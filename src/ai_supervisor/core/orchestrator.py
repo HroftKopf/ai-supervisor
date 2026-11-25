@@ -137,6 +137,7 @@ class Orchestrator:
         self._project_locks: dict[int, asyncio.Lock] = {}
         self._creation_lock = asyncio.Lock()
         self._action_locks: dict[int, asyncio.Lock] = {}
+        self._last_usage_warning: str | None = None
         self._stopping = False
         self._summaries: dict[int, asyncio.Task[Any]] = {}
 
@@ -787,6 +788,7 @@ class Orchestrator:
         )
         await self.tasks.update_fields(task.id, report=report)
         await self.tasks.add_event(task.id, "waiting_approval", "Ожидает решения владельца")
+        await self._maybe_usage_warning(task_id)
         await self._send_report_with_buttons(task, report)
         await self.conversations.add_message(
             task.conversation_id,
@@ -1078,6 +1080,7 @@ class Orchestrator:
             await self.tasks.update_fields(task.id, review_json=review.model_dump_json())
         report = await self._final_report(task, None, TaskStatus.FAILED)
         await self.tasks.update_fields(task.id, report=report)
+        await self._maybe_usage_warning(task_id)
         await self.notifier.send_text(
             self._chat_for_task(task),
             report,
@@ -1227,6 +1230,15 @@ class Orchestrator:
     def _chat_for_task(self, task: TaskRecord) -> int:
         # chat_id is the conversation owner's chat. All usage is owner-only.
         return self.settings.owner_id
+
+    async def _maybe_usage_warning(self, task_id: int) -> None:
+        warning = await self.usage.warning()
+        if not warning or warning == self._last_usage_warning:
+            return
+        self._last_usage_warning = warning
+        task = await self.tasks.get_optional(task_id)
+        if task is not None:
+            await self.notifier.send_text(self._chat_for_task(task), "⚠️ " + warning)
 
     async def _record_kimi_usage(
         self, usage: Any, *, task_id: int | None, project_id: int | None
