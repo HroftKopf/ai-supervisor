@@ -1,0 +1,42 @@
+[Unit]
+Description=AI Supervisor — Kimi + DeepSeek Harness Telegram supervisor
+Documentation=file:%h/Projects/ai-supervisor/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/ai-supervisor
+Environment=AI_SUPERVISOR_ROOT=%h/Projects/ai-supervisor
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=%h/Projects/ai-supervisor/.env
+ExecStart=%h/Projects/ai-supervisor/.venv/bin/ai-supervisor run
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+KillMode=mixed
+UMask=0077
+
+# Hardening. ReadWritePaths covers project worktrees/merge and var/.
+# If projects live outside ~/Projects, add those roots here.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+ReadWritePaths=%h/Projects
+LimitNOFILE=4096
+TasksMax=4096
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-supervisor
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,5 @@
+# AI Supervisor privacy hardening: do not upload canonical Harness session logs
+# to the model provider as optional request metadata.
+- id: session-log-deepseek
+  config:
+    enabled: false
