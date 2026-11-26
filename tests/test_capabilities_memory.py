@@ -130,3 +130,21 @@ async def test_memory_isolation_stale_and_unverified_labels(database, settings, 
     listed = await service.get_memories(project_id=project.id)
     assert active.id in {item.id for item in listed}
     assert stale.id not in {item.id for item in listed}
+
+
+@pytest.mark.asyncio
+async def test_memory_context_uses_query_relevance(database, settings, project) -> None:
+    from ai_supervisor.memory.conversations import ConversationService
+
+    service = ConversationService(database, settings)
+    await service.add_memory(
+        "project", "alpha release uses rust", project_id=project.id, key="a", verified=True
+    )
+    await service.add_memory(
+        "project", "beta release uses python", project_id=project.id, key="b", verified=True
+    )
+    context = await service.memory_context(
+        project_id=project.id, conversation_id=None, query="alpha"
+    )
+    assert "alpha release" in context
+    assert "beta release" not in context

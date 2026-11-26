@@ -43,6 +43,7 @@ from ai_supervisor.core.permissions import (
     PermissionManager,
 )
 from ai_supervisor.core.redaction import SecretRedactor
+from ai_supervisor.core.request_gateway import build_envelope
 from ai_supervisor.core.reviewer import ReviewGate, build_report
 from ai_supervisor.core.routing import RoutingLevel, RoutingPolicy
 from ai_supervisor.core.strategies import StrategyLibrary
@@ -85,6 +86,7 @@ from ai_supervisor.providers.base import (
     ProviderError,
     ProviderQuotaError,
     ProviderRateLimitError,
+    canonical_role,
 )
 from ai_supervisor.providers.kimi import (
     KimiError,
@@ -379,6 +381,12 @@ class Orchestrator:
         conversation = await self.conversations.get_or_create_conversation(
             message.chat_id, project.id
         )
+        envelope = build_envelope(
+            message,
+            project_id=project.id,
+            conversation_id=conversation.id,
+            redactor=self.redactor,
+        )
         attachment_text, images = await self._prepare_attachments(message)
         text = (message.text or "").strip()
         if text:
@@ -448,6 +456,8 @@ class Orchestrator:
                 conversation_id=conversation.id,
                 chat_id=message.chat_id,
                 title_hint=intent_result.task_title_hint or "",
+                request_text=envelope.original_text,
+                request_id=envelope.request_id,
             )
             return
 
@@ -470,9 +480,6 @@ class Orchestrator:
         images: list[tuple[bytes, str]],
         chat_id: int,
     ) -> None:
-        memory_block = await self.conversations.memory_context(
-            project_id=project.id, conversation_id=conversation.id
-        )
         api_messages = self.conversations.messages_for_api(context_messages)
         latest_text = next(
             (
@@ -482,9 +489,14 @@ class Orchestrator:
             ),
             "",
         )
+        memory_block = await self.conversations.memory_context(
+            project_id=project.id,
+            conversation_id=conversation.id,
+            query=latest_text,
+        )
         try:
             await self.usage.ensure_kimi_budget(0)
-            chat_profile = self.routing.reasoning(self.routing.for_request(latest_text))
+            chat_profile = self.routing.reasoning(self.routing.for_chat(latest_text))
             response = await self.supervisor.chat(
                 project_block=self._project_block(project),
                 memory_block=memory_block,
@@ -503,7 +515,7 @@ class Orchestrator:
                 context_chars=sum(
                     len(str(message.get("content") or "")) for message in api_messages
                 ),
-                routing_level=int(self.routing.for_request(latest_text)),
+                routing_level=int(self.routing.for_chat(latest_text)),
             )
         except (KimiQuotaError, ProviderQuotaError) as exc:
             if self.providers is not None:
@@ -626,6 +638,8 @@ class Orchestrator:
         conversation_id: int,
         chat_id: int,
         title_hint: str,
+        request_text: str = "",
+        request_id: str | None = None,
     ) -> None:
         async with self._creation_lock:
             await self._begin_task_locked(
@@ -633,6 +647,8 @@ class Orchestrator:
                 conversation_id=conversation_id,
                 chat_id=chat_id,
                 title_hint=title_hint,
+                request_text=request_text,
+                request_id=request_id,
             )
 
     async def _begin_task_locked(
@@ -642,6 +658,8 @@ class Orchestrator:
         conversation_id: int,
         chat_id: int,
         title_hint: str,
+        request_text: str = "",
+        request_id: str | None = None,
     ) -> None:
         active = await self.tasks.active(project.id)
         if active:
@@ -658,6 +676,9 @@ class Orchestrator:
             conversation_id,
             title,
             max_rework=self.settings.limits.max_rework,
+            source_request=request_text or title,
+            request_id=request_id,
+            intent_source="telegram",
         )
         await self.tasks.add_event(task.id, "accepted", "Задача принята от владельца")
         await self.progress.update(task.id, force=True, chat_id=chat_id)
@@ -733,8 +754,13 @@ class Orchestrator:
             await self._pause_task(task_id, str(exc))
         except (KimiQuotaError, ProviderQuotaError) as exc:
             if self.providers is not None:
-                for role in self.providers.roles:
-                    self.providers.mark_quota_exhausted(role)
+                provider_name = getattr(exc, "provider", None)
+                if provider_name:
+                    self.providers.mark_provider_quota(provider_name)
+                else:
+                    # Conservative fallback only for the execution planner; never
+                    # block unrelated providers because the source is unknown.
+                    self.providers.mark_quota_exhausted("planner")
             await self._pause_task(task_id, self._quota_message_for(exc))
         except (KimiRateLimitError, ProviderRateLimitError):
             await self._retry_wait(
@@ -787,11 +813,16 @@ class Orchestrator:
         conversation = await self.conversations.get(task.conversation_id)
         _summary, context_messages = await self.conversations.build_context(task.conversation_id)
         user_messages = [message for message in context_messages if message.role == "user"]
-        latest_user = request_override or (
-            user_messages[-1].content if user_messages else task.title
+        original_intent = task.source_request.strip()
+        latest_user = (
+            request_override
+            or original_intent
+            or (user_messages[-1].content if user_messages else task.title)
         )
         memory_block = await self.conversations.memory_context(
-            project_id=project.id, conversation_id=conversation.id
+            project_id=project.id,
+            conversation_id=conversation.id,
+            query=latest_user,
         )
         project_context = await self.context_builder.build(project, goal=latest_user)
         requested_level = self.routing.for_request(latest_user)
@@ -820,7 +851,7 @@ class Orchestrator:
         }
         if not spec.scope.strip():
             updates["scope"] = spec.goal[:8000]
-        if not spec.source_request.strip():
+        if not spec.source_request.strip() or original_intent:
             updates["source_request"] = latest_user[:8000]
         if spec.max_attempts == 0:
             updates["max_attempts"] = self.settings.limits.max_iterations
@@ -942,6 +973,65 @@ class Orchestrator:
         )
         return approval_id
 
+    async def _resume_review_checkpoint(
+        self, task: TaskRecord, project: ProjectRecord, project_context: str
+    ) -> bool:
+        """Continue a non-composite task from persisted evidence, without rerunning worker."""
+        evidence = self._load_evidence(task)
+        if evidence is None or task.review is not None or not task.worktree_path:
+            return False
+        worktree = Path(task.worktree_path)
+        if not worktree.is_dir():
+            return False
+        spec = self._spec_for(task)
+        project_context = await self.context_builder.build(project, goal=spec.goal)
+        precheck = ReviewGate.precheck(evidence, spec, worktree=worktree)
+        if precheck is None:
+            await self._try_transition(task.id, TaskStatus.REVIEWING)
+            await self.usage.ensure_kimi_budget(task.id)
+            review_level = RoutingLevel(spec.routing_level or int(self.routing.for_spec(spec)))
+            profile = self.routing.reasoning(review_level)
+            review, review_usage = await self.supervisor.review(
+                project_block=self._project_block(project),
+                spec=spec,
+                evidence=evidence,
+                project_context=project_context,
+                reasoning_effort=profile.effort,
+                max_completion_tokens=profile.max_tokens,
+            )
+            await self._record_kimi_usage(
+                review_usage,
+                task_id=task.id,
+                project_id=project.id,
+                role="review",
+                prompt_version=self.supervisor.prompt_metadata().get("version"),
+                routing_level=int(review_level),
+            )
+        else:
+            review = precheck
+        review = ReviewGate.enforce(review, evidence, spec, worktree=worktree)
+        task = await self.tasks.update_fields(task.id, review_json=review.model_dump_json())
+        await self.tasks.add_event(
+            task.id,
+            "review-checkpoint",
+            f"Review checkpoint: {review.verdict.value}",
+            {"summary": review.summary[:2000]},
+        )
+        if review.verdict is ReviewVerdict.APPROVED:
+            await self._finish_for_acceptance(
+                task.id, project, spec_evidence=evidence, review=review
+            )
+            return True
+        # The checkpoint cannot safely re-enter the worker loop from REVIEWING.
+        # Preserve the evidence and require an explicit rework/resume decision.
+        await self._block_task(
+            task.id,
+            "Review checkpoint требует решения владельца; повторный запуск worker не выполнялся.\n"
+            + review.summary,
+            review=review,
+        )
+        return True
+
     async def _execute_task(
         self,
         task_id: int,
@@ -959,6 +1049,9 @@ class Orchestrator:
             return
         task = await self.tasks.transition(task_id, TaskStatus.RUNNING)
         await self.tasks.add_event(task_id, "running", "Работа началась")
+        if self._spec_for(task).task_type is not TaskType.COMPOSITE:
+            if await self._resume_review_checkpoint(task, project, project_context):
+                return
         if self._spec_for(task).task_type is TaskType.COMPOSITE:
             await self._execute_composite(
                 task, project, project_context, manual_instruction=manual_instruction
@@ -1077,6 +1170,9 @@ class Orchestrator:
             )
             await self.progress.update(task.id, chat_id=self._chat_for_task(task))
             spec = self._spec_for(task)
+            # Reviewer must see the current project snapshot, not the one taken
+            # before the worker changed the worktree.
+            project_context = await self.context_builder.build(project, goal=spec.goal)
             precheck = ReviewGate.precheck(evidence, spec, worktree=Path(task.worktree_path or ""))
             if precheck is None:
                 await self._try_transition(task.id, TaskStatus.REVIEWING)
@@ -3203,9 +3299,10 @@ class Orchestrator:
     ) -> None:
         provider_name = "kimi"
         model_name = self.settings.kimi.model
+        canonical = canonical_role(role or "planner")
         if self.providers is not None and role:
             try:
-                provider = self.providers.provider_for(role)
+                provider = self.providers.provider_for(canonical)
                 provider_name = provider.name
                 model_name = provider.model
             except Exception:
@@ -3216,7 +3313,7 @@ class Orchestrator:
             usage=usage,
             task_id=task_id,
             project_id=project_id,
-            role=role,
+            role=canonical,
             prompt_version=prompt_version
             or (
                 self.supervisor.prompt_metadata().get("version")
@@ -3314,6 +3411,29 @@ class Orchestrator:
     # formatting for commands
     # ------------------------------------------------------------------
 
+    async def chat_direct(self, chat_id: int, user_id: int, text: str) -> None:
+        self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
+        project = await self._current_project(chat_id)
+        if project is None:
+            await self.notifier.send_text(chat_id, "Сначала выберите или создайте проект.")
+            return
+        conversation = await self.conversations.get_or_create_conversation(chat_id, project.id)
+        clean = self.redactor.redact(text.strip())[:8000]
+        if not clean:
+            await self.notifier.send_text(chat_id, "Пустой запрос не обработан.")
+            return
+        await self.conversations.add_message(conversation.id, "user", clean)
+        summary, context_messages = await self.conversations.build_context(conversation.id)
+        await self._chat(
+            project=project,
+            conversation=conversation,
+            summary=summary,
+            context_messages=context_messages,
+            images=[],
+            chat_id=chat_id,
+        )
+
     async def create_task_from_text(self, chat_id: int, user_id: int, text: str) -> None:
         self._assert_owner(user_id)
         self._assert_owner_chat(chat_id)
@@ -3327,6 +3447,8 @@ class Orchestrator:
             conversation_id=conversation.id,
             chat_id=chat_id,
             title_hint=text.strip()[:120] or "Задача",
+            request_text=self.redactor.redact(text.strip())[:8000],
+            request_id=f"req-{__import__('uuid').uuid4().hex}",
         )
 
     async def queue_text(self, chat_id: int) -> str:

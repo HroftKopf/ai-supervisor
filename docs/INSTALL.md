@@ -93,7 +93,7 @@ Nonsecret Kimi/DeepSeek endpoints and model IDs are in `config.toml`
 ## 4.1. Обновление с Phase 1
 
 При первом запуске новой версии `Database` сделает backup
-`var/backups/pre-migration-v6-*.db` и обновит схему v1/v2/v3/v4/v5→v6. Старые задачи сохраняются.
+`var/backups/pre-migration-v7-*.db` и обновит схему v1/v2/v3/v4/v5/v6→v7. Старые задачи сохраняются.
 Перед обновлением можно дополнительно выполнить `scripts/backup.sh`.
 
 ## 4.2. Egress worker

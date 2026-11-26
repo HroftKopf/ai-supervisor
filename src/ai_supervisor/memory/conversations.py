@@ -519,10 +519,26 @@ class ConversationService:
         await cursor.close()
         return cursor.rowcount > 0
 
-    async def memory_context(self, *, project_id: int | None, conversation_id: int | None) -> str:
-        items = await self.get_memories(
-            project_id=project_id, conversation_id=conversation_id, limit=100
-        )
+    async def memory_context(
+        self,
+        *,
+        project_id: int | None,
+        conversation_id: int | None,
+        query: str = "",
+    ) -> str:
+        if query.strip():
+            candidates = await self.search_memories(query.strip(), limit=20)
+            items = [
+                item
+                for item in candidates
+                if (item.scope != "project" or item.project_id == project_id)
+                and (item.scope != "conversation" or item.conversation_id == conversation_id)
+                and not item.stale
+            ][:20]
+        else:
+            items = await self.get_memories(
+                project_id=project_id, conversation_id=conversation_id, limit=20
+            )
         if not items:
             return ""
         lines = []

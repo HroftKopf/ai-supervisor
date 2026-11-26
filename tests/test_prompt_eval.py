@@ -65,6 +65,8 @@ def test_routing_levels_and_reasoning_profiles() -> None:
     assert policy.for_request("Перепиши README") is RoutingLevel.STANDARD
     assert policy.reasoning(RoutingLevel.SIMPLE).max_tokens == 2048
     assert policy.reasoning(RoutingLevel.COMPLEX).effort == "max"
+    assert policy.for_chat("Что такое архитектура?") is RoutingLevel.SIMPLE
+    assert policy.for_chat("Спроектируй распределённый control plane") is RoutingLevel.COMPLEX
 
 
 def test_prompt_diagnostics_are_safe_and_describe_actual_requests(settings) -> None:

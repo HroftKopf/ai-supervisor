@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 from collections.abc import Sequence
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -284,7 +285,9 @@ class SupervisorAgent:
         self.settings = settings
         self.redactor = redactor
         self.providers = providers
-        self.last_raw_usage: dict[str, Any] = {}
+        self._raw_usage: ContextVar[dict[str, Any] | None] = ContextVar(
+            f"supervisor-raw-usage-{id(self)}", default=None
+        )
         self.prompts = PromptRegistry(prompt_root or PROMPTS_DIR)
         self.base_prompt = self.prompts.get("supervisor").text
 
@@ -292,6 +295,10 @@ class SupervisorAgent:
         if self.providers is not None:
             return self.providers.provider_for(role)
         return self.kimi
+
+    @property
+    def last_raw_usage(self) -> dict[str, Any]:
+        return dict(self._raw_usage.get() or {})
 
     def prompt_metadata(self) -> dict[str, str]:
         return self.prompts.metadata()
@@ -485,7 +492,7 @@ class SupervisorAgent:
             purpose="chat",
             reasoning_effort=reasoning_effort,
         )
-        self.last_raw_usage = getattr(response, "raw_usage", {})
+        self._raw_usage.set(dict(getattr(response, "raw_usage", {})))
         return response
 
     async def summarize(self, prompt: str) -> tuple[str, TokenUsage]:
@@ -540,9 +547,13 @@ class SupervisorAgent:
                 reasoning_effort=reasoning_effort,
             )
             usage_total = usage_total.merge(response.usage)
-            self.last_raw_usage = getattr(response, "raw_usage", {})
-            if response.finish_reason == "length" and attempt == 0:
-                max_completion_tokens = min(max_completion_tokens * 2, 131072)
+            self._raw_usage.set(dict(getattr(response, "raw_usage", {})))
+            if response.finish_reason == "length":
+                last_error = (
+                    "провайдер обрезал структурированный ответ; скрытое увеличение "
+                    "бюджета запрещено"
+                )
+                break
             try:
                 raw = parse_tool_call(response, expected_name)
                 value = schema.model_validate(raw)

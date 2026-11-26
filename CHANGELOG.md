@@ -1,5 +1,14 @@
 # Changelog
 
+## Phase 2.9.3 — Control plane optimization
+- Immutable RequestEnvelope and task intent provenance (schema v7).
+- Provider-scoped quota isolation, canonical roles and per-call raw usage ContextVar.
+- Review checkpoint resume without worker rerun.
+- Explicit `/chat`, `/task`, `/auto` modes.
+- Relevance-based memory retrieval and chat-specific routing.
+- No hidden structured-output token escalation.
+- Generation readiness separated from model-list health.
+
 ## Phase 2.9.1 — Infrastructure hardening
 - Fixed failed SQLite connection cleanup.
 - Fixed `/usage` HTML in menu/callback paths.

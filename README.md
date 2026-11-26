@@ -4,14 +4,16 @@
 **Kimi K3.1 Pro** — технический руководитель и ревьюер, **DeepSeek Harness** — исполнитель,
 **Python-оркестратор** — управляющая инфраструктура.
 
-> Статус: **Phase 2.9.1**. Добавлены централизованный Presentation Layer, компактные
+> Статус: **Phase 2.9.3**. Добавлены централизованный Presentation Layer, компактные
 > редактируемые карточки прогресса, режимы compact/detailed/debug, меню /start, разделение
 > и версионирование промптов, адаптивная маршрутизация Level 0–3 и профили reasoning.
 > Сохранены COMPOSITE, GitAuthManager, approvals, sandbox, egress, auto-resume и миграции.
 > Живые сценарии Kimi API и реальный DSH в bwrap проверены; Telegram Bot API и реальная
 > публикация пользовательских файлов на GitHub не проверялись. Ограничения явно перечислены
 > в [«Известных ограничениях»](#известные-ограничения-phase-2-5).
-> Phase 2.9.1: infrastructure hardening, fault-injection hooks, SQLite/worker/sandbox tests.
+> Phase 2.9.3: immutable request intent, provider-scoped quota, review checkpoints, explicit
+> chat/task/auto modes and relevance memory. Previous hardening: fault-injection hooks,
+> SQLite/worker/sandbox tests.
 > Ограничения покрытия и незавершённые сценарии явно указаны в
 > [отчёте Phase 2.9.1](docs/reports/PHASE_2_9_1.md). Система не заявляет о непроверенных
 > функциях как о работающих.
@@ -93,7 +95,8 @@
 - `/models`, `/provider info|test|select`; ключи только в env, worker их не получает.
 - Единая типографика Telegram: карточки, Markdown Kimi → HTML, сохранение кода/абзацев.
 - FTS5-поиск, резюме, stop/rollback/pause/retry, systemd, doctor, redaction.
-- Phase 2.9.1 hardening report: [docs/reports/PHASE_2_9_1.md](docs/reports/PHASE_2_9_1.md);
+- Phase 2.9.3 report: [docs/reports/PHASE_2_9_3.md](docs/reports/PHASE_2_9_3.md);
+  Phase 2.9.1 hardening report: [docs/reports/PHASE_2_9_1.md](docs/reports/PHASE_2_9_1.md);
   audit: [docs/PHASE2_9.md](docs/PHASE2_9.md), learning path:
   [docs/learning/README.md](docs/learning/README.md), offline benchmarks: `benchmarks/run_offline.py`,
   Phase 3 proposal: [docs/PHASE3_ARCHITECTURE.md](docs/PHASE3_ARCHITECTURE.md).
@@ -372,7 +375,7 @@ sandbox_network = true
 
 Выполнено:
 
-- `pytest`: **154 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
+- `pytest`: **160 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
   Проверены запуск runtime, проброс endpoint, запись результата, usage (input 42,

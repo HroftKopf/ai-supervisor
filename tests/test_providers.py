@@ -272,6 +272,11 @@ async def test_registry_independent_role_provider_selection(settings) -> None:
         assert registry.provider_for("reviewer").model == settings.llm.openai_model
         registry.select("summarizer", "openai")
         assert registry.provider_for("summarizer").name == "openai"
+        # A provider-scoped quota never blocks a different provider/role.
+        registry.mark_provider_quota("kimi")
+        with pytest.raises(Exception, match="paused after quota"):
+            registry.provider_for("planner")
+        assert registry.provider_for("reviewer").name == "openai"
         registry.mark_quota_exhausted("chat")
         with pytest.raises(Exception, match="paused after quota"):
             registry.provider_for("chat")

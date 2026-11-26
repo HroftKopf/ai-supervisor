@@ -58,8 +58,12 @@ def normalize_error(exc: Exception, provider: str) -> ProviderError:
             "KimiConnectionError": ProviderConnectionError,
             "KimiProtocolError": ProviderProtocolError,
         }
-        return mapping.get(name, ProviderError)(f"{provider}: {exc}")
-    return ProviderError(f"{provider}: {type(exc).__name__}: {exc}")
+        error = mapping.get(name, ProviderError)(f"{provider}: {exc}")
+        error.provider = provider
+        return error
+    error = ProviderError(f"{provider}: {type(exc).__name__}: {exc}")
+    error.provider = provider
+    return error
 
 
 class KimiProvider:
@@ -107,7 +111,13 @@ class KimiProvider:
     async def health(self) -> ProviderHealth:
         try:
             models = await self.client.validate_model()
-            return ProviderHealth(available=True, detail="Kimi API reachable", models=models)
+            return ProviderHealth(
+                available=True,
+                detail="Kimi API/models reachable; generation quota not probed",
+                models=models,
+                generation_ready=None,
+                checks={"connectivity": "ok", "model_list": "ok", "generation": "not_probed"},
+            )
         except Exception as exc:
             return ProviderHealth(
                 available=False, detail=str(normalize_error(exc, self.name))[:500]
@@ -163,7 +173,12 @@ class OpenAICompatibleProvider:
     async def health(self) -> ProviderHealth:
         try:
             models = await self._client.validate_model()
-            return ProviderHealth(available=True, models=models)
+            return ProviderHealth(
+                available=True,
+                models=models,
+                generation_ready=None,
+                checks={"connectivity": "ok", "model_list": "ok", "generation": "not_probed"},
+            )
         except Exception as exc:
             return ProviderHealth(
                 available=False, detail=str(normalize_error(exc, self.name))[:500]
@@ -441,13 +456,20 @@ class OpenAIProvider:
                 klass = ProviderConnectionError
             else:
                 klass = ProviderError
-        return klass(f"openai: {name}: {str(exc)[:500]}")
+        error = klass(f"openai: {name}: {str(exc)[:500]}")
+        error.provider = self.name
+        return error
 
     async def health(self) -> ProviderHealth:
         try:
             models = await self._client.models.list()
             names = [str(getattr(item, "id", "")) for item in getattr(models, "data", [])]
-            return ProviderHealth(available=True, models=names)
+            return ProviderHealth(
+                available=True,
+                models=names,
+                generation_ready=None,
+                checks={"connectivity": "ok", "model_list": "ok", "generation": "not_probed"},
+            )
         except Exception as exc:
             return ProviderHealth(available=False, detail=str(self._normalize_error(exc))[:500])
 

@@ -646,6 +646,10 @@ class TaskRecord(BaseModel):
     project_id: int
     conversation_id: int
     title: str
+    request_id: str | None = None
+    source_request: str = ""
+    request_revision: int = 1
+    intent_source: str = "legacy-inferred"
     status: TaskStatus
     task_type: TaskType = TaskType.MODIFY
     parent_task_id: int | None = None

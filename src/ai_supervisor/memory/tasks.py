@@ -58,17 +58,25 @@ class TaskService:
         title: str,
         *,
         max_rework: int,
+        source_request: str = "",
+        request_id: str | None = None,
+        intent_source: str = "telegram",
     ) -> TaskRecord:
         now = iso_now()
         cursor = await self.db.execute(
             """
-            INSERT INTO tasks(project_id, conversation_id, title, status, max_rework, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tasks(project_id, conversation_id, title, request_id,
+                              source_request, intent_source, status, max_rework,
+                              created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 project_id,
                 conversation_id,
                 title.strip()[:120] or "Задача",
+                request_id,
+                source_request.strip()[:8000],
+                intent_source,
                 TaskStatus.CREATED.value,
                 max_rework,
                 now,
@@ -189,6 +197,10 @@ class TaskService:
     async def update_fields(self, task_id: int, **fields: Any) -> TaskRecord:
         allowed = {
             "title",
+            "request_id",
+            "source_request",
+            "request_revision",
+            "intent_source",
             "task_type",
             "parent_task_id",
             "spec_json",

@@ -11,14 +11,16 @@ from ai_supervisor.providers.adapters import (
     OpenAIProvider,
 )
 from ai_supervisor.providers.base import (
+    AgentRole,
     LLMProvider,
     ProviderCapabilities,
     ProviderConfigurationError,
     ProviderQuotaError,
+    canonical_role,
 )
 from ai_supervisor.providers.kimi import KimiClient, KimiClientConfig
 
-ROLES = ("chat", "classifier", "planner", "reviewer", "summarizer", "experience")
+ROLES = tuple(role.value for role in AgentRole)
 
 
 class ProviderRegistry:
@@ -85,6 +87,7 @@ class ProviderRegistry:
         return dict(self._providers)
 
     def provider_for(self, role: str) -> LLMProvider:
+        role = canonical_role(role)
         if role not in ROLES:
             raise ProviderConfigurationError(f"unknown LLM role: {role}")
         name = self._roles[role]
@@ -102,9 +105,14 @@ class ProviderRegistry:
         return provider
 
     def mark_quota_exhausted(self, role: str) -> None:
+        role = canonical_role(role)
         name = self._roles.get(role)
         if name:
             self._quota_blocked.add(name)
+
+    def mark_provider_quota(self, provider_name: str) -> None:
+        if provider_name in self._providers:
+            self._quota_blocked.add(provider_name)
 
     def clear_quota(self, provider_name: str) -> None:
         self._quota_blocked.discard(provider_name)
@@ -145,6 +153,7 @@ class ProviderRegistry:
         }
 
     def select(self, role: str, provider_name: str) -> None:
+        role = canonical_role(role)
         if role not in ROLES:
             raise ProviderConfigurationError(f"unknown LLM role: {role}")
         if provider_name not in self._providers:
@@ -154,7 +163,12 @@ class ProviderRegistry:
         self._roles[role] = provider_name
 
     async def health(self, role_or_provider: str = "") -> dict[str, Any]:
-        target = role_or_provider
+        target = (
+            canonical_role(role_or_provider)
+            if role_or_provider in ROLES
+            or role_or_provider in {"planning", "classification", "review"}
+            else role_or_provider
+        )
         if target in ROLES:
             name = self._roles[target]
             provider = self._providers.get(name)
@@ -163,7 +177,7 @@ class ProviderRegistry:
                     f"role {target} is configured for unavailable provider {name}"
                 )
             result = await provider.health()
-            if result.available:
+            if result.generation_ready is True:
                 self.clear_quota(provider.name)
             return {target: result.model_dump()}
         if target:
@@ -173,7 +187,7 @@ class ProviderRegistry:
         results: dict[str, Any] = {}
         for name, provider in providers.items():
             result = await provider.health()
-            if result.available:
+            if result.generation_ready is True:
                 self.clear_quota(name)
             results[name] = result.model_dump()
         return results

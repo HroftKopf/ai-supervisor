@@ -84,7 +84,15 @@ class LLMSection(BaseModel):
     @field_validator("roles")
     @classmethod
     def _roles(cls, value: dict[str, str]) -> dict[str, str]:
-        allowed_roles = {"chat", "classifier", "planner", "reviewer", "summarizer", "experience"}
+        allowed_roles = {
+            "chat",
+            "classifier",
+            "planner",
+            "reviewer",
+            "summarizer",
+            "experience",
+            "analysis",
+        }
         allowed_providers = {"kimi", "openai", "openai_compatible"}
         for role, provider in value.items():
             if role not in allowed_roles:
@@ -765,13 +773,22 @@ def normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
             "reviewer",
             "summarizer",
             "experience",
+            "analysis",
         },
     )
     old_roles = llm.get("roles", {})
     if not isinstance(old_roles, dict):
         raise ConfigError("llm.roles must be a table")
     merged_roles = dict(old_roles)
-    for role in ("chat", "classifier", "planner", "reviewer", "summarizer", "experience"):
+    for role in (
+        "chat",
+        "classifier",
+        "planner",
+        "reviewer",
+        "summarizer",
+        "experience",
+        "analysis",
+    ):
         if role in roles:
             merged_roles[role] = roles[role]
     if "default_provider" in roles:

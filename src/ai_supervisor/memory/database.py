@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def iso_now() -> str:
@@ -393,6 +393,10 @@ class Database:
                 "ui_mode": "TEXT NOT NULL DEFAULT 'compact'",
             },
             "tasks": {
+                "request_id": "TEXT",
+                "source_request": "TEXT NOT NULL DEFAULT ''",
+                "request_revision": "INTEGER NOT NULL DEFAULT 1",
+                "intent_source": "TEXT NOT NULL DEFAULT 'legacy-inferred'",
                 "ui_chat_id": "INTEGER",
                 "ui_message_id": "INTEGER",
                 "ui_hash": "TEXT",

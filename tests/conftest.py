@@ -48,6 +48,7 @@ class FakeSupervisor:
         self.review_verdict = ReviewVerdict.ACCEPT
         self.review_root_cause = RootCause.UNKNOWN
         self.review_sequence: list[ReviewVerdict] = []
+        self.plan_calls: list[dict[str, object]] = []
         self.chat_calls = 0
         self.review_calls = 0
         self.chat_response = "Привет! Это ответ Kimi."
@@ -70,7 +71,8 @@ class FakeSupervisor:
             TokenUsage(input_tokens=5, output_tokens=2, requests=1),
         )
 
-    async def plan(self, **_: object) -> tuple[TaskSpec, TokenUsage]:
+    async def plan(self, **kwargs: object) -> tuple[TaskSpec, TokenUsage]:
+        self.plan_calls.append(dict(kwargs))
         return self.plan_spec, TokenUsage(input_tokens=10, output_tokens=5, requests=1)
 
     async def review(self, **_: object) -> tuple[ReviewResult, TokenUsage]:

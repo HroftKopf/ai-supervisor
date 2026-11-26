@@ -1,6 +1,6 @@
 # Phase 2.9 — Stabilization, security and benchmarking
 
-Baseline: `dd3a3cf`; starting suite: 125 passed, 4 skipped; Phase 2.9 final: **154 passed, 4 skipped**.
+Baseline: `dd3a3cf`; starting suite: 125 passed, 4 skipped; Phase 2.9 final: **160 passed, 4 skipped**.
 
 ## 1. Architecture audit
 

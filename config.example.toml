@@ -66,6 +66,7 @@ planner = "kimi"
 reviewer = "kimi"
 summarizer = "kimi"
 experience = "kimi"
+analysis = "kimi"
 
 [routing]
 # Level selection is deterministic in code (0 native, 1 simple, 2 standard, 3 complex).

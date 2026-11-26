@@ -30,7 +30,9 @@ HELP_TEXT = """AI Supervisor — команды
 /project — текущий проект; /project list|select|add|create|remove|info|permissions|test|build|instructions|import-config
 /new — начать новый диалог
 /tasks — последние задачи
+/chat <текст> — обычный ответ без классификатора
 /task <текст> — создать задачу без классификатора
+/auto [текст] — автоматический выбор chat/task
 /task_info [id] — подробности задачи
 /queue — очередь и активные задачи
 /status [id] — состояние системы или задачи
@@ -92,6 +94,8 @@ class Handlers:
         r.message.register(self.cmd_project, Command("project"))
         r.message.register(self.cmd_new, Command("new"))
         r.message.register(self.cmd_tasks, Command("tasks"))
+        r.message.register(self.cmd_chat, Command("chat"))
+        r.message.register(self.cmd_auto, Command("auto"))
         r.message.register(self.cmd_task, Command("task"))
         r.message.register(self.cmd_task_info, Command("task_info"))
         r.message.register(self.cmd_queue, Command("queue"))
@@ -407,6 +411,30 @@ class Handlers:
             message.chat.id, await self.orchestrator.tasks_text(message.chat.id)
         )
 
+    async def cmd_chat(self, message: Message) -> None:
+        text = _command_tail(message.text or "").strip()
+        if not text:
+            await self.notifier.send_text(message.chat.id, "Использование: /chat <запрос>")
+            return
+        await self.orchestrator.chat_direct(message.chat.id, message.from_user.id, text)  # type: ignore[union-attr]
+
+    async def cmd_auto(self, message: Message) -> None:
+        text = _command_tail(message.text or "").strip()
+        if text:
+            await self.orchestrator.handle_incoming(
+                IncomingMessage(
+                    chat_id=message.chat.id,
+                    user_id=message.from_user.id,  # type: ignore[union-attr]
+                    text=text,
+                    telegram_message_id=getattr(message, "message_id", None),
+                )
+            )
+            return
+        await self.notifier.send_text(
+            message.chat.id,
+            "Режим auto включён для следующих сообщений: классификатор выберет chat или task.",
+        )
+
     async def cmd_task(self, message: Message) -> None:
         text = _command_tail(message.text or "")
         if not text:
@@ -683,7 +711,16 @@ class Handlers:
             results = await registry.health(role)
             lines = ["Проверка провайдера", ""]
             for name, data in results.items():
-                lines.append(f"{name}: {'доступен' if data['available'] else 'недоступен'}")
+                lines.append(f"{name}: {'API доступен' if data['available'] else 'недоступен'}")
+                checks = data.get("checks") or {}
+                if checks:
+                    lines.append(
+                        "  " + ", ".join(f"{key}={value}" for key, value in checks.items())
+                    )
+                if data.get("generation_ready") is not True:
+                    lines.append(
+                        "  generation readiness: не подтверждена (платный probe не выполнялся)"
+                    )
                 if data.get("detail"):
                     lines.append(str(data["detail"])[:1000])
             await self.notifier.send_text(message.chat.id, "\n".join(lines))

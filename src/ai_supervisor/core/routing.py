@@ -22,7 +22,7 @@ class ReasoningProfile:
 
 _COMPLEX_MARKERS = re.compile(
     r"(?i)(архитектур|безопасн|security|рефактор|миграц|переписать|"
-    r"нескольк|композит|deploy|инфраструктур|race|concurrency)"
+    r"нескольк|композит|deploy|инфраструктур|race|concurrency|распредел|control plane)"
 )
 _SIMPLE_MARKERS = re.compile(
     r"(?i)(статус|покажи|найди|прочитай|аудит|диагностик|логи|git status|"
@@ -58,6 +58,16 @@ class RoutingPolicy:
         if _SIMPLE_MARKERS.search(text or ""):
             return RoutingLevel.SIMPLE
         return RoutingLevel.STANDARD
+
+    def for_chat(self, text: str) -> RoutingLevel:
+        """Chat should not inherit an engineering task's reasoning level from a keyword."""
+        lowered = (text or "").lower()
+        engineering = re.search(
+            r"(спроект|реализ|исправ|внедр|миграц|аудит всей|security audit)", lowered
+        )
+        if engineering:
+            return self.for_request(text)
+        return RoutingLevel.SIMPLE
 
     def for_spec(self, spec: TaskSpec) -> RoutingLevel:
         if spec.task_type in {TaskType.SYSTEM_OPERATION, TaskType.EXTERNAL_OPERATION}:

@@ -93,7 +93,7 @@ OpenAI uses the Responses API; compatible providers use Chat Completions.
 ### `[agent_roles]`
 
 One provider per role: `default_provider`, `chat`, `classifier`, `planner`, `reviewer`,
-`summarizer`, `experience`. Allowed providers: `kimi`, `openai`, `openai_compatible`.
+`summarizer`, `experience`, `analysis`. Allowed providers: `kimi`, `openai`, `openai_compatible`.
 There is no automatic fallback between paid APIs. If the selected provider has no credentials,
 the request fails explicitly.
 

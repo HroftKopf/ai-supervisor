@@ -2,11 +2,34 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
 from ai_supervisor.models import TokenUsage
+
+
+class AgentRole(StrEnum):
+    CHAT = "chat"
+    CLASSIFIER = "classifier"
+    PLANNER = "planner"
+    REVIEWER = "reviewer"
+    SUMMARIZER = "summarizer"
+    EXPERIENCE = "experience"
+    ANALYSIS = "analysis"
+
+
+ROLE_ALIASES = {
+    "planning": AgentRole.PLANNER.value,
+    "classification": AgentRole.CLASSIFIER.value,
+    "review": AgentRole.REVIEWER.value,
+}
+
+
+def canonical_role(role: str) -> str:
+    value = str(role).strip().lower()
+    return ROLE_ALIASES.get(value, value)
 
 
 class ProviderError(RuntimeError):
@@ -82,6 +105,9 @@ class ProviderHealth(BaseModel):
     available: bool
     detail: str = ""
     models: list[str] = Field(default_factory=list)
+    # Reachability/model listing is not proof that paid generation is available.
+    generation_ready: bool | None = None
+    checks: dict[str, str] = Field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

@@ -207,3 +207,25 @@ async def test_chat_uses_auto_without_tools(settings) -> None:
     assert len(kimi.calls) == 1
     assert kimi.calls[0][1]["tool_choice"] == "auto"
     assert "tools" not in kimi.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_truncated_structured_response_is_not_retried_with_larger_budget(settings) -> None:
+    kimi = SequenceKimi(
+        [
+            KimiResponse(
+                content="",
+                finish_reason="length",
+                usage=TokenUsage(requests=1),
+            )
+        ]
+    )
+    with pytest.raises(SupervisorError, match="обрезал"):
+        await _agent(kimi, settings).classify(
+            project_block="demo",
+            conversation_block="",
+            latest_user_message="task",
+            conversation_id=1,
+        )
+    assert len(kimi.calls) == 1
+    assert kimi.calls[0][1]["max_completion_tokens"] == 2048

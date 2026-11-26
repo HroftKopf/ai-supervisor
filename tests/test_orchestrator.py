@@ -361,3 +361,78 @@ async def test_config_import_requires_owner_approval(orchestrator, project, tmp_
     assert approval_id is not None
     await orch.approve_action(approval_id, 424242, 424242)
     assert destination.read_text() == "layout = 'dwindle'\n"
+
+
+@pytest.mark.asyncio
+async def test_review_checkpoint_resumes_without_rerunning_worker(orchestrator, project) -> None:
+    from ai_supervisor.models import (
+        CheckResult,
+        Evidence,
+        TaskSpec,
+        TaskStatus,
+        TaskType,
+        WorkerResult,
+    )
+
+    orch, _supervisor, workers, _notifier, _projects, tasks = orchestrator
+    conversation = await orch.conversations.get_or_create_conversation(424242, project.id)
+    task = await tasks.create(
+        project.id, conversation.id, "checkpoint", max_rework=1, source_request="original"
+    )
+    await tasks.save_spec(
+        task.id,
+        TaskSpec(
+            title="checkpoint",
+            goal="read-only checkpoint",
+            task_type=TaskType.READ_ONLY,
+            acceptance_criteria=["ok"],
+            source_request="original",
+        ),
+    )
+    await tasks.transition(task.id, TaskStatus.PLANNING)
+    await tasks.transition(task.id, TaskStatus.QUEUED)
+    worktree = project.path
+    await tasks.update_fields(
+        task.id,
+        worktree_path=str(worktree),
+        evidence_json=Evidence(
+            task_id=task.id,
+            worker=WorkerResult(
+                session_id="s",
+                final_response="done",
+                finish_reason="completed",
+                return_code=0,
+            ),
+            checks=[CheckResult(name="test", command="true", exit_code=0)],
+        ).model_dump_json(),
+    )
+    task = await tasks.get(task.id)
+    await orch._execute_task(
+        task.id, project=project, project_context="ctx", manual_instruction=None
+    )
+    task = await tasks.get(task.id)
+    assert workers.calls == 0
+    assert task.review is not None
+    assert task.status is TaskStatus.WAITING_APPROVAL, task.error
+
+
+@pytest.mark.asyncio
+async def test_planner_uses_immutable_source_request(orchestrator, project) -> None:
+    orch, supervisor, _workers, _notifier, _projects, tasks = orchestrator
+    conversation = await orch.conversations.get_or_create_conversation(424242, project.id)
+    task = await tasks.create(
+        project.id,
+        conversation.id,
+        "A",
+        max_rework=1,
+        source_request="ORIGINAL REQUEST A",
+        request_id="req-a",
+    )
+    await tasks.transition(task.id, TaskStatus.PLANNING)
+    await orch.conversations.add_message(conversation.id, "user", "NEW MESSAGE B")
+    task = await tasks.get(task.id)
+    await orch._plan_task(task, project)
+    assert supervisor.plan_calls[-1]["latest_user_message"] == "ORIGINAL REQUEST A"
+    task = await tasks.get(task.id)
+    assert task.source_request == "ORIGINAL REQUEST A"
+    assert task.spec is not None and task.spec.source_request == "ORIGINAL REQUEST A"
