@@ -284,3 +284,50 @@ async def test_registry_independent_role_provider_selection(settings) -> None:
         assert "openai" in registry.snapshot()["quota_blocked"]
     finally:
         await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_quota_state_persists_across_registry_restart(settings, tmp_path) -> None:
+    from pydantic import SecretStr
+
+    from ai_supervisor.memory.database import Database
+
+    secrets = settings.secrets.model_copy(
+        update={
+            "kimi_api_key": SecretStr("synthetic-kimi"),
+            "openai_api_key": SecretStr("synthetic-openai"),
+        }
+    )
+    llm = settings.llm.model_copy(
+        update={"default_provider": "kimi", "roles": {"chat": "openai", "planner": "kimi"}}
+    )
+    settings = settings.model_copy(update={"secrets": secrets, "llm": llm})
+    db = Database(tmp_path / "provider-state.db")
+    await db.connect()
+    try:
+        first = ProviderRegistry(
+            settings,
+            __import__("ai_supervisor.core.redaction", fromlist=["SecretRedactor"]).SecretRedactor(
+                []
+            ),
+            db=db,
+        )
+        first.mark_provider_quota("kimi")
+        await first.persist_state("kimi", "QUOTA_EXHAUSTED", category="quota")
+        second = ProviderRegistry(
+            settings,
+            __import__("ai_supervisor.core.redaction", fromlist=["SecretRedactor"]).SecretRedactor(
+                []
+            ),
+            db=db,
+        )
+        await second.hydrate()
+        with pytest.raises(Exception, match="paused after quota"):
+            second.provider_for("planner")
+        assert second.provider_for("chat").name in {"kimi", "openai"}
+        state = await second.state_snapshot()
+        assert state["kimi"]["state"] == "QUOTA_EXHAUSTED"
+        await first.close()
+        await second.close()
+    finally:
+        await db.close()

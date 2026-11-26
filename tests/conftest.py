@@ -39,6 +39,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OWNER_ID = 424242
 
 
+def _fake_usage(input_tokens: int, output_tokens: int, requests: int = 1) -> TokenUsage:
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        requests=requests,
+        provider_id="kimi",
+        model_id="k3.1-pro",
+        request_id="test-request",
+        logical_call_id="test-call",
+        attempt_id="test-attempt",
+        account_scope_id="kimi",
+        role="planner",
+    )
+
+
 class FakeSupervisor:
     def prompt_metadata(self) -> dict[str, str]:
         return {"version": "test", "supervisor": "test", "planner": "test"}
@@ -68,12 +83,12 @@ class FakeSupervisor:
                 reason="test fixture",
                 task_title_hint="Append line" if self.intent is IntentKind.TASK else None,
             ),
-            TokenUsage(input_tokens=5, output_tokens=2, requests=1),
+            _fake_usage(5, 2),
         )
 
     async def plan(self, **kwargs: object) -> tuple[TaskSpec, TokenUsage]:
         self.plan_calls.append(dict(kwargs))
-        return self.plan_spec, TokenUsage(input_tokens=10, output_tokens=5, requests=1)
+        return self.plan_spec, _fake_usage(10, 5)
 
     async def review(self, **_: object) -> tuple[ReviewResult, TokenUsage]:
         self.review_calls += 1
@@ -100,7 +115,7 @@ class FakeSupervisor:
                 issues=["принципиальная ошибка"],
                 required_changes=[],
             )
-        return result, TokenUsage(input_tokens=7, output_tokens=3, requests=1)
+        return result, _fake_usage(7, 3)
 
     async def chat(self, **_: object):
         self.chat_calls += 1
@@ -109,12 +124,12 @@ class FakeSupervisor:
         return KimiResponse(
             content=self.chat_response,
             reasoning_content="",
-            usage=TokenUsage(input_tokens=3, output_tokens=2, requests=1),
+            usage=_fake_usage(3, 2),
             model="kimi-test",
         )
 
     async def summarize(self, prompt: str) -> tuple[str, TokenUsage]:
-        return "Краткое резюме", TokenUsage(input_tokens=2, output_tokens=1, requests=1)
+        return "Краткое резюме", _fake_usage(2, 1)
 
 
 class FakeWorkers:
@@ -125,7 +140,7 @@ class FakeWorkers:
         self.started = asyncio.Event()
         self.block = False
         self.cancelled = False
-        self.usage = TokenUsage(input_tokens=11, output_tokens=4, requests=1)
+        self.usage = _fake_usage(11, 4)
 
     async def run(
         self,

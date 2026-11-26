@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import uuid
 from collections.abc import Sequence
 from contextvars import ContextVar
 from pathlib import Path
@@ -20,7 +21,12 @@ from ai_supervisor.models import (
     TaskSpec,
     TokenUsage,
 )
-from ai_supervisor.providers.base import ProviderProtocolError, ProviderResponse
+from ai_supervisor.providers.base import (
+    ProviderCallIdentity,
+    ProviderProtocolError,
+    ProviderResponse,
+    canonical_role,
+)
 from ai_supervisor.providers.kimi import (
     KimiClient,
     KimiProtocolError,
@@ -339,6 +345,9 @@ class SupervisorAgent:
         conversation_id: int,
         reasoning_effort: str | None = None,
         max_completion_tokens: int = 2048,
+        task_id: int | None = None,
+        stage_id: int | None = None,
+        project_id: int | None = None,
     ) -> tuple[IntentResult, TokenUsage]:
         system = self.prompts.compose("classifier")
         messages = [
@@ -364,6 +373,9 @@ class SupervisorAgent:
             prompt_cache_key=f"conv-{conversation_id}-classify",
             purpose="classify",
             provider_role="classifier",
+            task_id=task_id,
+            stage_id=stage_id,
+            project_id=project_id,
         )
         return result.value, result.usage
 
@@ -380,6 +392,9 @@ class SupervisorAgent:
         max_completion_tokens: int | None = None,
         capabilities_block: str = "",
         strategy_block: str = "",
+        task_id: int | None = None,
+        stage_id: int | None = None,
+        project_id: int | None = None,
     ) -> tuple[TaskSpec, TokenUsage]:
         system = self.prompts.compose("planner")
         user = (
@@ -408,6 +423,9 @@ class SupervisorAgent:
             prompt_cache_key=f"conv-{conversation_id}-plan",
             purpose="plan",
             provider_role="planner",
+            task_id=task_id,
+            stage_id=stage_id,
+            project_id=project_id,
         )
         return result.value, result.usage
 
@@ -420,6 +438,9 @@ class SupervisorAgent:
         project_context: str,
         reasoning_effort: str | None = None,
         max_completion_tokens: int = 8192,
+        task_id: int | None = None,
+        stage_id: int | None = None,
+        project_id: int | None = None,
     ) -> tuple[ReviewResult, TokenUsage]:
         system = self.prompts.compose("reviewer")
         user = (
@@ -445,6 +466,9 @@ class SupervisorAgent:
             prompt_cache_key=f"task-{evidence.task_id}-review",
             purpose="review",
             provider_role="reviewer",
+            task_id=task_id,
+            stage_id=stage_id,
+            project_id=project_id,
         )
         return result.value, result.usage
 
@@ -459,6 +483,9 @@ class SupervisorAgent:
         conversation_id: int,
         reasoning_effort: str | None = None,
         max_completion_tokens: int = 4096,
+        task_id: int | None = None,
+        stage_id: int | None = None,
+        project_id: int | None = None,
     ) -> ProviderResponse:
         system_parts = [self.base_prompt]
         if project_block:
@@ -484,6 +511,7 @@ class SupervisorAgent:
                         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
                     )
                 last_user["content"] = blocks
+        identity = self._identity("chat", task_id=task_id, stage_id=stage_id, project_id=project_id)
         response = await self._provider("chat").complete(
             api_messages,
             tool_choice="auto",
@@ -491,11 +519,16 @@ class SupervisorAgent:
             prompt_cache_key=f"conv-{conversation_id}",
             purpose="chat",
             reasoning_effort=reasoning_effort,
+            identity=identity,
         )
         self._raw_usage.set(dict(getattr(response, "raw_usage", {})))
+        response = response.model_copy(
+            update={"usage": self._with_identity(response.usage, identity)}
+        )
         return response
 
     async def summarize(self, prompt: str) -> tuple[str, TokenUsage]:
+        identity = self._identity("summarizer")
         response = await self._provider("summarizer").complete(
             [
                 {
@@ -508,8 +541,50 @@ class SupervisorAgent:
             ],
             max_completion_tokens=4096,
             purpose="summarize",
+            identity=identity,
         )
-        return response.content.strip(), response.usage
+        return response.content.strip(), self._with_identity(response.usage, identity)
+
+    def _identity(
+        self,
+        role: str,
+        *,
+        task_id: int | None = None,
+        stage_id: int | None = None,
+        project_id: int | None = None,
+    ) -> ProviderCallIdentity:
+        canonical = canonical_role(role)
+        provider = self._provider(canonical)
+        call_id = f"call-{uuid.uuid4().hex}"
+        return ProviderCallIdentity(
+            request_id=f"req-{uuid.uuid4().hex}",
+            logical_call_id=call_id,
+            attempt_id=f"{call_id}-1",
+            provider_id=getattr(provider, "name", "unknown"),
+            account_scope_id=getattr(provider, "name", "unknown"),
+            model_id=getattr(provider, "model", "unknown"),
+            role=canonical,
+            project_id=project_id,
+            task_id=task_id,
+            stage_id=stage_id,
+            prompt_version=self.prompts.version,
+        )
+
+    @staticmethod
+    def _with_identity(usage: TokenUsage, identity: ProviderCallIdentity) -> TokenUsage:
+        return usage.model_copy(
+            update={
+                "provider_id": identity.provider_id,
+                "model_id": identity.model_id,
+                "request_id": identity.request_id,
+                "logical_call_id": identity.logical_call_id,
+                "attempt_id": identity.attempt_id,
+                "account_scope_id": identity.account_scope_id,
+                "stage_id": identity.stage_id,
+                "role": identity.role,
+                "reasoning_profile": identity.reasoning_profile,
+            }
+        )
 
     def _safe_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         safe: list[dict[str, Any]] = []
@@ -532,11 +607,23 @@ class SupervisorAgent:
         purpose: str,
         reasoning_effort: str | None = None,
         provider_role: str = "planner",
+        task_id: int | None = None,
+        stage_id: int | None = None,
+        project_id: int | None = None,
     ) -> StructuredReply:
         current_messages = list(messages)
         last_error: str | None = None
         usage_total = TokenUsage()
+        base_identity = self._identity(
+            provider_role,
+            task_id=task_id,
+            stage_id=stage_id,
+            project_id=project_id,
+        )
         for attempt in range(2):
+            identity = base_identity.model_copy(
+                update={"attempt_id": f"{base_identity.attempt_id}-{attempt + 1}"}
+            )
             response = await self._provider(provider_role).complete(
                 current_messages,
                 tools=[tool],
@@ -545,8 +632,9 @@ class SupervisorAgent:
                 prompt_cache_key=prompt_cache_key,
                 purpose=purpose,
                 reasoning_effort=reasoning_effort,
+                identity=identity,
             )
-            usage_total = usage_total.merge(response.usage)
+            usage_total = usage_total.merge(self._with_identity(response.usage, identity))
             self._raw_usage.set(dict(getattr(response, "raw_usage", {})))
             if response.finish_reason == "length":
                 last_error = (

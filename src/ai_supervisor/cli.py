@@ -62,11 +62,12 @@ async def run_bot(settings: Settings, *, skip_checks: bool = False) -> None:
         backup_before_migration=settings.backups.before_schema_migration,
     )
     await db.connect()
-    providers = ProviderRegistry(settings, redactor)
+    providers = ProviderRegistry(settings, redactor, db=db)
     bot: Bot | None = None
     orchestrator: Orchestrator | None = None
     telegram: TelegramBot | None = None
     try:
+        await providers.hydrate()
         if not skip_checks and settings.kimi.verify_model_on_startup:
             health = await providers.health("chat")
             logger.info("LLM provider check: %s", health)

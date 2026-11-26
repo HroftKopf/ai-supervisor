@@ -68,6 +68,21 @@ class ProviderCapabilityError(ProviderError):
     pass
 
 
+class ProviderCallIdentity(BaseModel):
+    request_id: str
+    logical_call_id: str
+    attempt_id: str
+    provider_id: str
+    account_scope_id: str = "default"
+    model_id: str
+    role: str
+    project_id: int | None = None
+    task_id: int | None = None
+    stage_id: int | None = None
+    prompt_version: str = ""
+    reasoning_profile: str = ""
+
+
 class ProviderToolCall(BaseModel):
     id: str
     name: str
@@ -78,6 +93,7 @@ class ProviderResponse(BaseModel):
     content: str = ""
     reasoning_content: str = ""
     tool_calls: list[ProviderToolCall] = Field(default_factory=list)
+    identity: ProviderCallIdentity | None = None
     finish_reason: str | None = None
     usage: TokenUsage = Field(default_factory=TokenUsage)
     model: str = ""
@@ -139,6 +155,7 @@ class LLMProvider(Protocol):
         purpose: str = "chat",
         reasoning_effort: str | None = None,
         stream: bool = False,
+        identity: ProviderCallIdentity | None = None,
     ) -> ProviderResponse: ...
 
     async def health(self) -> ProviderHealth: ...

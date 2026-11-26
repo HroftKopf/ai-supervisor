@@ -5,6 +5,7 @@ from typing import Any
 
 from ai_supervisor.config import Settings
 from ai_supervisor.core.redaction import SecretRedactor
+from ai_supervisor.memory.database import Database
 from ai_supervisor.providers.adapters import (
     KimiProvider,
     OpenAICompatibleProvider,
@@ -19,6 +20,7 @@ from ai_supervisor.providers.base import (
     canonical_role,
 )
 from ai_supervisor.providers.kimi import KimiClient, KimiClientConfig
+from ai_supervisor.providers.state import ProviderStateStore
 
 ROLES = tuple(role.value for role in AgentRole)
 
@@ -26,9 +28,12 @@ ROLES = tuple(role.value for role in AgentRole)
 class ProviderRegistry:
     """Explicit role -> provider routing. Never falls back to another paid API silently."""
 
-    def __init__(self, settings: Settings, redactor: SecretRedactor) -> None:
+    def __init__(
+        self, settings: Settings, redactor: SecretRedactor, db: Database | None = None
+    ) -> None:
         self.settings = settings
         self.redactor = redactor
+        self.state_store = ProviderStateStore(db) if db is not None else None
         self._providers: dict[str, LLMProvider] = {}
         self._quota_blocked: set[str] = set()
         self._roles: dict[str, str] = {
@@ -114,6 +119,28 @@ class ProviderRegistry:
         if provider_name in self._providers:
             self._quota_blocked.add(provider_name)
 
+    async def persist_state(
+        self, provider_name: str, state: str, *, category: str = "", reason: str = ""
+    ) -> None:
+        if self.state_store is not None:
+            await self.state_store.set_state(
+                provider_name, state=state, category=category, reason=reason
+            )
+
+    async def hydrate(self) -> None:
+        if self.state_store is None:
+            return
+        states = await self.state_store.list()
+        blocked = {
+            name
+            for name, data in states.items()
+            if str(data.get("state")) in {"QUOTA_EXHAUSTED", "AUTH_FAILED", "DISABLED"}
+        }
+        self._quota_blocked.update(blocked & set(self._providers))
+
+    async def state_snapshot(self) -> dict[str, dict[str, Any]]:
+        return await self.state_store.list() if self.state_store is not None else {}
+
     def clear_quota(self, provider_name: str) -> None:
         self._quota_blocked.discard(provider_name)
 
@@ -179,6 +206,8 @@ class ProviderRegistry:
             result = await provider.health()
             if result.generation_ready is True:
                 self.clear_quota(provider.name)
+                if self.state_store is not None:
+                    await self.state_store.set_available(provider.name)
             return {target: result.model_dump()}
         if target:
             providers = {target: self._providers[target]} if target in self._providers else {}
@@ -189,6 +218,8 @@ class ProviderRegistry:
             result = await provider.health()
             if result.generation_ready is True:
                 self.clear_quota(name)
+                if self.state_store is not None:
+                    await self.state_store.set_available(name)
             results[name] = result.model_dump()
         return results
 

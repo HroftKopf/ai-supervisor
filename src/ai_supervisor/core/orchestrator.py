@@ -17,6 +17,7 @@ from ai_supervisor.config import Settings
 from ai_supervisor.core.capabilities import capability_block
 from ai_supervisor.core.config_import import ConfigImportError, ConfigImportService
 from ai_supervisor.core.context import ContextError, ProjectContextBuilder
+from ai_supervisor.core.evidence_manifest import build_manifest, parse_manifest
 from ai_supervisor.core.fault_injection import FaultInjector
 from ai_supervisor.core.git_auth import (
     GitAuthError,
@@ -43,7 +44,7 @@ from ai_supervisor.core.permissions import (
     PermissionManager,
 )
 from ai_supervisor.core.redaction import SecretRedactor
-from ai_supervisor.core.request_gateway import build_envelope
+from ai_supervisor.core.request_gateway import RequestTooLarge, build_envelope
 from ai_supervisor.core.reviewer import ReviewGate, build_report
 from ai_supervisor.core.routing import RoutingLevel, RoutingPolicy
 from ai_supervisor.core.strategies import StrategyLibrary
@@ -381,12 +382,16 @@ class Orchestrator:
         conversation = await self.conversations.get_or_create_conversation(
             message.chat_id, project.id
         )
-        envelope = build_envelope(
-            message,
-            project_id=project.id,
-            conversation_id=conversation.id,
-            redactor=self.redactor,
-        )
+        try:
+            envelope = build_envelope(
+                message,
+                project_id=project.id,
+                conversation_id=conversation.id,
+                redactor=self.redactor,
+            )
+        except RequestTooLarge as exc:
+            await self.notifier.send_text(message.chat_id, str(exc))
+            return
         attachment_text, images = await self._prepare_attachments(message)
         text = (message.text or "").strip()
         if text:
@@ -506,6 +511,7 @@ class Orchestrator:
                 conversation_id=conversation.id,
                 reasoning_effort=chat_profile.effort,
                 max_completion_tokens=chat_profile.max_tokens,
+                project_id=project.id,
             )
             await self._record_kimi_usage(
                 response.usage,
@@ -757,6 +763,9 @@ class Orchestrator:
                 provider_name = getattr(exc, "provider", None)
                 if provider_name:
                     self.providers.mark_provider_quota(provider_name)
+                    await self.providers.persist_state(
+                        provider_name, "QUOTA_EXHAUSTED", category="quota"
+                    )
                 else:
                     # Conservative fallback only for the execution planner; never
                     # block unrelated providers because the source is unknown.
@@ -984,7 +993,20 @@ class Orchestrator:
         if not worktree.is_dir():
             return False
         spec = self._spec_for(task)
-        project_context = await self.context_builder.build(project, goal=spec.goal)
+        saved_manifest = parse_manifest(task.evidence_manifest_json)
+        if saved_manifest is None:
+            return False
+        current_manifest = await build_manifest(
+            project=project, task=task, worktree=worktree, evidence=evidence, spec=spec
+        )
+        if current_manifest.manifest_hash != saved_manifest.manifest_hash:
+            await self._block_task(
+                task.id,
+                "Evidence устарел: состояние worktree/HEAD/index/untracked изменилось "
+                "после сохранения checkpoint. Требуется решение владельца.",
+            )
+            return True
+        project_context = await self.context_builder.build(project, goal=spec.goal, root=worktree)
         precheck = ReviewGate.precheck(evidence, spec, worktree=worktree)
         if precheck is None:
             await self._try_transition(task.id, TaskStatus.REVIEWING)
@@ -998,6 +1020,8 @@ class Orchestrator:
                 project_context=project_context,
                 reasoning_effort=profile.effort,
                 max_completion_tokens=profile.max_tokens,
+                task_id=task.id,
+                project_id=project.id,
             )
             await self._record_kimi_usage(
                 review_usage,
@@ -1152,11 +1176,19 @@ class Orchestrator:
                 task=task, worktree=Path(task.worktree_path or ""), changed=evidence.has_changes
             )
             evidence = evidence.model_copy(update={"head_commit": head_commit})
+            manifest = await build_manifest(
+                project=project,
+                task=task,
+                worktree=Path(task.worktree_path or ""),
+                evidence=evidence,
+                spec=spec,
+            )
             task = await self.tasks.update_fields(
                 task.id,
                 head_commit=head_commit,
                 diff_path=str(state_dir / "diff.patch"),
                 evidence_json=evidence.model_dump_json(),
+                evidence_manifest_json=manifest.model_dump_json(),
             )
             await self.tasks.add_event(
                 task.id,
@@ -1172,7 +1204,9 @@ class Orchestrator:
             spec = self._spec_for(task)
             # Reviewer must see the current project snapshot, not the one taken
             # before the worker changed the worktree.
-            project_context = await self.context_builder.build(project, goal=spec.goal)
+            project_context = await self.context_builder.build(
+                project, goal=spec.goal, root=Path(task.worktree_path or project.path)
+            )
             precheck = ReviewGate.precheck(evidence, spec, worktree=Path(task.worktree_path or ""))
             if precheck is None:
                 await self._try_transition(task.id, TaskStatus.REVIEWING)
@@ -1186,6 +1220,8 @@ class Orchestrator:
                     project_context=project_context,
                     reasoning_effort=review_profile.effort,
                     max_completion_tokens=review_profile.max_tokens,
+                    task_id=task.id,
+                    project_id=project.id,
                 )
                 await self._record_kimi_usage(
                     review_usage,
@@ -2005,6 +2041,9 @@ class Orchestrator:
             conversation_id=task.conversation_id,
             reasoning_effort=profile.effort,
             max_completion_tokens=profile.max_tokens,
+            task_id=task.id,
+            stage_id=stage.id,
+            project_id=project.id,
         )
         await self._record_kimi_usage(
             response.usage,
@@ -3297,16 +3336,9 @@ class Orchestrator:
         routing_level: int | None = None,
         context_chars: int | None = None,
     ) -> None:
-        provider_name = "kimi"
-        model_name = self.settings.kimi.model
         canonical = canonical_role(role or "planner")
-        if self.providers is not None and role:
-            try:
-                provider = self.providers.provider_for(canonical)
-                provider_name = provider.name
-                model_name = provider.model
-            except Exception:
-                pass
+        provider_name = getattr(usage, "provider_id", "") or "unknown"
+        model_name = getattr(usage, "model_id", "") or "unknown"
         await self.usage.record(
             provider=provider_name,
             model=model_name,
@@ -3323,6 +3355,13 @@ class Orchestrator:
             routing_level=routing_level,
             context_chars=context_chars,
             raw_usage=getattr(self.supervisor, "last_raw_usage", None),
+            request_id=getattr(usage, "request_id", "") or None,
+            logical_call_id=getattr(usage, "logical_call_id", "") or None,
+            attempt_id=getattr(usage, "attempt_id", "") or None,
+            provider_id=getattr(usage, "provider_id", "") or None,
+            account_scope_id=getattr(usage, "account_scope_id", "") or None,
+            stage_id=getattr(usage, "stage_id", None),
+            reasoning_profile=getattr(usage, "reasoning_profile", "") or None,
         )
 
     @staticmethod
@@ -3441,13 +3480,17 @@ class Orchestrator:
         if project is None:
             await self.notifier.send_text(chat_id, "Сначала выберите или создайте проект.")
             return
+        clean_text = self.redactor.redact(text.strip())
+        if len(clean_text) > 8000:
+            await self.notifier.send_text(chat_id, "Задача превышает 8000 символов; сократите её.")
+            return
         conversation = await self.conversations.get_or_create_conversation(chat_id, project.id)
         await self._begin_task(
             project=project,
             conversation_id=conversation.id,
             chat_id=chat_id,
             title_hint=text.strip()[:120] or "Задача",
-            request_text=self.redactor.redact(text.strip())[:8000],
+            request_text=clean_text,
             request_id=f"req-{__import__('uuid').uuid4().hex}",
         )
 

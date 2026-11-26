@@ -69,8 +69,9 @@ class ProjectContextBuilder:
         include_files: bool = True,
         goal: str = "",
         role: str = "planner",
+        root: Path | None = None,
     ) -> str:
-        root = Path(project.path).resolve()
+        root = Path(root or project.path).resolve()
         if not root.is_dir():
             raise ContextError(f"каталог проекта недоступен: {root}")
         parts = [

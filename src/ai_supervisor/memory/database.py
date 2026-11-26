@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def iso_now() -> str:
@@ -227,6 +227,19 @@ CREATE TABLE IF NOT EXISTS approvals (
 
 CREATE INDEX IF NOT EXISTS idx_approvals_pending ON approvals(status, expires_at);
 
+CREATE TABLE IF NOT EXISTS provider_states (
+    provider_id TEXT PRIMARY KEY,
+    account_scope_id TEXT NOT NULL DEFAULT 'default',
+    state TEXT NOT NULL DEFAULT 'UNKNOWN',
+    failure_category TEXT,
+    detected_at TEXT,
+    last_checked_at TEXT,
+    retry_not_before TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS usage_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
@@ -380,6 +393,22 @@ class Database:
                 backup_dir=self.backup_dir,
                 keep=self.backup_keep,
             )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS provider_states (
+                provider_id TEXT PRIMARY KEY,
+                account_scope_id TEXT NOT NULL DEFAULT 'default',
+                state TEXT NOT NULL DEFAULT 'UNKNOWN',
+                failure_category TEXT,
+                detected_at TEXT,
+                last_checked_at TEXT,
+                retry_not_before TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         additions = {
             "projects": {
                 "remote_url": "TEXT",
@@ -397,6 +426,7 @@ class Database:
                 "source_request": "TEXT NOT NULL DEFAULT ''",
                 "request_revision": "INTEGER NOT NULL DEFAULT 1",
                 "intent_source": "TEXT NOT NULL DEFAULT 'legacy-inferred'",
+                "evidence_manifest_json": "TEXT",
                 "ui_chat_id": "INTEGER",
                 "ui_message_id": "INTEGER",
                 "ui_hash": "TEXT",
@@ -424,6 +454,13 @@ class Database:
             },
             "usage_events": {
                 "raw_usage_json": "TEXT",
+                "request_id": "TEXT",
+                "logical_call_id": "TEXT",
+                "attempt_id": "TEXT",
+                "provider_id": "TEXT",
+                "account_scope_id": "TEXT",
+                "stage_id": "INTEGER",
+                "reasoning_profile": "TEXT",
                 "prompt_version": "TEXT",
                 "role": "TEXT",
                 "routing_level": "INTEGER",

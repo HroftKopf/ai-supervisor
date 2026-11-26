@@ -703,6 +703,15 @@ class Handlers:
                     f"{name}: {data['model']}; tools={cap['tools']}, structured={cap['structured_output']}, "
                     f"streaming={cap['streaming']}, reasoning={cap['reasoning']}, cache={cap['prompt_cache']}"
                 )
+            states = await registry.state_snapshot()
+            if states:
+                lines += ["", "Сохранённое состояние:"]
+                for name, state in states.items():
+                    lines.append(
+                        f"{name}: {state.get('state')} "
+                        f"(category={state.get('failure_category') or '—'}, "
+                        f"checked={state.get('last_checked_at') or '—'})"
+                    )
             lines += ["", "Ключи не отображаются."]
             await self.notifier.send_text(message.chat.id, "\n".join(lines))
             return

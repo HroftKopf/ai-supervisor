@@ -552,6 +552,16 @@ class TokenUsage(BaseModel):
     reasoning_tokens: int = Field(default=0, ge=0)
     requests: int = Field(default=0, ge=0)
     duration_ms: int = Field(default=0, ge=0)
+    # Explicit call identity; empty means unknown, never silently Kimi.
+    provider_id: str = ""
+    model_id: str = ""
+    request_id: str = ""
+    logical_call_id: str = ""
+    attempt_id: str = ""
+    account_scope_id: str = ""
+    stage_id: int | None = None
+    reasoning_profile: str = ""
+    role: str = ""
 
     def merge(self, other: TokenUsage) -> TokenUsage:
         return TokenUsage(
@@ -562,6 +572,15 @@ class TokenUsage(BaseModel):
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
             requests=self.requests + other.requests,
             duration_ms=self.duration_ms + other.duration_ms,
+            provider_id=self.provider_id or other.provider_id,
+            model_id=self.model_id or other.model_id,
+            request_id=self.request_id or other.request_id,
+            logical_call_id=self.logical_call_id or other.logical_call_id,
+            attempt_id=other.attempt_id or self.attempt_id,
+            account_scope_id=self.account_scope_id or other.account_scope_id,
+            stage_id=other.stage_id if other.stage_id is not None else self.stage_id,
+            reasoning_profile=other.reasoning_profile or self.reasoning_profile,
+            role=other.role or self.role,
         )
 
     @property
@@ -668,6 +687,7 @@ class TaskRecord(BaseModel):
     blocked_reason: str | None = None
     review_json: str | None = None
     evidence_json: str | None = None
+    evidence_manifest_json: str | None = None
     report: str | None = None
     error: str | None = None
     session_id: str | None = None

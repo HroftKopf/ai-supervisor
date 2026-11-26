@@ -62,6 +62,8 @@ class TaskService:
         request_id: str | None = None,
         intent_source: str = "telegram",
     ) -> TaskRecord:
+        if len(source_request) > 8000:
+            raise TaskError("source_request exceeds 8000 characters")
         now = iso_now()
         cursor = await self.db.execute(
             """
@@ -197,10 +199,6 @@ class TaskService:
     async def update_fields(self, task_id: int, **fields: Any) -> TaskRecord:
         allowed = {
             "title",
-            "request_id",
-            "source_request",
-            "request_revision",
-            "intent_source",
             "task_type",
             "parent_task_id",
             "spec_json",
@@ -217,6 +215,7 @@ class TaskService:
             "blocked_reason",
             "review_json",
             "evidence_json",
+            "evidence_manifest_json",
             "report",
             "error",
             "session_id",

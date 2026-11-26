@@ -392,19 +392,30 @@ async def test_review_checkpoint_resumes_without_rerunning_worker(orchestrator, 
     await tasks.transition(task.id, TaskStatus.PLANNING)
     await tasks.transition(task.id, TaskStatus.QUEUED)
     worktree = project.path
+    evidence_value = Evidence(
+        task_id=task.id,
+        worker=WorkerResult(
+            session_id="s",
+            final_response="done",
+            finish_reason="completed",
+            return_code=0,
+        ),
+        checks=[CheckResult(name="test", command="true", exit_code=0)],
+    )
+    from ai_supervisor.core.evidence_manifest import build_manifest
+
+    manifest = await build_manifest(
+        project=project,
+        task=await tasks.get(task.id),
+        worktree=worktree,
+        evidence=evidence_value,
+        spec=(await tasks.get(task.id)).spec,
+    )
     await tasks.update_fields(
         task.id,
         worktree_path=str(worktree),
-        evidence_json=Evidence(
-            task_id=task.id,
-            worker=WorkerResult(
-                session_id="s",
-                final_response="done",
-                finish_reason="completed",
-                return_code=0,
-            ),
-            checks=[CheckResult(name="test", command="true", exit_code=0)],
-        ).model_dump_json(),
+        evidence_json=evidence_value.model_dump_json(),
+        evidence_manifest_json=manifest.model_dump_json(),
     )
     task = await tasks.get(task.id)
     await orch._execute_task(
@@ -436,3 +447,62 @@ async def test_planner_uses_immutable_source_request(orchestrator, project) -> N
     task = await tasks.get(task.id)
     assert task.source_request == "ORIGINAL REQUEST A"
     assert task.spec is not None and task.spec.source_request == "ORIGINAL REQUEST A"
+
+
+@pytest.mark.asyncio
+async def test_modified_worktree_invalidates_checkpoint(orchestrator, project, repo) -> None:
+    from ai_supervisor.core.evidence_manifest import build_manifest
+    from ai_supervisor.models import Evidence, TaskSpec, TaskStatus, TaskType, WorkerResult
+
+    orch, _supervisor, workers, _notifier, _projects, tasks = orchestrator
+    conversation = await orch.conversations.get_or_create_conversation(424242, project.id)
+    task = await tasks.create(
+        project.id, conversation.id, "checkpoint2", max_rework=1, source_request="original"
+    )
+    spec = TaskSpec(
+        title="checkpoint2",
+        goal="read-only checkpoint task",
+        task_type=TaskType.READ_ONLY,
+        acceptance_criteria=["ok"],
+        source_request="original",
+    )
+    await tasks.save_spec(task.id, spec)
+    await tasks.transition(task.id, TaskStatus.PLANNING)
+    await tasks.transition(task.id, TaskStatus.QUEUED)
+    evidence = Evidence(
+        task_id=task.id,
+        worker=WorkerResult(
+            session_id="s", final_response="done", finish_reason="completed", return_code=0
+        ),
+    )
+    manifest = await build_manifest(
+        project=project, task=await tasks.get(task.id), worktree=repo, evidence=evidence, spec=spec
+    )
+    await tasks.update_fields(
+        task.id,
+        worktree_path=str(repo),
+        evidence_json=evidence.model_dump_json(),
+        evidence_manifest_json=manifest.model_dump_json(),
+    )
+    (repo / "README.md").write_text("changed after evidence\n", encoding="utf-8")
+    task = await tasks.get(task.id)
+    await orch._execute_task(
+        task.id, project=project, project_context="ctx", manual_instruction=None
+    )
+    task = await tasks.get(task.id)
+    assert workers.calls == 0
+    assert task.status is TaskStatus.BLOCKED
+    assert "Evidence устарел" in (task.error or "")
+
+
+@pytest.mark.asyncio
+async def test_update_fields_rejects_original_request_mutation(orchestrator, project) -> None:
+    from ai_supervisor.memory.tasks import TaskError
+
+    _orch, _supervisor, _workers, _notifier, _projects, tasks = orchestrator
+    conversation = await _orch.conversations.get_or_create_conversation(424242, project.id)
+    task = await tasks.create(
+        project.id, conversation.id, "immutable", max_rework=1, source_request="original A"
+    )
+    with pytest.raises(TaskError, match="unexpected task fields"):
+        await tasks.update_fields(task.id, source_request="mutated")

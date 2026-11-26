@@ -54,6 +54,13 @@ class UsageService:
         routing_level: int | None = None,
         context_chars: int | None = None,
         raw_usage: dict[str, Any] | None = None,
+        request_id: str | None = None,
+        logical_call_id: str | None = None,
+        attempt_id: str | None = None,
+        provider_id: str | None = None,
+        account_scope_id: str | None = None,
+        stage_id: int | None = None,
+        reasoning_profile: str | None = None,
     ) -> None:
         if usage.requests == 0 and usage.total_tokens == 0:
             return
@@ -63,8 +70,10 @@ class UsageService:
             INSERT INTO usage_events(task_id, project_id, provider, model, input_tokens,
                 output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, requests,
                 duration_ms, error_category, cost, currency, prompt_version, role,
-                routing_level, context_chars, raw_usage_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                routing_level, context_chars, raw_usage_json, request_id,
+                logical_call_id, attempt_id, provider_id, account_scope_id,
+                stage_id, reasoning_profile, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -88,6 +97,13 @@ class UsageService:
                 __import__("json").dumps(raw_usage, ensure_ascii=False)[:20000]
                 if raw_usage
                 else None,
+                request_id,
+                logical_call_id,
+                attempt_id,
+                provider_id,
+                account_scope_id,
+                stage_id,
+                reasoning_profile,
                 iso_now(),
             ),
         )

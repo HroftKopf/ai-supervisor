@@ -9,6 +9,10 @@ from ai_supervisor.core.interfaces import IncomingMessage
 from ai_supervisor.core.redaction import SecretRedactor
 
 
+class RequestTooLarge(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class RequestEnvelope:
     request_id: str
@@ -38,7 +42,11 @@ def build_envelope(
     redactor: SecretRedactor,
     mode: str = "auto",
 ) -> RequestEnvelope:
-    text = redactor.redact((message.text or "").strip())[:8000]
+    text = redactor.redact((message.text or "").strip())
+    if len(text) > 8000:
+        raise RequestTooLarge(
+            "Запрос превышает 8000 символов; сократите его или разбейте на задачи."
+        )
     request_id = f"req-{uuid.uuid4().hex}"
     return RequestEnvelope(
         request_id=request_id,

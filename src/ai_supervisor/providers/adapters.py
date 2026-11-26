@@ -7,6 +7,7 @@ from ai_supervisor.core.redaction import SecretRedactor
 from ai_supervisor.models import TokenUsage
 from ai_supervisor.providers.base import (
     ProviderAuthenticationError,
+    ProviderCallIdentity,
     ProviderCapabilities,
     ProviderConnectionError,
     ProviderError,
@@ -93,6 +94,7 @@ class KimiProvider:
         purpose: str = "chat",
         reasoning_effort: str | None = None,
         stream: bool = False,
+        identity: ProviderCallIdentity | None = None,
     ) -> ProviderResponse:
         try:
             response = await self.client.complete(
@@ -104,7 +106,8 @@ class KimiProvider:
                 purpose=purpose,
                 reasoning_effort=reasoning_effort,
             )
-            return _convert(response, self.name)
+            converted = _convert(response, self.name)
+            return converted.model_copy(update={"identity": identity})
         except Exception as exc:
             raise normalize_error(exc, self.name) from exc
 
@@ -160,13 +163,18 @@ class OpenAICompatibleProvider:
         )
 
     async def complete(
-        self, messages: Sequence[Mapping[str, Any]], **kwargs: Any
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        identity: ProviderCallIdentity | None = None,
+        **kwargs: Any,
     ) -> ProviderResponse:
         if kwargs.get("reasoning_effort") and not self.capabilities.reasoning:
             kwargs["reasoning_effort"] = None
         try:
             response = await self._client.complete(messages, **kwargs)
-            return _convert(response, self.name)
+            converted = _convert(response, self.name)
+            return converted.model_copy(update={"identity": identity})
         except Exception as exc:
             raise normalize_error(exc, self.name) from exc
 
@@ -241,6 +249,7 @@ class OpenAIProvider:
         purpose: str = "chat",
         reasoning_effort: str | None = None,
         stream: bool = False,
+        identity: ProviderCallIdentity | None = None,
     ) -> ProviderResponse:
         system_parts: list[str] = []
         input_items: list[dict[str, Any]] = []
@@ -296,8 +305,10 @@ class OpenAIProvider:
         try:
             response = await self._client.responses.create(**kwargs)
             if stream:
-                return await self._consume_stream(response)
-            return self._normalize(response)
+                normalized = await self._consume_stream(response)
+            else:
+                normalized = self._normalize(response)
+            return normalized.model_copy(update={"identity": identity})
         except ProviderError:
             raise
         except Exception as exc:
