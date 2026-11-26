@@ -20,8 +20,9 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 | Проверка | Результат |
 |---|---|
 | `ruff check .` | все проверки пройдены |
-| `pytest -q` | **25 passed, 2 skipped** |
+| `pytest -q` | **34 passed, 3 skipped** |
 | `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py` | **2 passed** |
+| `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py` | **1 passed** |
 | bwrap probe | OK (user namespaces, read-only `/usr`) |
 | DSH runtime `sdk-minimal` init | OK |
 | Реальный DSH turn через mock Messages API | `completed`, usage input=42 output=7 cached=3 requests=1 |
@@ -46,13 +47,11 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 
 ### Что не проверено живьём
 
-Нет ключей в среде разработки, поэтому не выполнялись:
-
-- реальный `GET /models` и chat completions Kimi Code/Moonshot;
 - реальный Telegram `getMe`/long polling/кнопки;
 - реальный платный DeepSeek endpoint (вместо него — локальный Messages-совместимый mock).
 
-Эти проверки нужно выполнить после заполнения `.env`:
+Kimi API проверен живьём через `AI_SUPERVISOR_RUN_LIVE_KIMI=1` (chat/classify/plan/review).
+Telegram-проверку нужно выполнить после настройки и запуска бота:
 
 ```bash
 ai-supervisor doctor
@@ -60,6 +59,11 @@ ai-supervisor run
 ```
 
 `doctor` безопасно проверяет Kimi `/models`, Telegram `getMe`, DSH runtime и bwrap.
+Живой Kimi smoke можно повторить отдельно:
+
+```bash
+AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py -s
+```
 Затем создайте тестовую задачу на небольшом проекте и проверьте отчёт, `/diff`, `/logs`,
 кнопки «Принять»/«На доработку»/«Откатить».
 

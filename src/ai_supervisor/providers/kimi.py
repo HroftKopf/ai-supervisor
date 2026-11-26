@@ -6,7 +6,7 @@ import logging
 import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import openai
 from openai import AsyncOpenAI
@@ -180,10 +180,23 @@ class KimiClient:
         *,
         max_completion_tokens: int | None = None,
         tools: Sequence[Mapping[str, Any]] | None = None,
-        tool_choice: str | Mapping[str, Any] | None = None,
+        tool_choice: Literal["auto", "none", "required"] | None = None,
         prompt_cache_key: str | None = None,
         purpose: str = "chat",
     ) -> KimiResponse:
+        if isinstance(tool_choice, Mapping):
+            raise KimiConfigurationError(
+                "Forced named tool_choice objects are incompatible with K3.1 thinking. "
+                "Use tool_choice='required' with exactly the required tool in tools."
+            )
+        if tool_choice not in {None, "auto", "none", "required"}:
+            raise KimiConfigurationError(f"Unsupported tool_choice: {tool_choice!r}")
+        if tool_choice == "required" and not tools:
+            raise KimiConfigurationError(
+                "tool_choice='required' needs at least one tool definition"
+            )
+        if tools and tool_choice is None:
+            tool_choice = "auto"
         kwargs: dict[str, Any] = {
             "model": self.config.model,
             "messages": list(messages),
@@ -450,11 +463,16 @@ def structured_tool(
 def parse_tool_call(response: KimiResponse, expected_name: str) -> dict[str, Any]:
     if not response.tool_calls:
         raise KimiProtocolError(f"Kimi не вызвал обязательный инструмент {expected_name!r}.")
-    call = next((item for item in response.tool_calls if item.name == expected_name), None)
-    if call is None:
+    if len(response.tool_calls) != 1:
         names = ", ".join(item.name for item in response.tool_calls)
         raise KimiProtocolError(
-            f"Kimi вызвал неожиданный инструмент ({names}); ожидался {expected_name!r}."
+            f"Kimi вернул несколько вызовов инструментов ({names}); ожидался ровно один "
+            f"{expected_name!r}."
+        )
+    call = response.tool_calls[0]
+    if call.name != expected_name:
+        raise KimiProtocolError(
+            f"Kimi вызвал неожиданный инструмент {call.name!r}; ожидался {expected_name!r}."
         )
     try:
         value = json.loads(call.arguments or "{}")

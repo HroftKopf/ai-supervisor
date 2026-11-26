@@ -5,7 +5,7 @@
 | Компонент | Файлы | Состояние |
 |---|---|---|
 | Telegram long polling, owner auth, dedupe | `telegram/` | реализовано, live не проверено |
-| Kimi provider | `providers/kimi.py`, `agents/supervisor.py` | реализовано, live не проверено |
+| Kimi provider | `providers/kimi.py`, `agents/supervisor.py` | реализовано, live chat/classify/plan/review проверены |
 | DeepSeek Harness SDK | `worker_runner.py`, `core/worker_manager.py` | реализовано, проверено с mock DSH |
 | bwrap sandbox | `core/sandbox.py` | реализовано, проверено |
 | Git worktree / diff / merge / rollback | `core/workspace.py` | реализовано, проверено |
@@ -67,7 +67,7 @@
 8. **Откат после merge** — вручную `git revert`; автоматический rollback Phase 1 не делает.
 9. **Resume DSH** — может не сработать при несовместимой/повреждённой сессии; молчаливой подмены нет.
 10. **MCP/SSH/браузер/контейнеры** — не реализованы (Phase 4).
-11. **Живые Kimi/Telegram/DeepSeek** не проверены из-за отсутствия ключей; см. docs/TESTING.md.
+11. **Живые Telegram и платный DeepSeek** не проверены; Kimi API проверен живьём, DeepSeek SDK — на локальном Messages-mock. См. docs/TESTING.md.
 12. **systemd unit** — пример; пути и ReadWritePaths нужно адаптировать.
 13. **DeepSeek endpoint** — SDK использует Messages API; нужен совместимый endpoint.
 14. **Root/home** — worker не получает домашнюю директорию, но host network остаётся.
@@ -76,17 +76,17 @@
 
 | # | Критерий | Статус |
 |---|---|---|
-| 1 | Написать Kimi через Telegram | код готов; live не проверено (нет токена) |
-| 2 | Обычное общение | код + тест с fake Kimi |
-| 3 | Формирование ТЗ | code + schema test |
+| 1 | Написать Kimi через Telegram | код готов; live Telegram не проверено (нет запущенного бота) |
+| 2 | Обычное общение | код + fake Kimi + live Kimi chat |
+| 3 | Формирование ТЗ | code + schema test + live Kimi plan |
 | 4 | DeepSeek получает ТЗ без копирования | worker prompt + SDK, mock test |
 | 5 | Работа в разрешённом окружении | bwrap + worktree, integration test |
-| 6 | Kimi получает фактические результаты | evidence builder, unit test |
+| 6 | Kimi получает фактические результаты | evidence builder, unit test + live review |
 | 7 | Отчёт в Telegram | report + fake notifier test; live не проверено |
 | 8 | Повторная доработка | rework loop test |
 | 9 | История после перезапуска | SQLite reconnect test |
 | 10 | Посторонний не управляет | owner middleware tests |
-| 11 | Критические операции требуют подтверждения | approvals + button merge; tests |
+| 11 | Критические операции требуют подтверждения | approvals + button merge/rollback; tests |
 | 12 | Зависший исполнитель останавливается | stop test + timeout/kill |
 | 13 | Ключи не в репозитории/логах | .gitignore, redaction tests |
 | 14 | Worker не блокирует Telegram | aiogram tasks + background jobs; unit design |

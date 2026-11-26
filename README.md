@@ -5,9 +5,10 @@
 **Python-оркестратор** — управляющая инфраструктура.
 
 > Статус: **Phase 1 (MVP) реализован**. Код, unit-тесты и изолированный запуск DeepSeek Harness
-> проверены локально. Живые проверки Kimi API и Telegram не выполнялись, потому что в среде
-> разработки нет ключей. Это явно указано в разделе [«Что проверено»](#что-проверено).
-> Система не заявляет о непроверенных функциях как о работающих.
+> проверены локально. Живые сценарии Kimi API (общение, классификация, ТЗ, ревью) проверены
+> через настроенный endpoint; Telegram Bot API и платный DeepSeek endpoint ещё не проверялись.
+> Это явно указано в разделе [«Что проверено»](#что-проверено). Система не заявляет о
+> непроверенных функциях как о работающих.
 
 ---
 
@@ -281,11 +282,15 @@ memory_mb = 4096
 
 Выполнено:
 
-- `pytest`: **25 passed, 2 skipped** (интеграционные тесты по умолчанию пропускаются).
+- `pytest`: **34 passed, 3 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
   Проверены запуск runtime, проброс `DEEPSEEK_BASE_URL`, запись результата, usage (input 42,
-  output 7, cached 3, requests 1) и завершение `completed`.
+  output 7, cached 3, requests 1), завершение `completed` и реальный `bash` tool call,
+  изменивший файл в worktree.
+- `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest tests/test_kimi_live.py`: **1 passed** — реальные
+  запросы к настроенному Kimi API: обычное общение (`tool_choice=auto`), классификация,
+  формирование ТЗ и ревью (`tool_choice=required` + ровно один инструмент).
 - `ruff check .`: все проверки пройдены.
 - `bwrap` probe: user namespaces + read-only `/usr` + изолированный worktree.
 - Ручной end-to-end оркестрации с fake Kimi и реальным Git: plan → execute → diff → review →
@@ -293,13 +298,16 @@ memory_mb = 4096
 - SQLite WAL/FTS5, восстановление истории, redaction, path traversal, approval expiry,
   owner middleware, duplicate update.
 
-**Не проверено живьём (нет ключей):**
+**Не проверено живьём:**
 
-- реальный Kimi Code/Moonshot API (включая `/models`, streaming tool calls, rate limit/quota);
 - реальный Telegram Bot API (getMe, long polling, кнопки);
-- реальный DeepSeek API (использовался локальный Messages-mock, а не платный endpoint).
+- реальный платный DeepSeek endpoint (использовался локальный Messages-mock, а не платный endpoint).
 
-Эти проверки нужно сделать после заполнения `.env`:
+Kimi Code API проверен живьём: `/models`, streaming chat, classify, ТЗ и review с
+`tool_choice=required` и одним инструментом. Ошибка `tool_choice 'specified' is incompatible
+with thinking enabled` больше не воспроизводится; подробности в [docs/KIMI_FIX.md](docs/KIMI_FIX.md).
+
+Эти проверки нужно выполнить отдельно (Telegram и платный DeepSeek):
 
 ```bash
 ai-supervisor doctor

@@ -58,6 +58,11 @@
 - Tool calls собираются из stream-дельт, аргументы валидируются Pydantic.
 - Retry только для временных 429/5xx/сетевых ошибок; quota/401/403/400 — без retry.
 - Модель не подменяется.
+- `tool_choice` — только строка: `required` при обязательном вызове ровно одного инструмента;
+  `auto` для обычного общения. Именованные объекты
+  `{"type":"function","function":{"name":...}}` запрещены: K3.1 thinking отвечает на них
+  HTTP 400 `tool_choice 'specified' is incompatible with thinking enabled`.
+- Живая проверка 2026-11-26: chat (`auto`), classify/plan/review (`required`) прошли.
 
 Примечание: URL `https://deepseek-harness.github.io/...` из первоначального ТЗ на момент проверки
 возвращал 404. Актуальная документация SDK находится в GitHub-репозитории и в установленном пакете.

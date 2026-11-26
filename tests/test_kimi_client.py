@@ -144,3 +144,116 @@ async def test_tool_call_assistant_message_preserves_reasoning() -> None:
     message = response.assistant_message()
     assert message["reasoning_content"] == "reason"
     assert message["tool_calls"][0]["function"]["name"] == "submit_intent"
+
+
+def _fake_stream() -> SimpleNamespace:
+    async def create(**kwargs):  # type: ignore[no-untyped-def]
+        async def stream():
+            yield SimpleNamespace(
+                model="k3.1-pro",
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        delta=SimpleNamespace(
+                            reasoning_content=None, content="ok", tool_calls=None
+                        ),
+                    )
+                ],
+            )
+
+        return stream()
+
+    return SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        close=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_named_tool_choice_is_rejected_before_http() -> None:
+    from ai_supervisor.providers.kimi import KimiConfigurationError, structured_tool
+
+    client = _client()
+    fake = _fake_stream()
+    client._client = fake  # type: ignore[assignment]
+    tool = structured_tool(name="submit_intent", description="x", parameters={"type": "object"})
+    with pytest.raises(KimiConfigurationError, match="incompatible"):
+        await client.complete(
+            [{"role": "user", "content": "hi"}],
+            tools=[tool],
+            tool_choice={"type": "function", "function": {"name": "submit_intent"}},  # type: ignore[arg-type]
+        )
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_required_tool_choice_needs_tools() -> None:
+    from ai_supervisor.providers.kimi import KimiConfigurationError
+
+    client = _client()
+    with pytest.raises(KimiConfigurationError, match="needs at least one"):
+        await client.complete([{"role": "user", "content": "hi"}], tool_choice="required")
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_and_required_are_sent_as_strings() -> None:
+    from ai_supervisor.providers.kimi import structured_tool
+
+    captured: list[dict[str, object]] = []
+
+    async def create(**kwargs):  # type: ignore[no-untyped-def]
+        captured.append(kwargs)
+
+        async def stream():
+            yield SimpleNamespace(
+                model="k3.1-pro",
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        delta=SimpleNamespace(
+                            reasoning_content=None, content="ok", tool_calls=None
+                        ),
+                    )
+                ],
+            )
+
+        return stream()
+
+    client = _client()
+    client._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        close=AsyncMock(),
+    )
+    tool = structured_tool(name="submit_intent", description="x", parameters={"type": "object"})
+    await client.complete([{"role": "user", "content": "chat"}], tool_choice="auto")
+    await client.complete(
+        [{"role": "user", "content": "task"}], tools=[tool], tool_choice="required"
+    )
+    await client.complete([{"role": "user", "content": "tools"}], tools=[tool])
+    assert captured[0]["tool_choice"] == "auto"
+    assert captured[1]["tool_choice"] == "required"
+    assert len(captured[1]["tools"]) == 1  # type: ignore[arg-type]
+    assert captured[2]["tool_choice"] == "auto"
+    assert all(not isinstance(item["tool_choice"], dict) for item in captured)
+    await client.close()
+
+
+def test_parse_tool_call_rejects_multiple_calls() -> None:
+    from ai_supervisor.providers.kimi import (
+        KimiProtocolError,
+        KimiResponse,
+        KimiToolCall,
+        parse_tool_call,
+    )
+
+    response = KimiResponse(
+        tool_calls=[
+            KimiToolCall(id="1", name="submit_intent", arguments="{}"),
+            KimiToolCall(id="2", name="other", arguments="{}"),
+        ]
+    )
+    with pytest.raises(KimiProtocolError, match="несколько"):
+        parse_tool_call(response, "submit_intent")

@@ -268,6 +268,7 @@ class SupervisorAgent:
                 last_user["content"] = blocks
         response = await self.kimi.complete(
             api_messages,
+            tool_choice="auto",
             max_completion_tokens=16384,
             prompt_cache_key=f"conv-{conversation_id}",
             purpose="chat",
@@ -308,7 +309,7 @@ class SupervisorAgent:
             response = await self.kimi.complete(
                 current_messages,
                 tools=[tool],
-                tool_choice={"type": "function", "function": {"name": expected_name}},
+                tool_choice="required",
                 max_completion_tokens=max_completion_tokens,
                 prompt_cache_key=prompt_cache_key,
                 purpose=purpose,
@@ -323,38 +324,57 @@ class SupervisorAgent:
                 logger.warning(
                     "%s structured output rejected (attempt %s): %s", purpose, attempt + 1, exc
                 )
-                if attempt == 1 or not response.tool_calls:
+                if attempt == 1:
                     break
-                call = next(
-                    (item for item in response.tool_calls if item.name == expected_name), None
+                # Keep the full assistant message, including reasoning_content, then
+                # answer every tool call so Kimi can continue the same reasoning turn.
+                if response.content or response.reasoning_content or response.tool_calls:
+                    current_messages.append(response.assistant_message())
+                self._append_tool_error_results(
+                    current_messages,
+                    response,
+                    expected_name=expected_name,
+                    error=last_error,
                 )
-                if call is None:
-                    break
-                # Correct tool-call protocol: keep the full assistant message (with
-                # reasoning_content), append the matching tool result, retry once.
-                current_messages.append(response.assistant_message())
-                current_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "content": json.dumps(
-                            {
-                                "status": "error",
-                                "error": f"schema validation failed: {last_error}"[:2000],
-                            },
-                            ensure_ascii=False,
-                        ),
-                    }
-                )
-                current_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Аргументы не прошли валидацию. Исправь их и снова вызови "
-                            f"{expected_name}. Ошибка: {last_error[:1500]}"
-                        ),
-                    }
-                )
+                if not response.tool_calls:
+                    current_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Ты не вызвал обязательный инструмент "
+                                f"{expected_name}. Верни вызов этого инструмента с корректными "
+                                f"аргументами. Ошибка: {last_error[:1500]}"
+                            ),
+                        }
+                    )
         raise SupervisorError(
-            f"Kimi не смог вернуть корректный структурированный результат ({purpose}): {last_error}"
+            f"Kimi не вернул корректный вызов инструмента {expected_name!r} ({purpose}): {last_error}"
         )
+
+    @staticmethod
+    def _append_tool_error_results(
+        messages: list[dict[str, Any]],
+        response: KimiResponse,
+        *,
+        expected_name: str,
+        error: str,
+    ) -> None:
+        """Answer every returned tool call; Kimi rejects an assistant tool call without a result."""
+        for call in response.tool_calls:
+            if call.name == expected_name:
+                detail = f"Аргументы {expected_name} не прошли валидацию: {error[:2000]}"
+            else:
+                detail = (
+                    f"Неожиданный инструмент {call.name!r}; в этом режиме разрешён только "
+                    f"{expected_name!r}."
+                )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(
+                        {"status": "error", "error": detail},
+                        ensure_ascii=False,
+                    ),
+                }
+            )
