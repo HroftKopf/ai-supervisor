@@ -440,7 +440,17 @@ class Handlers:
         if not text:
             await self.notifier.send_text(message.chat.id, "Использование: /task <текст задачи>")
             return
-        await self.orchestrator.create_task_from_text(message.chat.id, message.from_user.id, text)
+        await self.orchestrator.create_task_from_text(
+            message.chat.id,
+            message.from_user.id,
+            text,
+            source_message_id=getattr(message, "message_id", None),
+            idempotency_key=(
+                f"telegram:{message.chat.id}:{getattr(message, 'message_id', None)}:task"
+                if getattr(message, "message_id", None) is not None
+                else None
+            ),
+        )
 
     async def cmd_task_info(self, message: Message) -> None:
         task = await self._task_from_message(message)

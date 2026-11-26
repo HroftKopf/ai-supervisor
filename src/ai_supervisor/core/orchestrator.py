@@ -56,6 +56,7 @@ from ai_supervisor.core.workspace import WorkspaceError, WorkspaceManager
 from ai_supervisor.memory.conversations import ConversationService
 from ai_supervisor.memory.experience import ExperienceExtractor
 from ai_supervisor.memory.projects import ProjectError, ProjectService, validate_remote_url
+from ai_supervisor.memory.requests import RequestService
 from ai_supervisor.memory.stages import StageError, TaskStageService
 from ai_supervisor.memory.tasks import TaskError, TaskService
 from ai_supervisor.models import (
@@ -195,6 +196,7 @@ class Orchestrator:
         self.tasks = tasks
         self.stages = TaskStageService(tasks.db)
         self.experience = ExperienceExtractor(conversations)
+        self.requests = RequestService(tasks.db)
         self.progress = ProgressManager(
             settings=settings,
             tasks=tasks,
@@ -276,6 +278,7 @@ class Orchestrator:
                         self._spawn_job(task.id, plan_if_needed=False, manual_instruction=None)
         if self.settings.app.auto_resume_git_auth_blocked:
             await self._auto_resume_git_auth_blocked()
+        await self.requests.recovery_reset()
         await self.progress.restore_active(self.settings.owner_id)
 
     async def _auto_resume_git_auth_blocked(self) -> None:
@@ -399,6 +402,18 @@ class Orchestrator:
         except RequestTooLarge as exc:
             await self.notifier.send_text(message.chat_id, str(exc))
             return
+        captured, created = await self.requests.capture(envelope)
+        if not created:
+            task_id = captured.get("task_id")
+            if task_id:
+                await self.notifier.send_text(
+                    message.chat_id, f"Это сообщение уже создало задачу #{int(task_id):03d}."
+                )
+            else:
+                await self.notifier.send_text(
+                    message.chat_id, "Это сообщение уже обрабатывается или уже обработано."
+                )
+            return
         attachment_text, images = await self._prepare_attachments(message)
         text = (message.text or "").strip()
         if text:
@@ -460,10 +475,11 @@ class Orchestrator:
                 question,
                 meta={"kind": "clarification"},
             )
+            await self.requests.mark_status(envelope.request_id, "clarification")
             await self.notifier.send_text(message.chat_id, question)
             return
         if intent_result.kind is IntentKind.TASK and not ambiguous:
-            await self._begin_task(
+            task = await self._begin_task(
                 project=project,
                 conversation_id=conversation.id,
                 chat_id=message.chat_id,
@@ -471,8 +487,11 @@ class Orchestrator:
                 request_text=envelope.original_text,
                 request_id=envelope.request_id,
             )
+            if task is None:
+                await self.requests.mark_status(envelope.request_id, "rejected")
             return
 
+        await self.requests.mark_status(envelope.request_id, "chat")
         await self._chat(
             project=project,
             conversation=conversation,
@@ -653,9 +672,9 @@ class Orchestrator:
         title_hint: str,
         request_text: str = "",
         request_id: str | None = None,
-    ) -> None:
+    ) -> TaskRecord | None:
         async with self._creation_lock:
-            await self._begin_task_locked(
+            return await self._begin_task_locked(
                 project=project,
                 conversation_id=conversation_id,
                 chat_id=chat_id,
@@ -673,7 +692,7 @@ class Orchestrator:
         title_hint: str,
         request_text: str = "",
         request_id: str | None = None,
-    ) -> None:
+    ) -> TaskRecord | None:
         active = await self.tasks.active(project.id)
         if active:
             ids = ", ".join(f"#{task.id:03d}" for task in active)
@@ -682,8 +701,8 @@ class Orchestrator:
                 f"В проекте {project.name} уже есть активная задача {ids}. "
                 "Дождитесь её завершения, примите/отклоните изменения или остановите её через /stop.",
             )
-            return
-        title = (title_hint or "Новая задача").strip()[:120]
+            return None
+        title = self.redactor.redact((title_hint or "Новая задача").strip())[:120]
         task = await self.tasks.create(
             project.id,
             conversation_id,
@@ -694,8 +713,11 @@ class Orchestrator:
             intent_source="telegram",
         )
         await self.tasks.add_event(task.id, "accepted", "Задача принята от владельца")
+        if request_id:
+            await self.requests.attach_task(request_id, task.id)
         await self.progress.update(task.id, force=True, chat_id=chat_id)
         self._spawn_job(task.id, plan_if_needed=True, manual_instruction=None)
+        return task
 
     def _spawn_job(
         self, task_id: int, *, plan_if_needed: bool, manual_instruction: str | None
@@ -3618,7 +3640,15 @@ class Orchestrator:
             chat_id=chat_id,
         )
 
-    async def create_task_from_text(self, chat_id: int, user_id: int, text: str) -> None:
+    async def create_task_from_text(
+        self,
+        chat_id: int,
+        user_id: int,
+        text: str,
+        *,
+        source_message_id: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> None:
         self._assert_owner(user_id)
         self._assert_owner_chat(chat_id)
         project = await self._current_project(chat_id)
@@ -3630,14 +3660,49 @@ class Orchestrator:
             await self.notifier.send_text(chat_id, "Задача превышает 8000 символов; сократите её.")
             return
         conversation = await self.conversations.get_or_create_conversation(chat_id, project.id)
-        await self._begin_task(
+        from ai_supervisor.core.interfaces import IncomingMessage
+
+        if idempotency_key is None and source_message_id is None:
+            # Internal callers must provide stable idempotency; a random fallback
+            # prevents accidental cross-request dedup but is not retry-safe.
+            idempotency_key = f"internal:{uuid.uuid4().hex}"
+        try:
+            envelope = build_envelope(
+                IncomingMessage(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    text=clean_text,
+                    telegram_message_id=source_message_id,
+                ),
+                project_id=project.id,
+                conversation_id=conversation.id,
+                redactor=self.redactor,
+                mode="task",
+                idempotency_key=idempotency_key,
+            )
+        except RequestTooLarge as exc:
+            await self.notifier.send_text(chat_id, str(exc))
+            return
+        captured, created = await self.requests.capture(envelope)
+        if not created:
+            task_id = captured.get("task_id")
+            if task_id:
+                await self.notifier.send_text(
+                    chat_id, f"Это сообщение уже создало задачу #{int(task_id):03d}."
+                )
+            else:
+                await self.notifier.send_text(chat_id, "Этот запрос уже обрабатывается.")
+            return
+        task = await self._begin_task(
             project=project,
             conversation_id=conversation.id,
             chat_id=chat_id,
             title_hint=text.strip()[:120] or "Задача",
             request_text=clean_text,
-            request_id=f"req-{__import__('uuid').uuid4().hex}",
+            request_id=envelope.request_id,
         )
+        if task is None:
+            await self.requests.mark_status(envelope.request_id, "rejected")
 
     async def queue_text(self, chat_id: int) -> str:
         project = await self._current_project(chat_id)

@@ -28,7 +28,7 @@ Baseline: `a8fcb07`. No paid API calls, no production credentials used, no produ
   conversation/project IDs, source message ID, normalized redacted text, attachment refs,
   timestamp, mode, source revision and policy ID.
 - SQLite schema v8 adds `tasks.request_id`, `source_request`, `request_revision`,
-  `intent_source`; schema v9 adds provider state generation.
+  `intent_source`; schema v10 adds durable request/dedup table and provider state generation.
 - New tasks store the original request at creation. Planner uses `task.source_request`; new
   conversation messages cannot replace it.
 - Legacy tasks default to `legacy-inferred` when no original request exists.
@@ -66,13 +66,13 @@ evidence is preserved and the task is blocked for an owner decision rather than 
 
 ### Schema
 
-SQLite schema v8 added request provenance and usage identity; schema v9 adds provider state
+SQLite schema v8 added request provenance and usage identity; schema v10 adds provider state
 generation. Migration backup is
-`pre-migration-v9-*.db`; additive columns preserve existing data.
+`pre-migration-v10-*.db`; additive columns preserve existing data.
 
 ## Verification
 
-- **174 passed, 4 skipped**, synthetic credentials only.
+- **183 passed, 4 skipped**, synthetic credentials only.
 - Offline benchmark after the change (single samples, current host): memory search 0.88–1.04 ms,
   context build 0.43–0.54 ms, state transitions median 3.5–3.6 ms, 20 scheduler jobs 0.28–0.30 ms,
   recovery 0.53–0.57 ms, peak context 25,693 B. These are slower than the Phase 2.9 sample
@@ -85,7 +85,7 @@ generation. Migration backup is
 
 ## Coverage
 
-Coverage is not at the Phase 2.9.3 target. The current measured result is approximately **68% statements / 51% branches (64% combined)**. Telegram handlers, WorkerManager edge branches,
+Coverage is not at the Phase 2.9.3 target. The current measured result is approximately **69% statements / 51% branches (64% combined)**. Telegram handlers, WorkerManager edge branches,
 sandbox mount failures and a full fault matrix remain uncovered. No exclusions were used to
 inflate the result.
 
@@ -98,8 +98,8 @@ inflate the result.
 | Quota isolation | VERIFIED offline | provider-scoped gate + test |
 | Persisted quota state | IMPLEMENTED_NOT_VERIFIED | `provider_states.generation`, atomic recovery, hydrate; live paid probe not run |
 | Owner-approved generation recovery | IMPLEMENTED_NOT_VERIFIED | minimal no-tool probe + approval binding + single-flight; offline mock only |
-| Immutable original request | PARTIAL | source_request immutable; amendment flow not implemented |
-| Telegram dedup | PARTIAL | existing middleware; no SQLite task unique key |
+| Immutable original request | PARTIAL | immutable source_request + reject update; owner amendments not implemented |
+| Telegram dedup | VERIFIED offline | durable `requests.dedup_key`, unique task `request_id`, concurrency tests |
 | Evidence manifest | PARTIAL | `EvidenceManifest` + HEAD/dirty invalidation tests; untracked metadata fingerprint is stat-based |
 | Review checkpoint | PARTIAL | approved resume works; non-approved checkpoint blocks instead of full parity |
 | Budget Engine 2.0 | NOT_IMPLEMENTED | no reservation lifecycle/preflight |
@@ -129,6 +129,6 @@ inflate the result.
 
 ## Update / rollback
 
-Update normally; schema v9 is additive with backup. Rollback the commit; existing tasks retain
+Update normally; schema v10 is additive with backup. Rollback the commit; existing tasks retain
 request provenance columns and legacy tasks remain readable. Do not delete logs or backups without
 owner approval.

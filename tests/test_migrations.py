@@ -49,7 +49,7 @@ async def test_v1_database_is_migrated_with_backup(tmp_path: Path) -> None:
     await db.connect()
     try:
         version = await db.scalar("SELECT value FROM schema_meta WHERE key='schema_version'")
-        assert version == "9"
+        assert version == "10"
         task_columns = {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(tasks)")}
         project_columns = {
             str(row["name"]) for row in await db.fetchall("PRAGMA table_info(projects)")
@@ -81,6 +81,13 @@ async def test_v1_database_is_migrated_with_backup(tmp_path: Path) -> None:
             "request_revision",
             "intent_source",
         } <= task_ui_columns
+        assert {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(requests)")} >= {
+            "request_id",
+            "dedup_key",
+            "original_request",
+            "revision",
+            "task_id",
+        }
         memory_columns = {
             str(row["name"]) for row in await db.fetchall("PRAGMA table_info(memories)")
         }
@@ -95,6 +102,6 @@ async def test_v1_database_is_migrated_with_backup(tmp_path: Path) -> None:
             "status",
             "result_json",
         } <= stage_columns
-        assert list((tmp_path / "backups").glob("pre-migration-v9-*.db"))
+        assert list((tmp_path / "backups").glob("pre-migration-v10-*.db"))
     finally:
         await db.close()

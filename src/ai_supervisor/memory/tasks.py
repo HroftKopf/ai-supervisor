@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Sequence
 from typing import Any
 
@@ -65,26 +66,36 @@ class TaskService:
         if len(source_request) > 8000:
             raise TaskError("source_request exceeds 8000 characters")
         now = iso_now()
-        cursor = await self.db.execute(
-            """
-            INSERT INTO tasks(project_id, conversation_id, title, request_id,
-                              source_request, intent_source, status, max_rework,
-                              created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                project_id,
-                conversation_id,
-                title.strip()[:120] or "Задача",
-                request_id,
-                source_request.strip()[:8000],
-                intent_source,
-                TaskStatus.CREATED.value,
-                max_rework,
-                now,
-                now,
-            ),
-        )
+        try:
+            cursor = await self.db.execute(
+                """
+                INSERT INTO tasks(project_id, conversation_id, title, request_id,
+                                  source_request, intent_source, status, max_rework,
+                                  created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    conversation_id,
+                    title.strip()[:120] or "Задача",
+                    request_id,
+                    source_request.strip()[:8000],
+                    intent_source,
+                    TaskStatus.CREATED.value,
+                    max_rework,
+                    now,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            if request_id:
+                row = await self.db.fetchone(
+                    "SELECT * FROM tasks WHERE request_id = ? ORDER BY id LIMIT 1",
+                    (request_id,),
+                )
+                if row is not None:
+                    return TaskRecord.model_validate(row_to_dict(row))
+            raise
         task_id = int(cursor.lastrowid or 0)
         await cursor.close()
         task = await self.get(task_id)

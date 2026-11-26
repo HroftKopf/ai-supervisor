@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def iso_now() -> str:
@@ -94,6 +94,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     project_id INTEGER NOT NULL REFERENCES projects(id),
     conversation_id INTEGER NOT NULL REFERENCES conversations(id),
     title TEXT NOT NULL,
+    request_id TEXT,
+    source_request TEXT NOT NULL DEFAULT '',
+    request_revision INTEGER NOT NULL DEFAULT 1,
+    intent_source TEXT NOT NULL DEFAULT 'legacy-inferred',
+    evidence_manifest_json TEXT,
     status TEXT NOT NULL,
     task_type TEXT NOT NULL DEFAULT 'modify',
     parent_task_id INTEGER,
@@ -266,6 +271,27 @@ CREATE TABLE IF NOT EXISTS usage_events (
 
 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_events(created_at);
 
+CREATE TABLE IF NOT EXISTS requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL UNIQUE,
+    dedup_key TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    owner_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    source_message_id INTEGER,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    original_request TEXT NOT NULL,
+    attachment_refs_json TEXT NOT NULL DEFAULT '[]',
+    mode TEXT NOT NULL DEFAULT 'auto',
+    revision INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'captured',
+    task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status, created_at);
+
 CREATE TABLE IF NOT EXISTS processed_updates (
     update_id INTEGER PRIMARY KEY,
     processed_at TEXT NOT NULL
@@ -364,6 +390,10 @@ class Database:
             await conn.execute("PRAGMA busy_timeout=5000")
             await conn.executescript(SCHEMA)
             await self._migrate(conn)
+            await conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_request_id "
+                "ON tasks(request_id) WHERE request_id IS NOT NULL"
+            )
             try:
                 await conn.executescript(FTS_SCHEMA)
                 self.fts_available = True
@@ -394,6 +424,28 @@ class Database:
                 backup_dir=self.backup_dir,
                 keep=self.backup_keep,
             )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                dedup_key TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL,
+                owner_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                source_message_id INTEGER,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                original_request TEXT NOT NULL,
+                attachment_refs_json TEXT NOT NULL DEFAULT '[]',
+                mode TEXT NOT NULL DEFAULT 'auto',
+                revision INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'captured',
+                task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS provider_states (
@@ -486,6 +538,10 @@ class Database:
                 for name, definition in columns.items():
                     if name not in existing:
                         await conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+            await conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_request_id "
+                "ON tasks(request_id) WHERE request_id IS NOT NULL"
+            )
             await conn.execute(
                 "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",

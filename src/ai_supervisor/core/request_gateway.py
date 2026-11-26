@@ -27,6 +27,7 @@ class RequestEnvelope:
     timestamp: datetime
     mode: str
     source_revision: int
+    dedup_key: str = ""
     policy_id: str = "owner-v1"
 
     @property
@@ -41,6 +42,7 @@ def build_envelope(
     conversation_id: int,
     redactor: SecretRedactor,
     mode: str = "auto",
+    idempotency_key: str | None = None,
 ) -> RequestEnvelope:
     text = redactor.redact((message.text or "").strip())
     if len(text) > 8000:
@@ -48,6 +50,14 @@ def build_envelope(
             "Запрос превышает 8000 символов; сократите его или разбейте на задачи."
         )
     request_id = f"req-{uuid.uuid4().hex}"
+    if idempotency_key:
+        dedup_key = idempotency_key
+    elif message.telegram_message_id is not None:
+        dedup_key = f"telegram:{message.chat_id}:{message.telegram_message_id}:{mode}"
+    else:
+        # Internal/non-Telegram callers may omit a source id; preserve a
+        # correlation key but do not claim durable deduplication for them.
+        dedup_key = f"internal:{uuid.uuid4().hex}"
     return RequestEnvelope(
         request_id=request_id,
         correlation_id=request_id,
@@ -61,4 +71,5 @@ def build_envelope(
         timestamp=datetime.now(UTC),
         mode=mode,
         source_revision=1,
+        dedup_key=dedup_key,
     )

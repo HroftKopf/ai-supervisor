@@ -36,13 +36,27 @@ Current state after this work: see final commit/report.
   worktree freshness are partial.
 - Orchestrator decomposition: not started; orchestrator remains monolithic.
 - Owner amendments/revisions and approval invalidation are not implemented.
-- Dedup is still middleware-based; no SQLite unique dedup key on task creation.
-- Request ID is not persisted on every stage/usage event; usage has identity columns but stage
-  foreign-key linkage is not complete.
+- Request ID is persisted on tasks/requests; stage/usage foreign-key linkage is still partial.
 - Full fault-injection matrix, multi-process SQLite, disk-full, and live provider/Telegram tests are
   not complete.
 - Learning chapters 12–18 and architecture docs CONTROL_PLANE/PROVIDER_LIFECYCLE/TASK_RECOVERY/
   CONTEXT_ENGINE/BUDGET_ENGINE are not complete.
+
+## Request integrity / deduplication (B.1)
+
+- Durable `requests` table with unique `dedup_key`.
+- Dedup key is Telegram-derived: `telegram:<chat_id>:<message_id>:<mode>`.
+- Request capture is atomic and single-winner; concurrent duplicates cannot start a second planner/worker.
+- Task creation has a unique `request_id` constraint; duplicate creates return the existing task.
+- `/task` and `/auto` both use the request gateway; `/task` preserves `source_message_id`.
+- `recovery_reset()` returns crashed `processing` requests to `captured` only when no task was attached.
+- `source_request` remains immutable through normal `update_fields`.
+- Original requests over 8000 chars are rejected, not truncated.
+- Title hints and request records are redacted.
+
+Regression tests: duplicate Telegram delivery, identical text with different message IDs, 20 concurrent
+captures, restart redelivery, `/task` source id, crash-boundary recovery, long-request rejection,
+redaction, immutable fields, owner authorization.
 
 ## Provider recovery test matrix
 
