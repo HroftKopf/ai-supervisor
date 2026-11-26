@@ -135,7 +135,7 @@ Telegram не поддерживает CSS/margin/padding/line-height; отст�
 
 ## Проверки
 
-- `pytest`: **207 passed, 4 skipped**.
+- `pytest`: **218 passed, 4 skipped**.
 - `ruff check .`: без ошибок.
 - DSH/bwrap/egress: **2 integration tests passed**.
 - Kimi regression: существующие тесты и live-профиль сохранены.

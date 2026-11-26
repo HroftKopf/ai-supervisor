@@ -980,7 +980,8 @@ class Handlers:
         chat_id = callback.message.chat.id
         user_id = callback.from_user.id
         await callback.answer("Принято")
-        task_id = int(arg) if arg.isdigit() else None
+        task_arg, _, callback_hash = arg.partition(":")
+        task_id = int(task_arg) if task_arg.isdigit() else None
         try:
             if action == "ui" and data.startswith("ui:mode:"):
                 mode = data.split(":", 2)[2]
@@ -1033,7 +1034,16 @@ class Handlers:
             elif action == "rep" and task_id is not None:
                 await self.orchestrator.send_report(task_id, chat_id)
             elif action == "acc" and task_id is not None:
-                await self.orchestrator.accept_task(task_id, user_id, chat_id)
+                if not callback_hash:
+                    await self.notifier.send_text(
+                        chat_id,
+                        "Старый callback принятия не содержит fingerprint результата; "
+                        "принятие отклонено. Откройте актуальный отчёт задачи.",
+                    )
+                    return
+                await self.orchestrator.accept_task(
+                    task_id, user_id, chat_id, expected_manifest_hash=callback_hash
+                )
             elif action == "rew" and task_id is not None:
                 await self.orchestrator.rework_task(task_id, user_id, chat_id)
             elif action == "dif" and task_id is not None:

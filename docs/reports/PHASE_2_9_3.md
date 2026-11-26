@@ -73,7 +73,7 @@ Migration backup is
 
 ## Verification
 
-- **207 passed, 4 skipped**, synthetic credentials only.
+- **218 passed, 4 skipped**, synthetic credentials only.
 - Offline benchmark after the change (single samples, current host): memory search 0.88–1.04 ms,
   context build 0.43–0.54 ms, state transitions median 3.5–3.6 ms, 20 scheduler jobs 0.28–0.30 ms,
   recovery 0.53–0.57 ms, peak context 25,693 B. These are slower than the Phase 2.9 sample
@@ -103,7 +103,8 @@ inflate the result.
 | Owner amendments/revisions | VERIFIED offline | `/amend`, `/revisions`, revisions table, approval-bound activation; live Telegram not run |
 | Telegram dedup | VERIFIED offline | durable `requests.dedup_key`, unique task `request_id`, concurrency tests |
 | Evidence manifest | PARTIAL | `EvidenceManifest` + HEAD/dirty invalidation tests; untracked metadata fingerprint is stat-based |
-| Review checkpoint | PARTIAL | approved resume works; non-approved checkpoint blocks instead of full parity |
+| Review checkpoint | PARTIAL | approved resume works; review is manifest-bound; non-approved checkpoint parity remains partial |
+| Acceptance gate | VERIFIED offline | manifest/review/HEAD/branch/base/permission checks and immutable SHA merge |
 | Budget Engine 2.0 | NOT_IMPLEMENTED | no reservation lifecycle/preflight |
 | Context Engine 2.0 | PARTIAL | relevance memory + fresh reviewer worktree; no fragment budgets |
 | Orchestrator decomposition | NOT_IMPLEMENTED | unchanged monolith |

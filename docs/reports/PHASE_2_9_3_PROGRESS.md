@@ -66,7 +66,7 @@ source id, transactional task/binding rollback, existing task discovery, classif
 lifecycle, cancellation, long-request rejection, redaction, immutable fields, owner authorization,
 v9→v10 migration preserving tasks/memory.
 
-Current full suite: **207 passed, 4 skipped**; coverage **69% statements / 52% branches**.
+Current full suite: **218 passed, 4 skipped**; coverage **69% statements / 52% branches**.
 
 ## Owner amendments / request revisions
 
@@ -105,6 +105,33 @@ completed rejection, unauthorized owner, old approval rejection, concurrent amen
 spec/review/evidence invalidation, old approval revocation, SQLite rollback, restart persistence,
 legacy initial revision, `/revisions` without LLM, no automatic worker, COMPOSITE stages,
 published/merged rejection, session/worktree retirement and preservation, status-change rejection.
+
+## Evidence integrity / acceptance gate (B.3)
+
+- `EvidenceManifest` format v2 includes canonical worktree, base ref/commit, HEAD, index, tracked
+  diff, recursive untracked content hashes, content-tree hash, validation hash, task/project/revision,
+  spec fingerprint and explicit unsafe-path list.
+- Untracked directories are traversed recursively; Git NUL paths are parsed; ordering is sorted.
+- Sensitive files and symlinks are never read; they are recorded as `unsafe_paths` and block
+  acceptance. External symlinks are not followed.
+- Validation content is hashed before and after checks; a change aborts validation.
+- Worktree content is checked again immediately before and after commit; stale test results are
+  rejected.
+- ReviewResult is bound to task, revision, spec hash, manifest hash and reviewed commit.
+- Evidence is recomputed after the reviewer call; changes during review block acceptance.
+- `AcceptanceGate` verifies task status, active revision, spec, evidence/manifest integrity, review
+  binding/verdict, HEAD, branch SHA, base branch and permission policy.
+- Acceptance callbacks carry the manifest fingerprint; old callbacks without a fingerprint are
+  rejected. Merge approvals include revision/manifest/commit binding.
+- `Workspace.apply` verifies the task branch still points at the reviewed SHA and merges that
+  immutable SHA with `--ff-only`, never the mutable branch name.
+- Already-completed merge recovery verifies the reviewed commit/manifest without requiring the
+  worktree to still exist.
+
+Regression tests: unchanged acceptance, dirty worktree, moved branch/base, untracked same-size/
+same-mtime change, nested untracked artifact, external symlink, validation configuration change,
+validation/commit mutation, stale review revision, corrupt/missing manifest, callback fingerprint,
+merge recovery, READ_MODIFY/COMPOSITE existing workflows.
 
 ## Provider recovery test matrix
 

@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from ai_supervisor.config import Settings
+from ai_supervisor.core.evidence_manifest import content_fingerprint
 from ai_supervisor.core.git_utils import GitError, git, git_output, run_process
 from ai_supervisor.core.redaction import SecretRedactor
 from ai_supervisor.core.sandbox import BwrapSandbox, SandboxPaths
@@ -281,6 +282,7 @@ class WorkspaceManager:
         status_result = await git(
             worktree, "status", "--porcelain=v1", timeout_seconds=30, check=False
         )
+        validation_before, unsafe_before = content_fingerprint(worktree)
         checks = await self.run_checks(
             task=task,
             project=project,
@@ -289,6 +291,12 @@ class WorkspaceManager:
             state_dir=state_dir,
             timeout_seconds=check_timeout_seconds,
         )
+        validation_after, unsafe_after = content_fingerprint(worktree)
+        if validation_before != validation_after or unsafe_before != unsafe_after:
+            raise WorkspaceError(
+                "worktree changed during validation; test results are not attributable to a "
+                "stable snapshot"
+            )
         staged = await git(worktree, "add", "-A", timeout_seconds=60, check=False)
         if staged.returncode != 0:
             raise WorkspaceError(f"git add failed: {staged.stderr.strip()}")
@@ -347,6 +355,8 @@ class WorkspaceManager:
             checks=checks,
             worker=worker,
             verification_note=verification_note,
+            validation_content_hash=validation_after,
+            validation_unsafe_paths=unsafe_after,
         )
 
     async def commit_changes(
@@ -406,11 +416,26 @@ class WorkspaceManager:
         )
         return result.returncode == 0
 
-    async def apply(self, task: TaskRecord, project: ProjectRecord, *, cleanup: bool = True) -> str:
+    async def apply(
+        self,
+        task: TaskRecord,
+        project: ProjectRecord,
+        *,
+        cleanup: bool = True,
+        expected_head: str | None = None,
+    ) -> str:
         repo = Path(project.path).resolve()
         self._assert_inside_allowed(repo)
         if not task.branch or not task.head_commit:
             raise WorkspaceError("task has no branch/head commit")
+        expected = expected_head or task.head_commit
+        if expected != task.head_commit:
+            raise WorkspaceError("expected merge commit does not match task head_commit")
+        branch_sha = (await git_output(repo, "rev-parse", f"refs/heads/{task.branch}")).strip()
+        if branch_sha != expected:
+            raise WorkspaceError(
+                "task branch moved after review; refusing to integrate a different commit"
+            )
         branch_now = await git(repo, "symbolic-ref", "--short", "HEAD", check=False)
         if branch_now.returncode != 0 or branch_now.stdout.strip() != project.base_branch:
             raise WorkspaceError(
@@ -434,7 +459,7 @@ class WorkspaceManager:
             "core.hooksPath=/dev/null",
             "merge",
             "--ff-only",
-            task.branch,
+            expected,
             timeout_seconds=120,
             check=False,
         )
@@ -444,7 +469,7 @@ class WorkspaceManager:
                 f"merge отклонён: {result.stderr.strip()[:2000] or result.stdout.strip()[:2000]}"
             )
         new_head = (await git_output(repo, "rev-parse", "HEAD")).strip()
-        if new_head != task.head_commit:
+        if new_head != expected:
             raise WorkspaceError(
                 "merge завершился не на ожидаемом коммите; проверьте ветку вручную"
             )

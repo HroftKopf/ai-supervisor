@@ -527,6 +527,12 @@ class ReviewResult(BaseModel):
     root_cause: RootCause = RootCause.UNKNOWN
     issues: list[ReviewIssue] = Field(default_factory=list, max_length=30)
     required_changes: list[str] = Field(default_factory=list, max_length=30)
+    # Bound by the orchestrator after the reviewer returns; never trusted from the model.
+    task_id: int = 0
+    request_revision: int = 0
+    spec_fingerprint: str = ""
+    manifest_fingerprint: str = ""
+    reviewed_commit: str = ""
 
     @field_validator("issues", mode="before")
     @classmethod
@@ -644,6 +650,8 @@ class Evidence(BaseModel):
     checks: list[CheckResult] = Field(default_factory=list)
     worker: WorkerResult
     verification_note: str = ""
+    validation_content_hash: str = ""
+    validation_unsafe_paths: list[str] = Field(default_factory=list)
     captured_at: datetime = Field(default_factory=utcnow)
 
     @property

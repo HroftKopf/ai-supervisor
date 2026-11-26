@@ -15,10 +15,16 @@ from zoneinfo import ZoneInfo
 
 from ai_supervisor.agents.supervisor import SupervisorAgent, SupervisorError
 from ai_supervisor.config import Settings
+from ai_supervisor.core.acceptance import AcceptanceError, AcceptanceGate
 from ai_supervisor.core.capabilities import capability_block
 from ai_supervisor.core.config_import import ConfigImportError, ConfigImportService
 from ai_supervisor.core.context import ContextError, ProjectContextBuilder
-from ai_supervisor.core.evidence_manifest import build_manifest, parse_manifest
+from ai_supervisor.core.evidence_manifest import (
+    EvidenceError,
+    build_manifest,
+    content_fingerprint,
+    parse_manifest,
+)
 from ai_supervisor.core.fault_injection import FaultInjector
 from ai_supervisor.core.git_auth import (
     GitAuthError,
@@ -887,6 +893,8 @@ class Orchestrator:
                 "Провайдер временно ограничил запросы. "
                 "Повтор будет выполнен после безопасной паузы; прогресс сохранён.",
             )
+        except EvidenceError as exc:
+            await self._block_task(task_id, f"Evidence integrity: {exc}")
         except (
             KimiError,
             ProviderError,
@@ -1151,6 +1159,21 @@ class Orchestrator:
         else:
             review = precheck
         review = ReviewGate.enforce(review, evidence, spec, worktree=worktree)
+        after_review = await build_manifest(
+            project=project,
+            task=task,
+            worktree=worktree,
+            evidence=evidence,
+            spec=spec,
+            validation_content_hash=evidence.validation_content_hash,
+        )
+        if after_review.manifest_hash != saved_manifest.manifest_hash:
+            await self._block_task(
+                task.id,
+                "Evidence изменился во время review; результат review не применяется.",
+            )
+            return True
+        review = self._bind_review(review, task, spec, after_review)
         task = await self.tasks.update_fields(task.id, review_json=review.model_dump_json())
         await self.tasks.add_event(
             task.id,
@@ -1289,16 +1312,33 @@ class Orchestrator:
                 check_timeout_seconds=max(30.0, (deadline - datetime.now(UTC)).total_seconds()),
                 diff_path=state_dir / "diff.patch",
             )
+            worktree_now = Path(task.worktree_path or "")
+            pre_commit_hash, _pre_unsafe = content_fingerprint(worktree_now)
+            if pre_commit_hash != evidence.validation_content_hash:
+                await self._block_task(
+                    task.id,
+                    "Worktree изменился между validation и commit; результаты проверок "
+                    "не относятся к текущему состоянию.",
+                )
+                return
             head_commit = await self.workspace.commit_changes(
-                task=task, worktree=Path(task.worktree_path or ""), changed=evidence.has_changes
+                task=task, worktree=worktree_now, changed=evidence.has_changes
             )
+            post_commit_hash, _post_unsafe = content_fingerprint(worktree_now)
+            if post_commit_hash != evidence.validation_content_hash:
+                await self._block_task(
+                    task.id,
+                    "Worktree изменился во время commit; результаты проверок недействительны.",
+                )
+                return
             evidence = evidence.model_copy(update={"head_commit": head_commit})
             manifest = await build_manifest(
                 project=project,
                 task=task,
-                worktree=Path(task.worktree_path or ""),
+                worktree=worktree_now,
                 evidence=evidence,
                 spec=spec,
+                validation_content_hash=evidence.validation_content_hash,
             )
             task = await self.tasks.update_fields(
                 task.id,
@@ -1353,6 +1393,21 @@ class Orchestrator:
             review = ReviewGate.enforce(
                 review, evidence, spec, worktree=Path(task.worktree_path or "")
             )
+            after_review = await build_manifest(
+                project=project,
+                task=task,
+                worktree=Path(task.worktree_path or ""),
+                evidence=evidence,
+                spec=spec,
+                validation_content_hash=evidence.validation_content_hash,
+            )
+            if after_review.manifest_hash != manifest.manifest_hash:
+                await self._block_task(
+                    task.id,
+                    "Evidence изменился во время review; результат review не применяется.",
+                )
+                return
+            review = self._bind_review(review, task, spec, manifest)
             task = await self.tasks.update_fields(
                 task.id,
                 review_json=review.model_dump_json(),
@@ -2464,6 +2519,18 @@ class Orchestrator:
         await self.tasks.update_fields(task.id, review_json=review.model_dump_json())
         await self._request_task_approval(task, review.summary)
 
+    @staticmethod
+    def _bind_review(review: Any, task: TaskRecord, spec: TaskSpec, manifest: Any) -> Any:
+        return review.model_copy(
+            update={
+                "task_id": task.id,
+                "request_revision": task.request_revision,
+                "spec_fingerprint": manifest.spec_hash,
+                "manifest_fingerprint": manifest.manifest_hash,
+                "reviewed_commit": manifest.head_sha,
+            }
+        )
+
     async def _finish_for_acceptance(
         self,
         task_id: int,
@@ -2504,7 +2571,10 @@ class Orchestrator:
                 mode=mode,
             ),
             [
-                [Button("Принять", f"acc:{task.id}"), Button("На доработку", f"rew:{task.id}")],
+                [
+                    Button("Принять", f"acc:{task.id}:{self._acceptance_hash(task)}"),
+                    Button("На доработку", f"rew:{task.id}"),
+                ],
                 [Button("Подробности", f"det:{task.id}"), Button("Diff", f"dif:{task.id}")],
                 [Button("Журнал", f"log:{task.id}"), Button("Откатить", f"rb:{task.id}")],
             ],
@@ -2522,7 +2592,13 @@ class Orchestrator:
         )
 
     @_locked_action
-    async def accept_task(self, task_id: int, user_id: int, chat_id: int) -> None:
+    async def accept_task(
+        self,
+        task_id: int,
+        user_id: int,
+        chat_id: int,
+        expected_manifest_hash: str | None = None,
+    ) -> None:
         self._assert_owner(user_id)
         self._assert_owner_chat(chat_id)
         task = await self.tasks.get(task_id)
@@ -2533,7 +2609,69 @@ class Orchestrator:
         if project is None:
             await self.notifier.send_text(chat_id, "Проект задачи не найден.")
             return
-        if await self.workspace.is_applied(task, project):
+        spec = self._spec_for(task)
+        evidence = self._load_evidence(task)
+        stored = parse_manifest(task.evidence_manifest_json)
+        review = task.review
+        already_applied = await self.workspace.is_applied(task, project)
+        require_merge = task.task_type is not TaskType.READ_ONLY
+        current = None
+        branch_head = ""
+        base_head = ""
+        repo = Path(project.path).resolve()
+        if not already_applied:
+            try:
+                branch_sha = await git(
+                    repo,
+                    "rev-parse",
+                    "--verify",
+                    f"refs/heads/{task.branch or ''}",
+                    check=False,
+                )
+                branch_head = branch_sha.stdout.strip() if branch_sha.returncode == 0 else ""
+                base_head = (await git_output(repo, "rev-parse", project.base_branch)).strip()
+                if task.worktree_path and Path(task.worktree_path).is_dir():
+                    current = await build_manifest(
+                        project=project,
+                        task=task,
+                        worktree=Path(task.worktree_path),
+                        evidence=evidence,
+                        spec=spec,
+                        validation_content_hash=(
+                            evidence.validation_content_hash if evidence else ""
+                        ),
+                    )
+            except Exception:
+                current = None
+        else:
+            branch_head = stored.head_sha if stored else ""
+            base_head = task.base_commit or ""
+        decision = AcceptanceGate.check(
+            task=task,
+            spec=spec,
+            evidence=evidence,
+            stored_manifest=stored,
+            current_manifest=current or (stored if already_applied else None),
+            review=review,
+            expected_manifest_hash=expected_manifest_hash,
+            branch_head=branch_head,
+            base_head=base_head,
+            require_merge=require_merge,
+            permissions_ok=self.permissions.level(Action.APPLY_MERGE).value != "denied",
+        )
+        if not decision.allowed:
+            await self.tasks.add_event(
+                task.id,
+                "acceptance-blocked",
+                f"Acceptance gate: {decision.reason}",
+            )
+            await self.notifier.send_text(
+                chat_id,
+                f"Принятие задачи #{task.id:03d} заблокировано: {decision.reason}. "
+                "Worktree и артефакты сохранены.",
+            )
+            return
+        if already_applied:
             warnings = await self.workspace.cleanup(task, project, remove_branch=True, strict=False)
             await self._try_transition(task.id, TaskStatus.COMPLETED)
             task = await self.tasks.get(task.id)
@@ -2549,18 +2687,27 @@ class Orchestrator:
             for warning in warnings:
                 logger.warning("post-merge cleanup: %s", warning)
             return
+        require_merge_action = Action.APPLY_MERGE
         try:
-            self.permissions.require_allowed(Action.APPLY_MERGE)
+            self.permissions.require_allowed(require_merge_action)
             approval_id = await self.approvals.grant_once(
-                action=Action.APPLY_MERGE,
-                payload={"task_id": task.id},
+                action=require_merge_action,
+                payload={
+                    "task_id": task.id,
+                    "request_revision": task.request_revision,
+                    "manifest_fingerprint": stored.manifest_hash,
+                    "reviewed_commit": stored.head_sha,
+                },
                 decided_by=user_id,
                 task_id=task.id,
                 ttl_seconds=600,
             )
-            await self.approvals.consume(approval_id, user_id=user_id, action=Action.APPLY_MERGE)
-            new_head = await self.workspace.apply(task, project)
-        except (ApprovalError, PermissionDenied, WorkspaceError) as exc:
+            await self.approvals.consume(approval_id, user_id=user_id, action=require_merge_action)
+            if require_merge:
+                new_head = await self.workspace.apply(task, project, expected_head=stored.head_sha)
+            else:
+                new_head = task.head_commit or ""
+        except (ApprovalError, PermissionDenied, WorkspaceError, AcceptanceError) as exc:
             await self.notifier.send_text(
                 chat_id,
                 f"Не удалось применить изменения задачи #{task.id:03d}: {self.redactor.redact(str(exc))}",
@@ -2573,35 +2720,18 @@ class Orchestrator:
         report = await self._final_report(task, project, TaskStatus.COMPLETED)
         await self.tasks.update_fields(task.id, report=report)
         mode = await self.conversations.get_ui_mode(chat_id)
-        stages = await self.stages.list(task.id)
         await self.progress.update(task.id, force=True, chat_id=chat_id)
-        buttons = [
-            [Button("Подробности", f"det:{task.id}"), Button("Расход токенов", f"use:{task.id}")],
-            [Button("Журнал", f"log:{task.id}")],
-        ]
-        if project.remote_url and project.remote_url.startswith(("https://", "http://")):
-            buttons.insert(0, [Button("Открыть репозиторий", url=project.remote_url)])
-        if project.remote_url:
-            buttons.insert(0, [Button("Опубликовать в Git", f"push:{task.id}")])
         await self.notifier.send_text(
             chat_id,
-            completion_card(
-                task,
-                project,
-                evidence=self._load_evidence(task),
-                review=task.review,
-                stages=stages,
-                mode=mode,
-                repo_url=project.remote_url,
-            ),
-            buttons,
+            completion_card(task, project, evidence=evidence, review=review, stages=[], mode=mode),
             parse_mode="HTML",
         )
+        await self.notifier.send_text(chat_id, report)
         await self.conversations.add_message(
             task.conversation_id,
             "assistant",
             report,
-            meta={"task_id": task.id, "kind": "completed"},
+            meta={"task_id": task.id, "kind": "report", "status": TaskStatus.COMPLETED.value},
         )
 
     @_locked_action
@@ -3682,11 +3812,16 @@ class Orchestrator:
         except Exception:
             return None
 
+    @staticmethod
+    def _acceptance_hash(task: TaskRecord) -> str:
+        manifest = parse_manifest(task.evidence_manifest_json)
+        return manifest.manifest_hash if manifest else "none"
+
     async def _send_report_with_buttons(self, task: TaskRecord, report: str) -> None:
         chat_id = self._chat_for_task(task)
         buttons = [
             [
-                Button("Принять изменения", f"acc:{task.id}"),
+                Button("Принять изменения", f"acc:{task.id}:{self._acceptance_hash(task)}"),
                 Button("На доработку", f"rew:{task.id}"),
             ],
             [

@@ -375,7 +375,7 @@ sandbox_network = true
 
 Выполнено:
 
-- `pytest`: **207 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
+- `pytest`: **218 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
   Проверены запуск runtime, проброс endpoint, запись результата, usage (input 42,
