@@ -31,6 +31,7 @@ class AppSection(BaseModel):
     data_dir: str = "var"
     timezone: str = "Europe/Moscow"
     log_level: str = "INFO"
+    task_log_retention_days: int = Field(default=14, ge=1, le=3650)
 
     @field_validator("log_level")
     @classmethod

@@ -169,12 +169,41 @@ class Orchestrator:
 
     async def startup(self) -> None:
         await self.approvals.expire_old()
+        await self._cleanup_old_task_logs()
         await self.tasks.mark_workers_interrupted_on_startup()
         interrupted = await self.tasks.mark_interrupted_on_startup()
         if interrupted:
             logger.warning(
                 "marked %s task(s) interrupted after restart: %s", len(interrupted), interrupted
             )
+
+    async def _cleanup_old_task_logs(self) -> None:
+        import shutil
+        import time
+
+        cutoff = time.time() - self.settings.app.task_log_retention_days * 86400
+        removed = 0
+
+        def clean() -> int:
+            count = 0
+            root = self.settings.task_logs_dir
+            if not root.exists():
+                return 0
+            for child in root.glob("task-*"):
+                try:
+                    if child.stat().st_mtime < cutoff:
+                        if child.is_dir():
+                            shutil.rmtree(child)
+                        else:
+                            child.unlink()
+                        count += 1
+                except OSError:
+                    continue
+            return count
+
+        removed = await asyncio.to_thread(clean)
+        if removed:
+            logger.info("removed %s expired task log entries", removed)
 
     async def shutdown(self) -> None:
         self._stopping = True
@@ -2084,6 +2113,74 @@ class Orchestrator:
             await self._send_long(chat_id, task.report)
         else:
             await self.notifier.send_text(chat_id, "Отчёт ещё не сформирован.")
+
+    async def send_detailed_report(self, task_id: int, chat_id: int) -> None:
+        task = await self.tasks.get(task_id)
+        project = await self.projects.get(task.project_id)
+        spec = self._spec_for(task)
+        evidence = self._load_evidence(task)
+        review = task.review
+        events = await self.tasks.events(task_id, limit=80)
+        lines = [
+            f"Подробный отчёт задачи #{task.id:03d}",
+            f"Проект: {project.name if project else '—'}",
+            f"Статус: {task.status.value}",
+            f"Тип: {spec.task_type.value}",
+            f"Ветка: {task.branch or '—'}",
+            f"Base: {task.base_commit or '—'}",
+            f"Head: {task.head_commit or '—'}",
+            "",
+            "План:",
+            f"- {spec.goal}",
+        ]
+        for step in spec.steps[:20]:
+            lines.append(f"  • {step}")
+        lines += ["", "Критерии:"]
+        for criterion in spec.acceptance_criteria:
+            lines.append(f"- {criterion}")
+        if evidence:
+            lines += [
+                "",
+                "Изменённые файлы:",
+                *[f"- {name}" for name in evidence.changed_files[:50]],
+                "",
+                f"Diff stat: {evidence.diff_stat[:1000] or '(нет)'}",
+                f"Worker finish: {evidence.worker.finish_reason}; exit={evidence.worker.return_code}",
+                f"Worker report: {(evidence.worker.final_response or '(нет)')[:1500]}",
+                "",
+                "Проверки:",
+            ]
+            for check in evidence.checks:
+                lines.append(
+                    f"- {check.name}: exit={check.exit_code}, timeout={check.timed_out}, "
+                    f"{check.command[:200]}"
+                )
+                if check.stdout_tail:
+                    lines.append(f"  stdout: {check.stdout_tail[-500:]}")
+                if check.stderr_tail:
+                    lines.append(f"  stderr: {check.stderr_tail[-500:]}")
+        if review:
+            lines += ["", f"Ревью: {review.verdict.value}", f"- {review.summary}"]
+            for issue in review.issues[:20]:
+                lines.append(
+                    f"- [{issue.severity.value}] {issue.criterion}: {issue.evidence} "
+                    f"→ {issue.recommendation}"
+                )
+        lines += ["", "Журнал (последние события):"]
+        for event in events[-40:]:
+            lines.append(f"- {event['created_at']} {event['event_type']}: {event['message'][:300]}")
+        if task.error:
+            lines += ["", f"Ошибка: {task.error[:1500]}"]
+        text = self.redactor.redact("\n".join(lines))
+        if len(text) > 3500:
+            path = self.settings.task_logs_dir / f"task-{task.id:04d}-detailed-report.md"
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+            await self.notifier.send_document(
+                chat_id, path, f"Подробный отчёт задачи #{task.id:03d}"
+            )
+        else:
+            await self._send_long(chat_id, text)
 
     async def latest_task(self, chat_id: int, project_id: int | None = None) -> TaskRecord | None:
         project = (

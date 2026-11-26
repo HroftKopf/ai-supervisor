@@ -88,8 +88,8 @@ Kimi возвращает `approved` / `rework_required` / `approval_required` /
 
 ### Telegram
 
-Добавлены `/task`, `/task_info`, `/queue`, `/cancel`, `/pause`, `/retry`, `/push`, `/doctor`,
-`/project` management. Старые команды сохранены.
+Добавлены `/task`, `/task_info`, `/queue`, `/cancel`, `/pause`, `/retry`, `/push`, `/github`,
+`/report full`, `/doctor`, `/project` management. Старые команды сохранены.
 
 ### Миграции
 
@@ -111,7 +111,7 @@ Kimi возвращает `approved` / `rework_required` / `approval_required` /
 
 См. раздел README «Что ещё не реализовано в Phase 2»:
 COMPOSITE/DAG, routing, продвинутые GitHub PR/checks, system/external executor,
-config-import approval-tool, retention/structured JSON logs. Базовые `/github info|create`
+config-import approval-tool, JSON-correlated logs/event retention. Базовые `/github info|create`
 и Git push реализованы. Worker network остаётся общей (egress allowlist — следующий этап).
 
 ## Перезапуск после обновления

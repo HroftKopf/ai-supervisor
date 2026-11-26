@@ -415,8 +415,21 @@ class Handlers:
             await self.orchestrator.send_diff(task.id, message.chat.id)
 
     async def cmd_report(self, message: Message) -> None:
-        task = await self._task_from_message(message)
-        if task:
+        arg = _command_tail(message.text or "")
+        detailed = arg.lower() in {"full", "detailed", "подробно"}
+        if detailed:
+            arg = ""
+        task = (
+            await self.orchestrator.tasks.get_optional(int(arg))
+            if arg.isdigit()
+            else await self.orchestrator.latest_task(message.chat.id)
+        )
+        if task is None:
+            await self.notifier.send_text(message.chat.id, "Задача не найдена.")
+            return
+        if detailed:
+            await self.orchestrator.send_detailed_report(task.id, message.chat.id)
+        else:
             await self.orchestrator.send_report(task.id, message.chat.id)
 
     async def cmd_approve(self, message: Message) -> None:

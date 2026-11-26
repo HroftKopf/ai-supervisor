@@ -198,7 +198,7 @@ SDK запускает собственный bundled runtime; системны�
 Команды: `/start`, `/help`, `/projects`, `/project` (`list|select|info|add|create|remove|
 permissions|remote|budget|max-rework|extra-read|permission|test|build|instructions`),
 `/new`, `/task`, `/task_info`, `/tasks`, `/queue`, `/status`, `/agents`, `/logs`, `/diff`,
-`/report`, `/approve`, `/reject`, `/stop`, `/cancel`, `/pause`, `/resume`, `/retry`,
+`/report [id] [full]`, `/approve`, `/reject`, `/stop`, `/cancel`, `/pause`, `/resume`, `/retry`,
 `/rollback`, `/rework`, `/push`, `/github info|create`, `/usage` (`today|week|month|task N`),
 `/memory`, `/settings`, `/doctor`. Команды не обязательны — можно писать обычным языком.
 
@@ -368,8 +368,8 @@ ai-supervisor run
   сейчас эти типы блокируются до отдельного этапа.
 - Config import как отдельный approval-tool; вместо него worker получает только явно разрешённые
   read-only paths и может скопировать конфиг в worktree с secret-сканом diff.
-- Ретенция task-логов/событий и JSON-корреляция логов; файловые логи ротируются, task-каталоги
-  пока требуют периодической очистки.
+- JSON-корреляция логов и ретенция строк `task_events`; файловые task-логи очищаются
+  автоматически по `app.task_log_retention_days`, но JSON-формат журнала ещё не включён.
 
 Полный список: [docs/PHASE2.md](docs/PHASE2.md).
 
