@@ -72,7 +72,7 @@ generation. Migration backup is
 
 ## Verification
 
-- **183 passed, 4 skipped**, synthetic credentials only.
+- **191 passed, 4 skipped**, synthetic credentials only.
 - Offline benchmark after the change (single samples, current host): memory search 0.88–1.04 ms,
   context build 0.43–0.54 ms, state transitions median 3.5–3.6 ms, 20 scheduler jobs 0.28–0.30 ms,
   recovery 0.53–0.57 ms, peak context 25,693 B. These are slower than the Phase 2.9 sample
@@ -85,7 +85,7 @@ generation. Migration backup is
 
 ## Coverage
 
-Coverage is not at the Phase 2.9.3 target. The current measured result is approximately **69% statements / 51% branches (64% combined)**. Telegram handlers, WorkerManager edge branches,
+Coverage is not at the Phase 2.9.3 target. The current measured result is approximately **68% statements / 51% branches (64% combined)**. Telegram handlers, WorkerManager edge branches,
 sandbox mount failures and a full fault matrix remain uncovered. No exclusions were used to
 inflate the result.
 

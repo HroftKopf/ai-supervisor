@@ -97,6 +97,7 @@ class Handlers:
         r.message.register(self.cmd_chat, Command("chat"))
         r.message.register(self.cmd_auto, Command("auto"))
         r.message.register(self.cmd_task, Command("task"))
+        r.message.register(self.cmd_request, Command("request"))
         r.message.register(self.cmd_task_info, Command("task_info"))
         r.message.register(self.cmd_queue, Command("queue"))
         r.message.register(self.cmd_status, Command("status"))
@@ -450,6 +451,19 @@ class Handlers:
                 if getattr(message, "message_id", None) is not None
                 else None
             ),
+        )
+
+    async def cmd_request(self, message: Message) -> None:
+        parts = (message.text or "").split()
+        if len(parts) != 4 or parts[1] != "retry":
+            await self.notifier.send_text(
+                message.chat.id, "Использование: /request retry <request_id>"
+            )
+            return
+        await self.orchestrator.retry_request(
+            parts[3],
+            message.from_user.id,
+            message.chat.id,  # type: ignore[union-attr]
         )
 
     async def cmd_task_info(self, message: Message) -> None:

@@ -52,6 +52,56 @@ class TaskService:
     def __init__(self, db: Database) -> None:
         self.db = db
 
+    @staticmethod
+    def model(row: Any) -> TaskRecord:
+        return TaskRecord.model_validate(row_to_dict(row))
+
+    async def create_in_transaction(
+        self,
+        conn: Any,
+        project_id: int,
+        conversation_id: int,
+        title: str,
+        *,
+        max_rework: int,
+        source_request: str = "",
+        request_id: str | None = None,
+        intent_source: str = "telegram",
+    ) -> tuple[TaskRecord, bool]:
+        if request_id:
+            existing = await (
+                await conn.execute(
+                    "SELECT * FROM tasks WHERE request_id = ? ORDER BY id LIMIT 1", (request_id,)
+                )
+            ).fetchone()
+            if existing is not None:
+                return TaskRecord.model_validate(row_to_dict(existing)), False
+        now = iso_now()
+        cursor = await conn.execute(
+            """
+            INSERT INTO tasks(project_id, conversation_id, title, request_id,
+                              source_request, intent_source, status, max_rework,
+                              created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                conversation_id,
+                title.strip()[:120] or "Задача",
+                request_id,
+                source_request.strip()[:8000],
+                intent_source,
+                TaskStatus.CREATED.value,
+                max_rework,
+                now,
+                now,
+            ),
+        )
+        task_id = int(cursor.lastrowid or 0)
+        await cursor.close()
+        row = await (await conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))).fetchone()
+        return TaskRecord.model_validate(row_to_dict(row)), True
+
     async def create(
         self,
         project_id: int,

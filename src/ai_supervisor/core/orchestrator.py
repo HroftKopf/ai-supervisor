@@ -375,7 +375,9 @@ class Orchestrator:
     # incoming conversation
     # ------------------------------------------------------------------
 
-    async def handle_incoming(self, message: IncomingMessage) -> None:
+    async def handle_incoming(
+        self, message: IncomingMessage, *, request_mode: str = "auto"
+    ) -> None:
         self._assert_owner(message.user_id)
         if message.chat_id != message.user_id:
             # Telegram private chats have chat.id == user.id. Keep the check explicit.
@@ -398,6 +400,7 @@ class Orchestrator:
                 project_id=project.id,
                 conversation_id=conversation.id,
                 redactor=self.redactor,
+                mode=request_mode,
             )
         except RequestTooLarge as exc:
             await self.notifier.send_text(message.chat_id, str(exc))
@@ -414,13 +417,44 @@ class Orchestrator:
                     message.chat_id, "Это сообщение уже обрабатывается или уже обработано."
                 )
             return
-        attachment_text, images = await self._prepare_attachments(message)
-        text = (message.text or "").strip()
+        stored_project = await self.projects.get(int(captured["project_id"]))
+        if stored_project is None:
+            await self.requests.mark_status(str(captured["request_id"]), "failed")
+            await self.notifier.send_text(message.chat_id, "Проект исходного запроса удалён.")
+            return
+        project = stored_project
+        try:
+            conversation = await self.conversations.get(int(captured["conversation_id"]))
+        except Exception:
+            await self.requests.mark_status(str(captured["request_id"]), "failed")
+            await self.notifier.send_text(message.chat_id, "Исходная беседа запроса удалена.")
+            return
+        envelope = self.requests.envelope_from_row(captured)
+        request_id = envelope.request_id
+        current_attachments = tuple(attachment.filename for attachment in message.attachments)
+        if envelope.attachment_refs and current_attachments != envelope.attachment_refs:
+            await self.requests.mark_status(request_id, "retryable")
+            await self.notifier.send_text(
+                message.chat_id,
+                "Повторная доставка не содержит тех же вложений исходного запроса; "
+                "безопасно сопоставить их нельзя. Запрос не обработан.",
+            )
+            return
+        try:
+            attachment_text, images = await self._prepare_attachments(message)
+        except Exception as exc:
+            await self.requests.mark_status(request_id, "retryable")
+            await self.notifier.send_text(
+                message.chat_id, f"Вложения не обработаны: {type(exc).__name__}."
+            )
+            return
+        text = envelope.original_text.strip()
         if text:
             text = self.redactor.redact(text)
         if attachment_text:
             text = (text + "\n\n" + attachment_text).strip()
         if not text and not images:
+            await self.requests.mark_status(request_id, "rejected")
             await self.notifier.send_text(message.chat_id, "Пустое сообщение не обработано.")
             return
         user_message = await self.conversations.add_message(
@@ -460,11 +494,19 @@ class Orchestrator:
         except (KimiQuotaError, ProviderQuotaError) as exc:
             if self.providers is not None:
                 self.providers.mark_quota_exhausted("classifier")
+            await self.requests.mark_status(request_id, "retryable")
             await self._notify_quota(message.chat_id, exc)
             return
+        except asyncio.CancelledError:
+            await self.requests.mark_status(request_id, "cancelled")
+            raise
         except (KimiError, ProviderError, LimitExceeded) as exc:
+            await self.requests.mark_status(request_id, "retryable")
             await self.notifier.send_text(message.chat_id, self._friendly_error(exc))
             return
+        except Exception:
+            await self.requests.mark_status(request_id, "failed")
+            raise
 
         ambiguous = intent_result.clarification or intent_result.confidence < 0.6
         if intent_result.clarification:
@@ -479,27 +521,36 @@ class Orchestrator:
             await self.notifier.send_text(message.chat_id, question)
             return
         if intent_result.kind is IntentKind.TASK and not ambiguous:
-            task = await self._begin_task(
-                project=project,
-                conversation_id=conversation.id,
-                chat_id=message.chat_id,
-                title_hint=intent_result.task_title_hint or "",
-                request_text=envelope.original_text,
-                request_id=envelope.request_id,
-            )
+            try:
+                task = await self._begin_task(
+                    project=project,
+                    conversation_id=conversation.id,
+                    chat_id=message.chat_id,
+                    title_hint=intent_result.task_title_hint or "",
+                    request_text=envelope.original_text,
+                    request_id=request_id,
+                )
+            except Exception:
+                await self.requests.mark_status(request_id, "failed")
+                raise
             if task is None:
-                await self.requests.mark_status(envelope.request_id, "rejected")
+                await self.requests.mark_status(request_id, "rejected")
             return
 
-        await self.requests.mark_status(envelope.request_id, "chat")
-        await self._chat(
-            project=project,
-            conversation=conversation,
-            summary=summary,
-            context_messages=context_messages,
-            images=images,
-            chat_id=message.chat_id,
-        )
+        await self.requests.mark_status(request_id, "chat")
+        try:
+            await self._chat(
+                project=project,
+                conversation=conversation,
+                summary=summary,
+                context_messages=context_messages,
+                images=images,
+                chat_id=message.chat_id,
+                request_id=request_id,
+            )
+        except Exception:
+            await self.requests.mark_status(request_id, "failed")
+            raise
 
     async def _chat(
         self,
@@ -510,6 +561,7 @@ class Orchestrator:
         context_messages: list[Any],
         images: list[tuple[bytes, str]],
         chat_id: int,
+        request_id: str | None = None,
     ) -> None:
         api_messages = self.conversations.messages_for_api(context_messages)
         latest_text = next(
@@ -552,9 +604,17 @@ class Orchestrator:
         except (KimiQuotaError, ProviderQuotaError) as exc:
             if self.providers is not None:
                 self.providers.mark_quota_exhausted("chat")
+            if request_id:
+                await self.requests.mark_status(request_id, "retryable")
             await self._notify_quota(chat_id, exc)
             return
+        except asyncio.CancelledError:
+            if request_id:
+                await self.requests.mark_status(request_id, "cancelled")
+            raise
         except (KimiError, ProviderError, LimitExceeded) as exc:
+            if request_id:
+                await self.requests.mark_status(request_id, "retryable")
             await self.notifier.send_text(chat_id, self._friendly_error(exc))
             return
         content = self.redactor.redact(response.content.strip())
@@ -703,18 +763,28 @@ class Orchestrator:
             )
             return None
         title = self.redactor.redact((title_hint or "Новая задача").strip())[:120]
-        task = await self.tasks.create(
-            project.id,
-            conversation_id,
-            title,
-            max_rework=self.settings.limits.max_rework,
-            source_request=request_text or title,
-            request_id=request_id,
-            intent_source="telegram",
-        )
-        await self.tasks.add_event(task.id, "accepted", "Задача принята от владельца")
         if request_id:
-            await self.requests.attach_task(request_id, task.id)
+            task, created = await self.requests.create_task(
+                request_id=request_id,
+                project_id=project.id,
+                conversation_id=conversation_id,
+                title=title,
+                max_rework=self.settings.limits.max_rework,
+                source_request=request_text or title,
+            )
+            if not created:
+                return task
+        else:
+            task = await self.tasks.create(
+                project.id,
+                conversation_id,
+                title,
+                max_rework=self.settings.limits.max_rework,
+                source_request=request_text or title,
+                request_id=None,
+                intent_source="telegram",
+            )
+            await self.tasks.add_event(task.id, "accepted", "Задача принята от владельца")
         await self.progress.update(task.id, force=True, chat_id=chat_id)
         self._spawn_job(task.id, plan_if_needed=True, manual_instruction=None)
         return task
@@ -3640,6 +3710,48 @@ class Orchestrator:
             chat_id=chat_id,
         )
 
+    async def retry_request(self, request_id: str, user_id: int, chat_id: int) -> None:
+        self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
+        row = await self.requests.get(request_id)
+        if row is None:
+            await self.notifier.send_text(chat_id, "Запрос не найден.")
+            return
+        if row.get("task_id"):
+            await self.notifier.send_text(
+                chat_id, f"Запрос уже создал задачу #{int(row['task_id']):03d}."
+            )
+            return
+        if row.get("status") not in {"retryable", "failed", "cancelled"}:
+            await self.notifier.send_text(
+                chat_id, f"Запрос в состоянии {row.get('status')}; повтор не требуется."
+            )
+            return
+        if row.get("attachment_refs_json") not in (None, "", "[]"):
+            await self.requests.mark_status(request_id, "retryable")
+            await self.notifier.send_text(
+                chat_id,
+                "Вложения запроса нельзя безопасно восстановить автоматически; "
+                "отправьте запрос с вложениями повторно.",
+            )
+            return
+        updated, changed = await self.requests.retry(request_id)
+        if not changed:
+            await self.notifier.send_text(chat_id, "Повторная обработка уже запущена.")
+            return
+        from ai_supervisor.core.interfaces import IncomingMessage
+
+        envelope = self.requests.envelope_from_row(updated)
+        await self.handle_incoming(
+            IncomingMessage(
+                chat_id=int(envelope.chat_id),
+                user_id=int(envelope.owner_id),
+                text=envelope.original_text,
+                telegram_message_id=envelope.source_message_id,
+            ),
+            request_mode=str(envelope.mode),
+        )
+
     async def create_task_from_text(
         self,
         chat_id: int,
@@ -3693,16 +3805,40 @@ class Orchestrator:
             else:
                 await self.notifier.send_text(chat_id, "Этот запрос уже обрабатывается.")
             return
-        task = await self._begin_task(
-            project=project,
-            conversation_id=conversation.id,
-            chat_id=chat_id,
-            title_hint=text.strip()[:120] or "Задача",
-            request_text=clean_text,
-            request_id=envelope.request_id,
-        )
+        stored_project = await self.projects.get(int(captured["project_id"]))
+        if stored_project is None:
+            await self.requests.mark_status(str(captured["request_id"]), "failed")
+            await self.notifier.send_text(chat_id, "Проект исходного запроса удалён.")
+            return
+        try:
+            stored_conversation = await self.conversations.get(int(captured["conversation_id"]))
+        except Exception:
+            await self.requests.mark_status(str(captured["request_id"]), "failed")
+            await self.notifier.send_text(chat_id, "Исходная беседа запроса удалена.")
+            return
+        stored_envelope = self.requests.envelope_from_row(captured)
+        if stored_envelope.attachment_refs:
+            await self.requests.mark_status(stored_envelope.request_id, "retryable")
+            await self.notifier.send_text(
+                chat_id,
+                "Вложения исходного запроса не могут быть безопасно восстановлены; "
+                "задача не создана.",
+            )
+            return
+        try:
+            task = await self._begin_task(
+                project=stored_project,
+                conversation_id=stored_conversation.id,
+                chat_id=chat_id,
+                title_hint=text.strip()[:120] or "Задача",
+                request_text=stored_envelope.original_text,
+                request_id=stored_envelope.request_id,
+            )
+        except Exception:
+            await self.requests.mark_status(stored_envelope.request_id, "failed")
+            raise
         if task is None:
-            await self.requests.mark_status(envelope.request_id, "rejected")
+            await self.requests.mark_status(stored_envelope.request_id, "rejected")
 
     async def queue_text(self, chat_id: int) -> str:
         project = await self._current_project(chat_id)

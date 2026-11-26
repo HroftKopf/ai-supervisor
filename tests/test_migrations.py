@@ -105,3 +105,57 @@ async def test_v1_database_is_migrated_with_backup(tmp_path: Path) -> None:
         assert list((tmp_path / "backups").glob("pre-migration-v10-*.db"))
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_v9_request_table_migration_preserves_tasks_and_memory(tmp_path: Path) -> None:
+    path = tmp_path / "v9.db"
+    db = Database(path)
+    await db.connect()
+    try:
+        await db.execute(
+            "INSERT INTO projects(name, path, created_at, updated_at) VALUES(?,?,?,?)",
+            ("legacy", str(tmp_path), "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+        )
+        await db.execute(
+            "INSERT INTO conversations(chat_id, project_id, created_at, updated_at) VALUES(?,?,?,?)",
+            (1, 1, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+        )
+        await db.execute(
+            "INSERT INTO tasks(project_id, conversation_id, title, status, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                1,
+                1,
+                "legacy task",
+                "completed",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        await db.execute(
+            "INSERT INTO memories(scope, project_id, key, content, created_at, updated_at) "
+            "VALUES('project', 1, 'legacy', 'remember me', ?, ?)",
+            ("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+        )
+        await db.execute("DROP TABLE requests")
+        await db.execute("DROP INDEX IF EXISTS idx_tasks_request_id")
+        await db.execute("UPDATE schema_meta SET value='9' WHERE key='schema_version'")
+    finally:
+        await db.close()
+    reopened = Database(path)
+    await reopened.connect()
+    try:
+        assert (
+            await reopened.scalar("SELECT value FROM schema_meta WHERE key='schema_version'")
+            == "10"
+        )
+        assert await reopened.scalar("SELECT COUNT(*) FROM tasks WHERE title='legacy task'") == 1
+        assert (
+            await reopened.scalar("SELECT content FROM memories WHERE key='legacy'")
+            == "remember me"
+        )
+        assert await reopened.scalar("SELECT COUNT(*) FROM requests") == 0
+        assert list((tmp_path / "backups").glob("pre-migration-v10-*.db"))
+    finally:
+        await reopened.close()

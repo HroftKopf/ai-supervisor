@@ -73,7 +73,7 @@ live review: valid ReviewResult (accept/rework)
 ```
 
 Итог: `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py` — 2 passed.
-Обычные/регрессионные тесты: 183 passed, 4 skipped. `ruff check` — без ошибок.
+Обычные/регрессионные тесты: 191 passed, 4 skipped. `ruff check` — без ошибок.
 
 ## Перезапуск сервиса
 

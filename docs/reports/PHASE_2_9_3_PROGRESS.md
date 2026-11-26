@@ -23,7 +23,7 @@ Current state after this work: see final commit/report.
   provider/model/generation-bound approval, usage identity registration and atomic persisted
   AVAILABLE transition. Persistence is written before the in-memory block is cleared.
 - No hidden structured-output token escalation.
-- Tests increased from 160 to 163; coverage remains ~68% statements / 51% branches.
+- Tests increased from 160 to 191; coverage remains ~68% statements / 51% branches.
 
 ## Not completed — do not claim Phase 2.9.3 accepted
 
@@ -46,17 +46,26 @@ Current state after this work: see final commit/report.
 
 - Durable `requests` table with unique `dedup_key`.
 - Dedup key is Telegram-derived: `telegram:<chat_id>:<message_id>:<mode>`.
-- Request capture is atomic and single-winner; concurrent duplicates cannot start a second planner/worker.
-- Task creation has a unique `request_id` constraint; duplicate creates return the existing task.
+- Request capture uses an atomic conditional reclaim (`status='captured' AND task_id IS NULL`);
+  only the SQLite winner processes.
+- Task insert, accepted event and request binding are one SQLite transaction.
+- Existing task by `request_id` is discovered before creating a second task/event.
 - `/task` and `/auto` both use the request gateway; `/task` preserves `source_message_id`.
 - `recovery_reset()` returns crashed `processing` requests to `captured` only when no task was attached.
+- Failure lifecycle: `retryable`, `rejected`, `cancelled`, `failed`, `chat`, `task`.
+- `/request retry <request_id>` re-queues only retryable/failed/cancelled requests; no automatic paid retry.
+- Original owner/project/conversation/request_id are preserved across reclaim and project switch.
 - `source_request` remains immutable through normal `update_fields`.
 - Original requests over 8000 chars are rejected, not truncated.
 - Title hints and request records are redacted.
 
 Regression tests: duplicate Telegram delivery, identical text with different message IDs, 20 concurrent
-captures, restart redelivery, `/task` source id, crash-boundary recovery, long-request rejection,
-redaction, immutable fields, owner authorization.
+captures, 20 concurrent reclaims, reclaim keeps request_id/project, restart redelivery, `/task`
+source id, transactional task/binding rollback, existing task discovery, classifier quota/network
+lifecycle, cancellation, long-request rejection, redaction, immutable fields, owner authorization,
+v9→v10 migration preserving tasks/memory.
+
+Current full suite: **191 passed, 4 skipped**; coverage **68% statements / 51% branches**.
 
 ## Provider recovery test matrix
 

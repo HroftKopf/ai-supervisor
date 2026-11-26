@@ -117,7 +117,7 @@ executor, длительность, hash коммита, результат secr
 
 ## Проверено
 
-- `pytest`: **183 passed, 4 skipped**.
+- `pytest`: **191 passed, 4 skipped**.
 - `ruff check .`: без ошибок.
 - `ai-supervisor doctor`: GitHub token принят; egress netns/proxy OK.
 - Реальный `git push --dry-run` из worktree #004 через `GitAuthManager` — rc 0 (без публикации).
