@@ -72,6 +72,11 @@ SQLite schema v7 adds request provenance fields. Migration backup is
 ## Verification
 
 - **160 passed, 4 skipped**, synthetic credentials only.
+- Offline benchmark after the change (single samples, current host): memory search 0.88–1.04 ms,
+  context build 0.43–0.54 ms, state transitions median 3.5–3.6 ms, 20 scheduler jobs 0.28–0.30 ms,
+  recovery 0.53–0.57 ms, peak context 25,693 B. These are slower than the Phase 2.9 sample
+  (0.65/0.34/2.3/0.22/0.45 ms); the measurements are not controlled for host load, so no
+  regression or improvement claim is made.
 - New tests: request envelope, immutable intent, review checkpoint, provider quota isolation,
   canonical role resolution, generation-readiness separation, explicit modes, relevance memory.
 - Existing COMPOSITE/publish/approval tests pass.

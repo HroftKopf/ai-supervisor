@@ -269,6 +269,7 @@ async def test_registry_independent_role_provider_selection(settings) -> None:
         assert "kimi-secret" not in str(snapshot)
         assert registry.provider_for("chat").name == "openai"
         assert registry.provider_for("planner").name == "kimi"
+        assert registry.provider_for("planning").name == "kimi"
         assert registry.provider_for("reviewer").model == settings.llm.openai_model
         registry.select("summarizer", "openai")
         assert registry.provider_for("summarizer").name == "openai"
