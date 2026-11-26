@@ -1,0 +1,196 @@
+# AI Supervisor configuration.
+# Secrets are NEVER stored here. Put only credentials/personal IDs in .env.
+# Section names are stable; comments explain safe ranges and security impact.
+
+[application]
+# Timezone for reports and daily usage boundaries.
+timezone = "Europe/Moscow"
+[telegram]
+# Owner-only mode: the bot refuses groups and non-owner users.
+private_chat_only = true
+polling_timeout_seconds = 30
+# Telegram hard limit is 4096; keep a margin for HTML entities.
+max_message_chars = 4000
+
+[providers.kimi]
+# Kimi Code endpoint and documented model IDs: k3.1-pro is the primary.
+# Keys and base URLs are not interchangeable between Kimi Code and Moonshot.
+base_url = "https://api.kimi.ai/coding/v1"
+model = "k3.1-pro"
+# Kimi K3.1 accepts low / high / max. "max" is expensive; use it only for hard tasks.
+reasoning_effort = "high"
+max_completion_tokens = 32768
+request_timeout_seconds = 180
+max_retries = 3
+max_concurrent_requests = 2
+verify_model_on_startup = true
+
+[providers.deepseek]
+# DeepSeek Harness is the execution backend, not a control-model provider.
+provider = "deepseek-official"
+base_url = ""
+model = "deepseek-v4-flash"
+profile = "sdk-minimal"
+max_tokens = 32768
+# Empty keeps the worker model's default reasoning effort.
+reasoning_effort = ""
+initialize_timeout_seconds = 60
+shutdown_timeout_seconds = 5
+
+[providers.openai]
+# Official OpenAI Responses API. OPENAI_API_KEY belongs in .env.
+base_url = "https://api.openai.com/v1"
+# Real model ID; change only to a model available to your account.
+model = "gpt-4.1"
+# Enable only for models/endpoints that support the reasoning parameter.
+reasoning = false
+# Disable for endpoints/proxies that do not support prompt cache keys.
+prompt_cache = true
+
+[providers.openai_compatible]
+# Chat Completions-compatible third-party/local endpoint.
+# OPENAI_COMPATIBLE_API_KEY belongs in .env.
+base_url = ""
+model = ""
+# Enable only when the endpoint documents these capabilities.
+reasoning = false
+prompt_cache = false
+
+[agent_roles]
+# Every role can use a different provider: kimi | openai | openai_compatible.
+# No automatic fallback between paid APIs is performed.
+default_provider = "kimi"
+chat = "kimi"
+classifier = "kimi"
+planner = "kimi"
+reviewer = "kimi"
+summarizer = "kimi"
+experience = "kimi"
+
+[routing]
+# Level selection is deterministic in code (0 native, 1 simple, 2 standard, 3 complex).
+# No thresholds are configurable; reasoning budgets live in [reasoning].
+
+[reasoning]
+# Per-level reasoning effort and output budget. These are starting values,
+# not a claim of optimality. Higher values consume more tokens and time.
+level1_effort = "low"
+level1_max_tokens = 2048
+level2_effort = "high"
+level2_max_tokens = 8192
+level3_effort = "max"
+level3_max_tokens = 16384
+classifier_effort = "low"
+classifier_max_tokens = 2048
+
+[task_limits]
+# Maximum executor/review cycles before a task is blocked.
+max_rework = 3
+max_task_minutes = 45
+max_iterations = 12
+# Control-model requests per task (legacy option name retained for compatibility).
+max_task_kimi_requests = 40
+# 0 means unlimited. Applies to all providers for one task.
+max_task_total_tokens = 0
+# 0 means unlimited. Real provider-reported tokens/requests, not estimates.
+daily_token_limit = 0
+daily_request_limit = 0
+warn_at_percent = 80
+
+[scheduler]
+# Parallel workers. Raise only after measuring CPU, memory and provider limits.
+max_workers = 3
+
+[memory]
+# Conversation context window and rolling summary limits.
+max_context_messages = 16
+max_context_chars = 24000
+summarize_after_messages = 40
+summary_max_chars = 6000
+
+[strategies]
+# Relevant strategy files are selected dynamically; whole library is never sent.
+enabled = true
+max_selected = 2
+
+[context]
+# Hard caps for project/context reads and diffs.
+max_project_context_chars = 30000
+max_file_read_bytes = 262144
+max_diff_chars = 80000
+
+[security]
+# Projects must be strict children of one of these roots.
+allowed_project_roots = ["/home/youruser/Projects"]
+# Refuse startup if .env is readable by group/others.
+require_env_mode_600 = true
+# NEVER set true in production: workers would run without isolation.
+allow_unsafe_no_sandbox = false
+
+[sandbox]
+# bwrap is the security boundary. "none" is refused unless explicitly unsafe.
+backend = "bwrap"
+memory_mb = 4096
+cpu_seconds_per_worker = 3000
+max_open_files = 1024
+max_processes = 1024
+
+[network]
+# Worker has no shared network: only an allowlisted CONNECT proxy.
+sandbox_network = true
+
+[network.egress]
+enabled = true
+allowed_hosts = ["api.deepseek.com"]
+allowed_ports = [80, 443]
+max_connections = 32
+
+[git]
+author_name = "AI Supervisor"
+author_email = "ai-supervisor@localhost"
+base_branch = "main"
+commit_prefix = "ai-supervisor"
+
+[github]
+api_url = "https://api.github.com"
+default_private = true
+# Hosts that may receive GITHUB_TOKEN for HTTPS Git operations.
+push_hosts = ["github.com"]
+timeout_seconds = 30
+
+[usage]
+# Optional prices per million tokens. Zero means "not calculated" (never invented).
+# Costs use the actual provider/model and explicit currency.
+#[usage.pricing."kimi/k3.1-pro"]
+#input_per_mtok = 0.0
+#output_per_mtok = 0.0
+#cache_read_per_mtok = 0.0
+#cache_write_per_mtok = 0.0
+#currency = "USD"
+#
+#[usage.pricing."openai/gpt-4.1"]
+#input_per_mtok = 0.0
+#output_per_mtok = 0.0
+#currency = "USD"
+
+[recovery]
+# Resume interrupted work after restart, never completed stages.
+auto_resume_composite = true
+auto_resume_git_auth_blocked = true
+
+[logging]
+# DEBUG/INFO/WARNING/ERROR/CRITICAL. DEBUG never prints credentials.
+log_level = "INFO"
+# Per-task worker logs older than this are deleted on startup (DB audit remains).
+task_log_retention_days = 14
+max_worker_log_chars = 20000
+
+[storage]
+# Relative paths are resolved against the project root.
+data_dir = "var"
+
+[backups]
+# Migration/config backups are local-only and gitignored. Keep them mode 600.
+directory = "var/backups"
+keep = 20
+before_schema_migration = true

@@ -555,10 +555,10 @@ class Orchestrator:
                     "поддерживаются текстовые файлы и изображения]"
                 )
                 continue
-            if attachment.size > self.settings.security.max_file_read_bytes:
+            if attachment.size > self.settings.context.max_file_read_bytes:
                 parts.append(
                     f"[Вложение {attachment.filename} пропущено: больше "
-                    f"{self.settings.security.max_file_read_bytes} байт]"
+                    f"{self.settings.context.max_file_read_bytes} байт]"
                 )
                 continue
             try:
@@ -569,7 +569,7 @@ class Orchestrator:
             content = self.redactor.redact(content)
             parts.append(
                 f"[НЕДОВЕРЕННОЕ ВЛОЖЕНИЕ: {attachment.filename}]\n"
-                f"{content[: self.settings.security.max_file_read_bytes]}\n"
+                f"{content[: self.settings.context.max_file_read_bytes]}\n"
                 f"[КОНЕЦ ВЛОЖЕНИЯ: {attachment.filename}]"
             )
         return "\n\n".join(parts), images
@@ -795,7 +795,11 @@ class Orchestrator:
             reasoning_effort=plan_profile.effort,
             max_completion_tokens=plan_profile.max_tokens,
             capabilities_block=capability_block(),
-            strategy_block=self.strategies.select(latest_user),
+            strategy_block=(
+                self.strategies.select(latest_user, limit=self.settings.strategies.max_selected)
+                if self.settings.strategies.enabled
+                else ""
+            ),
         )
         final_level = max(int(requested_level), int(self.routing.for_spec(spec)))
         updates: dict[str, object] = {

@@ -139,6 +139,8 @@ python -m venv .venv
 python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 
+cp config.example.toml config.toml
+$EDITOR config.toml
 cp .env.example .env
 chmod 600 .env
 $EDITOR .env
@@ -147,8 +149,9 @@ ai-supervisor doctor
 ai-supervisor run
 ```
 
-`doctor` проверяет Python, SQLite FTS5, Git, bubblewrap, DSH runtime, права `.env`, Telegram-бота
-и доступность выбранной модели Kimi. Он не печатает секреты.
+`doctor` проверяет Python, SQLite FTS5, Git, bubblewrap, DSH runtime, права `.env`,
+Telegram-бота, структуру конфигурации и доступность всех выбранных control-провайдеров.
+Он не печатает секреты.
 
 `ai-supervisor run` запускает long polling. Публичный IP, порты и домен не нужны.
 Для работы без открытого терминала используйте systemd user unit:
@@ -171,20 +174,26 @@ journalctl --user -u ai-supervisor.service -f
 Секреты хранятся только в `.env` (или `EnvironmentFile` systemd), не в `config.toml` и не в Git.
 
 ```env
-KIMI_API_KEY=
-KIMI_BASE_URL=https://api.kimi.ai/coding/v1
-KIMI_MODEL=k3.1-pro
-
-DEEPSEEK_API_KEY=
-DEEPSEEK_BASE_URL=
-DEEPSEEK_MODEL=
-
+# Telegram
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_OWNER_ID=
 
-# Optional: GitHub repository info/create. Never passed to the worker.
+# Kimi
+KIMI_API_KEY=
+
+# DeepSeek Harness executor
+DEEPSEEK_API_KEY=
+
+# Optional control providers
+OPENAI_API_KEY=
+OPENAI_COMPATIBLE_API_KEY=
+
+# Optional GitHub
 GITHUB_TOKEN=
 ```
+
+Неконфиденциальные endpoint/model, роли провайдеров, reasoning-бюджеты и лимиты находятся в
+`config.toml`. Полное описание: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 - `.env` должен иметь режим `600`; при `require_env_mode_600=true` сервис откажется запускаться с
   более широкими правами.
@@ -221,7 +230,7 @@ SDK запускает собственный bundled runtime; системны�
 - Patch `config/dsh/disable-session-log-upload.yml` отключает необязательную отправку журналов
   сессии провайдеру.
 - SDK 0.2.2rc2 общается с DeepSeek по **Messages API** (`/v1/messages`). Если
-  `DEEPSEEK_BASE_URL` задан, endpoint должен быть Messages-совместимым. Пустое значение
+  `providers.deepseek.base_url` задан, endpoint должен быть Messages-совместимым. Пустое значение
   использует официальный default SDK.
 - Worker не получает `KIMI_API_KEY`, `TELEGRAM_BOT_TOKEN`, SSH-ключи или браузерные профили.
 - Существующие настройки Harness пользователя не читаются и не перезаписываются.
@@ -250,7 +259,7 @@ permissions|remote|budget|max-rework|extra-read|permission|import-config|test|bu
 ### Проекты
 
 ```text
-/project add hks-shell /home/hks/hks-shell
+/project add example-shell /home/you/projects/example-shell
 /project test "cargo test"
 /project build "cargo build"
 /project create my-new-project "Rust / Wayland"
@@ -293,8 +302,10 @@ permissions|remote|budget|max-rework|extra-read|permission|import-config|test|bu
 Ключевые параметры:
 
 ```toml
-[limits]
+[scheduler]
 max_workers = 3
+
+[task_limits]
 max_rework = 3
 max_task_minutes = 45
 max_iterations = 12
@@ -304,10 +315,13 @@ daily_token_limit = 0
 
 [sandbox]
 backend = "bwrap"
-network = true
 memory_mb = 4096
+
+[network]
+sandbox_network = true
 ```
 
+Полный справочник: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 Все значения валидируются Pydantic при запуске. `sandbox.backend = "none"` запрещён, пока явно
 не выставлен `security.allow_unsafe_no_sandbox = true`; в production этого делать нельзя.
 
@@ -348,10 +362,10 @@ memory_mb = 4096
 
 Выполнено:
 
-- `pytest`: **112 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
+- `pytest`: **120 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
-  Проверены запуск runtime, проброс `DEEPSEEK_BASE_URL`, запись результата, usage (input 42,
+  Проверены запуск runtime, проброс endpoint, запись результата, usage (input 42,
   output 7, cached 3, requests 1), завершение `completed`, реальный `bash` tool call,
   изменивший файл в worktree, и работу через netns + allowlisted egress proxy.
 - `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest tests/test_kimi_live.py`: **2 passed** на последнем

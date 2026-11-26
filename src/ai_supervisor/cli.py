@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 from ai_supervisor.config import ConfigError, Settings, load_settings
@@ -49,7 +50,12 @@ async def run_bot(settings: Settings, *, skip_checks: bool = False) -> None:
     await sandbox.check_available()
     logger.info("sandbox check passed: %s", settings.sandbox.backend)
 
-    db = Database(settings.db_path)
+    db = Database(
+        settings.db_path,
+        backup_dir=settings.backup_dir,
+        backup_keep=settings.backups.keep,
+        backup_before_migration=settings.backups.before_schema_migration,
+    )
     await db.connect()
     providers = ProviderRegistry(settings, redactor)
     bot: Bot | None = None
@@ -139,6 +145,43 @@ class Doctor:
             self.ok("Python", platform.python_version())
         else:
             self.fail("Python", f"{platform.python_version()} < 3.12")
+
+        try:
+            with s.config_path.open("rb") as handle:
+                config_raw = tomllib.load(handle)
+            self.ok(
+                "Configuration",
+                f"{s.config_path.name}: {len(config_raw)} section(s), "
+                f"providers={', '.join(sorted(config_raw.get('providers', {})))}",
+            )
+            if not (s.root / "config.example.toml").is_file():
+                self.warn("Config template", "config.example.toml is missing")
+            else:
+                self.ok("Config template", "config.example.toml present")
+            nonsecret_env = {
+                "KIMI_BASE_URL",
+                "KIMI_MODEL",
+                "DEEPSEEK_BASE_URL",
+                "DEEPSEEK_MODEL",
+            }
+            env_keys = set()
+            if s.env_path.is_file():
+                for line in s.env_path.read_text(encoding="utf-8").splitlines():
+                    if "=" in line and not line.lstrip().startswith("#"):
+                        env_keys.add(line.split("=", 1)[0].strip())
+            stale = sorted(env_keys & nonsecret_env)
+            if stale:
+                self.warn(
+                    "Secrets layout",
+                    "non-secret settings still in .env: "
+                    + ", ".join(stale)
+                    + "; move them to config.toml",
+                )
+            else:
+                self.ok("Secrets layout", ".env contains credentials/personal IDs only")
+            self.ok("Backups", f"{s.backup_dir} (keep={s.backups.keep})")
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            self.fail("Configuration", str(exc))
 
         try:
             sqlite3.connect(":memory:").execute("CREATE VIRTUAL TABLE t USING fts5(x)")

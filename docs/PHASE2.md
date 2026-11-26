@@ -104,7 +104,7 @@ Kimi возвращает `approved` / `rework_required` / `approval_required` /
 
 ## Что проверено
 
-- `pytest`: 112 passed, 4 skipped.
+- `pytest`: 120 passed, 4 skipped.
 - `ruff check`: без ошибок.
 - Реальный DSH runtime в bwrap: 2 integration tests passed (включая bash tool call).
 - Живой Kimi API: chat/classify/plan v2/review — passed.

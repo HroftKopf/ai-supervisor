@@ -138,10 +138,26 @@ class SecuritySection(BaseModel):
     )
     require_env_mode_600: bool = True
     allow_unsafe_no_sandbox: bool = False
-    max_file_read_bytes: int = Field(default=262144, ge=4096, le=10_000_000)
+
+
+class ContextSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     max_project_context_chars: int = Field(default=30000, ge=4000, le=200000)
+    max_file_read_bytes: int = Field(default=262144, ge=4096, le=10_000_000)
     max_diff_chars: int = Field(default=80000, ge=4000, le=1_000_000)
-    max_merge_conflict_chars: int = Field(default=12000, ge=1000, le=200000)
+
+
+class StrategiesSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = True
+    max_selected: int = Field(default=2, ge=0, le=5)
+
+
+class BackupsSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    directory: str = "var/backups"
+    keep: int = Field(default=20, ge=1, le=1000)
+    before_schema_migration: bool = True
 
 
 class LimitsSection(BaseModel):
@@ -162,6 +178,7 @@ class LimitsSection(BaseModel):
 class DeepSeekSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     provider: str = "deepseek-official"
+    base_url: str = ""
     model: str = "deepseek-v4-flash"
     profile: str = "sdk-minimal"
     max_tokens: int = Field(default=32768, ge=1024, le=1_048_576)
@@ -234,7 +251,6 @@ class MemorySection(BaseModel):
     max_context_chars: int = Field(default=24000, ge=2000, le=200000)
     summarize_after_messages: int = Field(default=40, ge=10, le=1000)
     summary_max_chars: int = Field(default=6000, ge=500, le=50000)
-    max_search_results: int = Field(default=20, ge=1, le=100)
 
 
 class ModelPrice(BaseModel):
@@ -331,6 +347,9 @@ class Settings(BaseModel):
     llm: LLMSection
     telegram: TelegramSection
     security: SecuritySection
+    context: ContextSection
+    strategies: StrategiesSection
+    backups: BackupsSection
     github: GitHubSection
     egress: EgressSection
     routing: RoutingSection
@@ -426,11 +445,17 @@ class Settings(BaseModel):
 
     @property
     def deepseek_base_url(self) -> str:
-        return os.environ.get("DEEPSEEK_BASE_URL", "").strip()
+        # Environment remains an explicit deployment/test override; config.toml is
+        # the normal location for this non-secret value.
+        return os.environ.get("DEEPSEEK_BASE_URL", "").strip() or self.deepseek.base_url.strip()
 
     @property
     def deepseek_model(self) -> str:
-        return os.environ.get("DEEPSEEK_MODEL", "").strip() or self.deepseek.model
+        return os.environ.get("DEEPSEEK_MODEL", "").strip() or self.deepseek.model.strip()
+
+    @property
+    def backup_dir(self) -> Path:
+        return self._resolve_data_path(self.backups.directory)
 
     @property
     def deepseek_key(self) -> str:
@@ -567,6 +592,247 @@ def validate_provider_url(url: str, *, label: str) -> None:
         )
 
 
+_OLD_TOP_LEVEL = {
+    "app",
+    "kimi",
+    "llm",
+    "telegram",
+    "security",
+    "limits",
+    "deepseek",
+    "sandbox",
+    "git",
+    "github",
+    "egress",
+    "routing",
+    "memory",
+    "usage",
+}
+_NEW_TOP_LEVEL = {
+    "application",
+    "storage",
+    "logging",
+    "recovery",
+    "providers",
+    "agent_roles",
+    "reasoning",
+    "task_limits",
+    "scheduler",
+    "strategies",
+    "context",
+    "network",
+    "pricing",
+    "backups",
+}
+
+
+def _as_section(raw: dict[str, Any], key: str) -> dict[str, Any]:
+    value = raw.get(key, {})
+    if not isinstance(value, dict):
+        raise ConfigError(f"config section [{key}] must be a table")
+    return dict(value)
+
+
+def _check_keys(section: str, value: dict[str, Any], allowed: set[str]) -> None:
+    unknown = set(value) - allowed
+    if unknown:
+        raise ConfigError(f"unknown setting(s) in [{section}]: " + ", ".join(sorted(unknown)))
+
+
+def _merge(*sections: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for section in sections:
+        result.update(section)
+    return result
+
+
+def normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
+    """Map the grouped 2.9 layout and the legacy flat layout to internal sections.
+
+    The on-disk layout is deliberately decoupled from the runtime model so old
+    config.toml files continue to load. New grouped values win over legacy values.
+    """
+    unknown = set(raw) - _OLD_TOP_LEVEL - _NEW_TOP_LEVEL
+    if unknown:
+        raise ConfigError("unknown top-level config section(s): " + ", ".join(sorted(unknown)))
+
+    application = _as_section(raw, "application")
+    storage = _as_section(raw, "storage")
+    logging = _as_section(raw, "logging")
+    recovery = _as_section(raw, "recovery")
+    _check_keys(
+        "application",
+        application,
+        {
+            "timezone",
+            "auto_resume_composite",
+            "auto_resume_git_auth_blocked",
+            "log_level",
+            "task_log_retention_days",
+            "data_dir",
+        },
+    )
+    _check_keys("storage", storage, {"data_dir"})
+    _check_keys(
+        "logging", logging, {"log_level", "task_log_retention_days", "max_worker_log_chars"}
+    )
+    _check_keys("recovery", recovery, {"auto_resume_composite", "auto_resume_git_auth_blocked"})
+    app = _merge(_as_section(raw, "app"), application)
+    if "data_dir" in storage:
+        app["data_dir"] = storage["data_dir"]
+    if "log_level" in logging:
+        app["log_level"] = logging["log_level"]
+    if "task_log_retention_days" in logging:
+        app["task_log_retention_days"] = logging["task_log_retention_days"]
+    if "auto_resume_composite" in recovery:
+        app["auto_resume_composite"] = recovery["auto_resume_composite"]
+    if "auto_resume_git_auth_blocked" in recovery:
+        app["auto_resume_git_auth_blocked"] = recovery["auto_resume_git_auth_blocked"]
+
+    providers = _as_section(raw, "providers")
+    unknown_providers = set(providers) - {"kimi", "deepseek", "openai", "openai_compatible"}
+    if unknown_providers:
+        raise ConfigError("unknown provider(s): " + ", ".join(sorted(unknown_providers)))
+    provider_kimi = _as_section(providers, "kimi")
+    provider_deepseek = _as_section(providers, "deepseek")
+    provider_openai = _as_section(providers, "openai")
+    provider_compatible = _as_section(providers, "openai_compatible")
+    _check_keys("providers.kimi", provider_kimi, set(KimiSection.model_fields))
+    _check_keys("providers.deepseek", provider_deepseek, set(DeepSeekSection.model_fields))
+    _check_keys(
+        "providers.openai", provider_openai, {"base_url", "model", "reasoning", "prompt_cache"}
+    )
+    _check_keys(
+        "providers.openai_compatible",
+        provider_compatible,
+        {"base_url", "model", "reasoning", "prompt_cache"},
+    )
+    kimi = _merge(_as_section(raw, "kimi"), provider_kimi)
+    # Explicit deployment/test override. Normal .env files contain secrets only;
+    # config.toml is canonical for these non-secret values.
+    kimi["base_url"] = (
+        os.environ.get("KIMI_BASE_URL", "").strip()
+        or kimi.get("base_url")
+        or "https://api.kimi.ai/coding/v1"
+    )
+    kimi["model"] = os.environ.get("KIMI_MODEL", "").strip() or kimi.get("model") or "k3.1-pro"
+    deepseek = _merge(_as_section(raw, "deepseek"), provider_deepseek)
+    if not deepseek.get("base_url"):
+        deepseek["base_url"] = os.environ.get("DEEPSEEK_BASE_URL", "").strip()
+    if not deepseek.get("model"):
+        deepseek["model"] = os.environ.get("DEEPSEEK_MODEL", "").strip() or "deepseek-v4-flash"
+
+    llm = _merge(_as_section(raw, "llm"))
+    openai_map = {
+        "base_url": "openai_base_url",
+        "model": "openai_model",
+        "reasoning": "openai_reasoning",
+        "prompt_cache": "openai_prompt_cache",
+    }
+    for source, target in openai_map.items():
+        if source in provider_openai:
+            llm[target] = provider_openai[source]
+    compatible_map = {
+        "base_url": "compatible_base_url",
+        "model": "compatible_model",
+        "reasoning": "compatible_reasoning",
+        "prompt_cache": "compatible_prompt_cache",
+    }
+    for source, target in compatible_map.items():
+        if source in provider_compatible:
+            llm[target] = provider_compatible[source]
+    roles = _as_section(raw, "agent_roles")
+    _check_keys(
+        "agent_roles",
+        roles,
+        {
+            "default",
+            "default_provider",
+            "chat",
+            "classifier",
+            "planner",
+            "reviewer",
+            "summarizer",
+            "experience",
+        },
+    )
+    old_roles = llm.get("roles", {})
+    if not isinstance(old_roles, dict):
+        raise ConfigError("llm.roles must be a table")
+    merged_roles = dict(old_roles)
+    for role in ("chat", "classifier", "planner", "reviewer", "summarizer", "experience"):
+        if role in roles:
+            merged_roles[role] = roles[role]
+    if "default_provider" in roles:
+        llm["default_provider"] = roles["default_provider"]
+    elif "default" in roles:
+        llm["default_provider"] = roles["default"]
+    if merged_roles:
+        llm["roles"] = merged_roles
+
+    routing = _merge(_as_section(raw, "routing"), _as_section(raw, "reasoning"))
+
+    limits = _merge(_as_section(raw, "limits"), _as_section(raw, "task_limits"))
+    scheduler = _as_section(raw, "scheduler")
+    if "max_workers" in scheduler:
+        limits["max_workers"] = scheduler["max_workers"]
+    if "max_worker_log_chars" in logging:
+        limits["max_worker_log_chars"] = logging["max_worker_log_chars"]
+
+    usage = _merge(_as_section(raw, "usage"))
+    for key in ("daily_token_limit", "daily_request_limit", "warn_at_percent"):
+        if key in usage:
+            limits[key] = usage.pop(key)
+    pricing = _merge(_as_section(raw, "pricing"), usage.pop("pricing", {}))
+    if pricing:
+        usage["prices"] = pricing
+
+    security = _as_section(raw, "security")
+    context = _as_section(raw, "context")
+    _check_keys("context", context, set(ContextSection.model_fields))
+    for key in (
+        "max_project_context_chars",
+        "max_file_read_bytes",
+        "max_diff_chars",
+    ):
+        if key in security and key not in context:
+            context[key] = security.pop(key)
+        elif key in security:
+            security.pop(key)
+
+    sandbox = _as_section(raw, "sandbox")
+    _check_keys("sandbox", sandbox, set(SandboxSection.model_fields))
+    network = _as_section(raw, "network")
+    _check_keys("network", network, {"sandbox_network", "worker_network", "egress"})
+    egress = _merge(_as_section(raw, "egress"), _as_section(network, "egress"))
+    if "sandbox_network" in network:
+        sandbox["network"] = network["sandbox_network"]
+    elif "worker_network" in network:
+        sandbox["network"] = network["worker_network"]
+
+    _check_keys("strategies", _as_section(raw, "strategies"), set(StrategiesSection.model_fields))
+    _check_keys("backups", _as_section(raw, "backups"), set(BackupsSection.model_fields))
+    return {
+        "app": app,
+        "kimi": kimi,
+        "deepseek": deepseek,
+        "llm": llm,
+        "telegram": _as_section(raw, "telegram"),
+        "security": security,
+        "context": context,
+        "strategies": _as_section(raw, "strategies"),
+        "backups": _as_section(raw, "backups"),
+        "github": _as_section(raw, "github"),
+        "egress": egress,
+        "routing": routing,
+        "limits": limits,
+        "sandbox": sandbox,
+        "git": _as_section(raw, "git"),
+        "memory": _as_section(raw, "memory"),
+        "usage": usage,
+    }
+
+
 def _find_root(explicit_root: str | Path | None) -> Path:
     if explicit_root is not None:
         return Path(explicit_root).expanduser().resolve()
@@ -609,17 +875,7 @@ def load_settings(
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"invalid TOML in {config_file}: {exc}") from exc
 
-    # Environment wins over config for deployment-specific values.
-    kimi = dict(raw.get("kimi", {}))
-    if os.environ.get("KIMI_BASE_URL", "").strip():
-        kimi["base_url"] = os.environ["KIMI_BASE_URL"].strip()
-    if os.environ.get("KIMI_MODEL", "").strip():
-        kimi["model"] = os.environ["KIMI_MODEL"].strip()
-    raw["kimi"] = kimi
-    deepseek = dict(raw.get("deepseek", {}))
-    if os.environ.get("DEEPSEEK_MODEL", "").strip():
-        deepseek["model"] = os.environ["DEEPSEEK_MODEL"].strip()
-    raw["deepseek"] = deepseek
+    raw = normalize_config(raw)
 
     owner_raw = os.environ.get("TELEGRAM_OWNER_ID", "").strip()
     owner_id: int | None = None
@@ -646,43 +902,24 @@ def load_settings(
         ),
     )
 
-    allowed_top_level = {
-        "app",
-        "kimi",
-        "llm",
-        "telegram",
-        "security",
-        "limits",
-        "deepseek",
-        "sandbox",
-        "git",
-        "github",
-        "egress",
-        "routing",
-        "memory",
-        "usage",
-    }
-    unknown_sections = set(raw) - allowed_top_level
-    if unknown_sections:
-        raise ConfigError(
-            "unknown top-level config section(s): " + ", ".join(sorted(unknown_sections))
-        )
-
     try:
         settings = Settings(
             root=project_root,
             config_path=config_file.resolve(),
             env_path=env_file.resolve(),
             app=AppSection.model_validate(raw.get("app", {})),
-            kimi=KimiSection.model_validate(kimi),
+            kimi=KimiSection.model_validate(raw.get("kimi", {})),
             llm=LLMSection.model_validate(raw.get("llm", {})),
             telegram=TelegramSection.model_validate(raw.get("telegram", {})),
             security=SecuritySection.model_validate(raw.get("security", {})),
+            context=ContextSection.model_validate(raw.get("context", {})),
+            strategies=StrategiesSection.model_validate(raw.get("strategies", {})),
+            backups=BackupsSection.model_validate(raw.get("backups", {})),
             github=GitHubSection.model_validate(raw.get("github", {})),
             egress=EgressSection.model_validate(raw.get("egress", {})),
             routing=RoutingSection.model_validate(raw.get("routing", {})),
             limits=LimitsSection.model_validate(raw.get("limits", {})),
-            deepseek=DeepSeekSection.model_validate(deepseek),
+            deepseek=DeepSeekSection.model_validate(raw.get("deepseek", {})),
             sandbox=SandboxSection.model_validate(raw.get("sandbox", {})),
             git=GitSection.model_validate(raw.get("git", {})),
             memory=MemorySection.model_validate(raw.get("memory", {})),

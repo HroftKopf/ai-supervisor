@@ -322,8 +322,8 @@ class WorkspaceManager:
         diff_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         diff_path.write_text(full_diff, encoding="utf-8")
         diff_path.chmod(0o600)
-        truncated = len(full_diff) > self.settings.security.max_diff_chars
-        diff = _truncate_middle(full_diff, self.settings.security.max_diff_chars)
+        truncated = len(full_diff) > self.settings.context.max_diff_chars
+        diff = _truncate_middle(full_diff, self.settings.context.max_diff_chars)
         head_commit = (await git_output(worktree, "rev-parse", "HEAD")).strip()
         verification_note = ""
         if not checks:

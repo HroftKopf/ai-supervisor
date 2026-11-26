@@ -2,6 +2,9 @@
 .env
 .env.*
 !.env.example
+# Local settings are user-specific; publish config.example.toml instead.
+config.toml
+!config.example.toml
 *.pem
 *.key
 *.p12

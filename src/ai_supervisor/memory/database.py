@@ -315,8 +315,18 @@ END;
 
 
 class Database:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        backup_dir: Path | None = None,
+        backup_keep: int = 20,
+        backup_before_migration: bool = True,
+    ) -> None:
         self.path = path
+        self.backup_dir = backup_dir
+        self.backup_keep = backup_keep
+        self.backup_before_migration = backup_before_migration
         self._connection: aiosqlite.Connection | None = None
         # One connection is shared by the whole application. Serialise operations
         # so an unrelated message insert cannot interleave with a task transaction.
@@ -359,8 +369,13 @@ class Database:
             )
         if current == SCHEMA_VERSION:
             return
-        if self.path.exists() and self.path.stat().st_size > 0:
-            await asyncio.to_thread(_backup_before_migration, self.path)
+        if self.backup_before_migration and self.path.exists() and self.path.stat().st_size > 0:
+            await asyncio.to_thread(
+                _backup_before_migration,
+                self.path,
+                backup_dir=self.backup_dir,
+                keep=self.backup_keep,
+            )
         additions = {
             "projects": {
                 "remote_url": "TEXT",
@@ -492,8 +507,8 @@ def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
-def _backup_before_migration(path: Path) -> Path:
-    backup_dir = path.parent / "backups"
+def _backup_before_migration(path: Path, *, backup_dir: Path | None = None, keep: int = 20) -> Path:
+    backup_dir = backup_dir or (path.parent / "backups")
     backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = (
         backup_dir
@@ -507,4 +522,13 @@ def _backup_before_migration(path: Path) -> Path:
         destination.close()
         source.close()
     target.chmod(0o600)
+    if keep > 0:
+        backups = sorted(
+            backup_dir.glob("pre-migration-v*-*.db"), key=lambda item: item.stat().st_mtime
+        )
+        for stale in backups[:-keep]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
     return target

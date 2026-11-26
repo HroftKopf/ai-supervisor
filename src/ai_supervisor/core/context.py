@@ -112,7 +112,7 @@ class ProjectContextBuilder:
         if include_files:
             selected = _select_important(visible, goal=goal)
             budget = max(
-                2000, self.settings.security.max_project_context_chars - len("\n".join(parts))
+                2000, self.settings.context.max_project_context_chars - len("\n".join(parts))
             )
             for path in selected:
                 if budget <= 0:
@@ -125,7 +125,7 @@ class ProjectContextBuilder:
                 parts.append(f"\n--- file: {path} ---\n{content}\n--- end: {path} ---")
                 budget -= len(content)
         text = "\n".join(parts)
-        return text[: self.settings.security.max_project_context_chars]
+        return text[: self.settings.context.max_project_context_chars]
 
     async def _safe_read(self, project_root: Path, path: Path) -> str | None:
         try:
@@ -151,7 +151,7 @@ class ProjectContextBuilder:
             stat = resolved.stat()
         except OSError:
             return None
-        if not resolved.is_file() or stat.st_size > self.settings.security.max_file_read_bytes:
+        if not resolved.is_file() or stat.st_size > self.settings.context.max_file_read_bytes:
             return None
         try:
             data = await asyncio.to_thread(resolved.read_bytes)

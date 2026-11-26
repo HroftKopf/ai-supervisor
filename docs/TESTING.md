@@ -20,7 +20,7 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 | Проверка | Результат |
 |---|---|
 | `ruff check .` | все проверки пройдены |
-| `pytest -q` | **112 passed, 4 skipped** |
+| `pytest -q` | **120 passed, 4 skipped** |
 | `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py` | **2 passed** |
 | `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py` | **2 passed** |
 | bwrap probe | OK (user namespaces, read-only `/usr`) |
@@ -59,6 +59,8 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 - Memory categories/upsert/stale/experience extractor; 39 evaluation scenarios.
 - Provider abstraction: Kimi regression, OpenAI Responses mock, tools, streaming, usage,
   normalized errors, capability negotiation, independent roles, no fallback.
+- Configuration: grouped↔legacy migration, unknown section/key, wrong types, provider/role
+  validation, env-only-secrets template checks, local config ignored.
 - Typography: Markdown→Telegram HTML, paragraphs/code, vertical spacing and limits.
 - Worker env excludes KIMI/OpenAI/OPENAI_COMPATIBLE keys.
 

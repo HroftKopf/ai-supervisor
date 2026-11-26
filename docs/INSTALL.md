@@ -35,6 +35,8 @@ python -c 'import ai_supervisor; print("ok")'
 ## 3. Конфигурация
 
 ```bash
+cp config.example.toml config.toml
+$EDITOR config.toml
 cp .env.example .env
 chmod 600 .env
 $EDITOR .env
@@ -43,33 +45,38 @@ $EDITOR .env
 Минимум:
 
 ```env
-KIMI_API_KEY=...
-KIMI_BASE_URL=https://api.kimi.ai/coding/v1
-KIMI_MODEL=k3.1-pro
-DEEPSEEK_API_KEY=...
+# Telegram
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_OWNER_ID=123456789
-# Optional: GitHub repo info/create and HTTPS Git push
-GITHUB_TOKEN=
-# Optional provider-agnostic control models:
+# Kimi control model
+KIMI_API_KEY=...
+# DeepSeek Harness executor (required)
+DEEPSEEK_API_KEY=...
+# Optional control providers
 # OPENAI_API_KEY=
 # OPENAI_COMPATIBLE_API_KEY=
+# Optional GitHub
+# GITHUB_TOKEN=
 ```
 
-`DEEPSEEK_BASE_URL` оставьте пустым для официального endpoint SDK. Если задаёте свой,
-он должен быть совместим с **Messages API** (`/v1/messages`), который использует DSH 0.2.2rc2.
+Nonsecret Kimi/DeepSeek endpoints and model IDs are in `config.toml`
+(`[providers.kimi]`, `[providers.deepseek]`), not in `.env`.
 
-Провайдеры управляющих моделей выбираются в `[llm.roles]`; по умолчанию все роли — Kimi.
-Для OpenAI задайте `OPENAI_API_KEY` и при необходимости `[llm] openai_model`.
+`providers.deepseek.base_url` оставьте пустым для официального endpoint SDK. Если задаёте
+свой, он должен быть совместим с **Messages API** (`/v1/messages`), который использует DSH
+0.2.2rc2.
+
+Провайдеры управляющих моделей выбираются в `[agent_roles]`; по умолчанию все роли — Kimi.
+Для OpenAI задайте `OPENAI_API_KEY` и при необходимости `[providers.openai]`.
 Ключи не передаются worker-процессам.
 
 `config.toml`:
 
 - `security.allowed_project_roots` — реальные корни ваших проектов.
-- `limits.max_workers` — начальное значение 3.
-- `limits.max_rework` — начальное значение 3.
+- `scheduler.max_workers` — начальное значение 3.
+- `task_limits.max_rework` — начальное значение 3.
 - `sandbox.backend = "bwrap"` не меняйте на `none`.
-- `usage.*` — при желании задайте цены за миллион токенов; иначе стоимость не рассчитывается.
+- `usage.pricing` — при желании задайте цены за миллион токенов; иначе стоимость не рассчитывается.
 
 ## 4. Telegram
 
@@ -94,7 +101,7 @@ GITHUB_TOKEN=
 Worker не имеет прямого выхода в сеть. `config.toml`:
 
 ```toml
-[egress]
+[network.egress]
 enabled = true
 allowed_hosts = ["api.deepseek.com"]
 allowed_ports = [80, 443]
@@ -104,7 +111,7 @@ allowed_ports = [80, 443]
 GIT_ASKPASS и не пишется в Git config. Если нужен GitHub Enterprise, добавьте его host в
 `[github].push_hosts` (по умолчанию `["github.com"]`).
 
-Если `DEEPSEEK_BASE_URL` задаёт другой host/port, они добавляются автоматически только для
+Если `providers.deepseek.base_url` задаёт другой host/port, они добавляются автоматически только для
 этого endpoint. Не добавляйте произвольные хосты без необходимости. Для локального mock
 используйте non-loopback имя (`127.0.0.1.nip.io`) или тестовый профиль с `egress.enabled=false`.
 
@@ -143,7 +150,7 @@ ai-supervisor doctor
 ## 7. Первый проект
 
 ```text
-/project add demo /home/hks/Projects/demo
+/project add demo /home/you/Projects/demo
 /project test "python -m pytest -q"
 /project build "python -m compileall -q ."
 ```

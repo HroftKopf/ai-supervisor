@@ -42,19 +42,19 @@ Provider-specific параметры остаются в адаптерах. `re
 
 ## Роли и конфигурация
 
-`[llm]` в `config.toml` выбирает провайдера независимо для:
+`[agent_roles]` в `config.toml` выбирает провайдера независимо для:
 
 `chat`, `classifier`, `planner`, `reviewer`, `summarizer`, `experience`.
 
 ```toml
-[llm]
-default_provider = "kimi"
-openai_base_url = "https://api.openai.com/v1"
-openai_model = "gpt-4.1"
-openai_reasoning = false
-openai_prompt_cache = true  # false для endpoint без cache
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+model = "gpt-4.1"
+reasoning = false
+prompt_cache = true  # false для endpoint без cache
 
-[llm.roles]
+[agent_roles]
+default_provider = "kimi"
 chat = "kimi"
 classifier = "kimi"
 planner = "kimi"
@@ -78,7 +78,7 @@ DeepSeek Harness продолжает использовать `DEEPSEEK_API_KEY
 - `/provider select <role> <provider>` — явная смена на время работы; при наличии активных
   задач отклоняется, чтобы не менять конфигурацию запущенной задачи.
 
-Постоянная смена — через `[llm.roles]` и рестарт.
+Постоянная смена — через `[agent_roles]` и рестарт.
 
 ## Usage
 
@@ -135,7 +135,7 @@ Telegram не поддерживает CSS/margin/padding/line-height; отст�
 
 ## Проверки
 
-- `pytest`: **112 passed, 4 skipped**.
+- `pytest`: **120 passed, 4 skipped**.
 - `ruff check .`: без ошибок.
 - DSH/bwrap/egress: **2 integration tests passed**.
 - Kimi regression: существующие тесты и live-профиль сохранены.
@@ -168,11 +168,11 @@ chmod 600 .env
 2. Укажите модель/роли:
 
 ```toml
-[llm]
-default_provider = "openai"
-openai_model = "gpt-4.1"
+[providers.openai]
+model = "gpt-4.1"
 
-[llm.roles]
+[agent_roles]
+default_provider = "openai"
 chat = "openai"
 classifier = "openai"
 planner = "openai"
@@ -195,7 +195,7 @@ systemctl --user restart ai-supervisor.service
 
 ## Откат
 
-- Вернуть `[llm] default_provider = "kimi"` и роли `kimi`.
+- Вернуть `default_provider = "kimi"` и роли `kimi` в `[agent_roles]`.
 - Или `git revert` коммита Phase 2.8.
 - SQLite schema v6 добавляет `usage_events.raw_usage_json`; память/задачи v5 совместимы.
 - GitAuthManager, sandbox, approvals и egress не ослаблялись.
