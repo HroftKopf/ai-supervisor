@@ -124,7 +124,7 @@ async def test_composite_import_commit_validate_autocontinues(
         Path(task.worktree_path or "") / "niri/config.kdl"
     ).read_text() == "layout {\n  dwindle\n}\n"
     assert task.head_commit
-    assert task.report and "## Этапы" in task.report
+    assert task.report and "## COMPOSITE этапы" in task.report
     assert supervisor.chat_calls == 0
     assert supervisor.review_calls == 0
 
@@ -311,6 +311,11 @@ async def test_niri_composite_publishes_to_github_after_approvals(
     )
     assert result.stdout.strip()
     assert notifier.messages
+    assert "Python Orchestrator" in (task.report or "")
+    assert "COMPOSITE этапы" in (task.report or "")
+    assert "commit=" in (task.report or "")
+    assert "secret_scan=passed" in (task.report or "")
+    assert "Время с учётом планирования" in (task.report or "")
 
 
 @pytest.mark.asyncio
@@ -561,3 +566,144 @@ async def test_auto_resume_after_restart_keeps_completed_stage(
     stages = await orch.stages.list(task.id)
     assert stages[0].status is StageStatus.COMPLETED
     assert stages[1].status is StageStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_missing_git_credentials_pause_as_waiting_input(
+    orchestrator, project, tmp_path: Path
+) -> None:
+    orch, _supervisor, _workers, _notifier, projects, tasks = orchestrator
+    from pydantic import SecretStr
+
+    orch.settings.secrets.github_token = SecretStr("")
+    await projects.update_instructions(
+        project.id, remote_url="https://github.com/owner/private-config.git"
+    )
+    import subprocess
+
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://github.com/owner/private-config.git"],
+        cwd=project.path,
+        check=True,
+    )
+    conversation = await orch.conversations.get_or_create_conversation(424242, project.id)
+    task = await tasks.create(project.id, conversation.id, "auth wait", max_rework=3)
+    spec = TaskSpec(
+        title="Publish auth wait",
+        goal="Опубликовать подготовленный репозиторий",
+        task_type=TaskType.COMPOSITE,
+        acceptance_criteria=["published"],
+        requires_file_changes=False,
+        stages=[
+            StageSpec(
+                id="publish",
+                operation=StageOperation.PUBLISH,
+                goal="publish",
+                executor=StageExecutor.GIT,
+                required_permissions=[RiskLevel.HIGH],
+                acceptance_criteria=["remote sha"],
+                merge=False,
+            )
+        ],
+    )
+    task = await tasks.save_spec(task.id, spec)
+    task = await tasks.transition(task.id, TaskStatus.PLANNING)
+    task = await tasks.transition(task.id, TaskStatus.QUEUED)
+    prepared = await orch.workspace.prepare(task, project)
+    task = await tasks.update_fields(
+        task.id,
+        worktree_path=prepared["worktree_path"],
+        branch=prepared["branch"],
+        base_ref=prepared["base_ref"],
+        base_commit=prepared["base_commit"],
+        head_commit=prepared["base_commit"],
+        dsh_home=str(orch.settings.dsh_homes_dir / f"task-{task.id:04d}"),
+    )
+    await orch.stages.ensure(task.id, spec.stages)
+    orch._spawn_job(task.id, plan_if_needed=False, manual_instruction=None)
+    await _run_until_idle(orch)
+    task = await tasks.get(task.id)
+    assert task.status is TaskStatus.WAITING_INPUT
+    assert "GITHUB_TOKEN" in (task.error or "")
+    stages = await orch.stages.list(task.id)
+    assert stages[0].status is StageStatus.READY
+
+
+@pytest.mark.asyncio
+async def test_auth_blocked_publish_auto_resumes_from_publish_stage(orchestrator, project) -> None:
+    import subprocess
+
+    from pydantic import SecretStr
+
+    orch, _supervisor, _workers, _notifier, projects, tasks = orchestrator
+    orch.settings.secrets.github_token = SecretStr("test-token-abcdefghijklmnop")
+    await projects.update_instructions(
+        project.id, remote_url="https://github.com/owner/private.git"
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://github.com/owner/private.git"],
+        cwd=project.path,
+        check=True,
+    )
+    conversation = await orch.conversations.get_or_create_conversation(424242, project.id)
+    task = await tasks.create(project.id, conversation.id, "resume publish", max_rework=3)
+    spec = TaskSpec(
+        title="Resume publish",
+        goal="Продолжить публикацию с сохранённого этапа",
+        task_type=TaskType.COMPOSITE,
+        acceptance_criteria=["published"],
+        requires_file_changes=False,
+        stages=[
+            StageSpec(
+                id="publish",
+                operation=StageOperation.PUBLISH,
+                goal="publish",
+                executor=StageExecutor.GIT,
+                required_permissions=[RiskLevel.HIGH],
+                acceptance_criteria=["remote sha"],
+                merge=False,
+            )
+        ],
+    )
+    task = await tasks.save_spec(task.id, spec)
+    task = await tasks.transition(task.id, TaskStatus.PLANNING)
+    task = await tasks.transition(task.id, TaskStatus.QUEUED)
+    task = await tasks.transition(task.id, TaskStatus.RUNNING)
+    prepared = await orch.workspace.prepare(task, project)
+    task = await tasks.update_fields(
+        task.id,
+        worktree_path=prepared["worktree_path"],
+        branch=prepared["branch"],
+        base_ref=prepared["base_ref"],
+        base_commit=prepared["base_commit"],
+        head_commit=prepared["base_commit"],
+        dsh_home=str(orch.settings.dsh_homes_dir / f"task-{task.id:04d}"),
+    )
+    stages = await orch.stages.ensure(task.id, spec.stages)
+    await orch.stages.set_status(stages[0].id, StageStatus.RUNNING)
+    await orch.stages.set_status(
+        stages[0].id,
+        StageStatus.FAILED,
+        error="could not read Username for 'https://github.com': terminal prompts disabled",
+    )
+    task = await tasks.transition(task.id, TaskStatus.BLOCKED)
+    reason = "could not read Username for 'https://github.com': terminal prompts disabled"
+    await tasks.update_fields(task.id, blocked_reason=reason, error=reason)
+
+    await orch.startup()
+    await _run_until_idle(orch)
+    task = await tasks.get(task.id)
+    assert task.status is TaskStatus.WAITING_APPROVAL, (
+        task.error,
+        [(s.stage_key, s.status.value, s.error) for s in await orch.stages.list(task.id)],
+        [e["event_type"] for e in await tasks.events(task.id)],
+    )
+    stages = await orch.stages.list(task.id)
+    assert stages[0].status is StageStatus.WAITING_APPROVAL
+    assert (
+        any(
+            stage.operation is StageOperation.IMPORT_CONFIG
+            for stage in await orch.stages.list(task.id)
+        )
+        is False
+    )

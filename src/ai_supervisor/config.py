@@ -33,6 +33,7 @@ class AppSection(BaseModel):
     log_level: str = "INFO"
     task_log_retention_days: int = Field(default=14, ge=1, le=3650)
     auto_resume_composite: bool = True
+    auto_resume_git_auth_blocked: bool = True
 
     @field_validator("log_level")
     @classmethod
@@ -79,6 +80,18 @@ class GitHubSection(BaseModel):
     api_url: str = "https://api.github.com"
     timeout_seconds: float = Field(default=30.0, gt=0, le=180)
     default_private: bool = True
+    push_hosts: list[str] = Field(default_factory=lambda: ["github.com"], max_length=20)
+
+    @field_validator("push_hosts")
+    @classmethod
+    def _push_hosts(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for item in value:
+            host = item.strip().lower()
+            if not host or any(ch.isspace() for ch in host) or "://" in host or "/" in host:
+                raise ValueError("github.push_hosts must contain host names only")
+            cleaned.append(host)
+        return cleaned
 
     @model_validator(mode="after")
     def _valid_api_url(self) -> GitHubSection:

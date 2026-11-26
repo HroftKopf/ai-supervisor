@@ -74,6 +74,32 @@ TCP-relay на `127.0.0.1`, который ведёт в Unix-socket `EgressProx
 поддерживает HTTP CONNECT/HTTP. DSH получает `HTTP(S)_PROXY` и использует свой global
 dispatcher; прямые соединения невозможны. Сокет имеет mode 600 и живёт в `/state`.
 
+## Git Authentication Manager (Phase 2.5.1)
+
+Все сетевые Git-операции (`ls-remote`, `fetch`, `push`) идут через `GitAuthManager`:
+
+- remote URL читается из локального Git config и проверяется; credentials в URL запрещены;
+- GITHUB_TOKEN передаётся только для HTTPS-хостов из `github.push_hosts` (по умолчанию
+  `github.com`); сторонние хосты токен не получают;
+- токен пишется только в приватный временный файл `0600`; askpass-скрипт `0700` читает его;
+  ни токен, ни его значение не попадают в argv, URL, Git config, SQLite, логи или Telegram;
+- `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS_REQUIRE=force`; command-level config отключает hooks,
+  credential helpers, redirects и proxy, требует TLS; опасные `url.*`, `http.*`, `credential.*`,
+  `include.*`, `remote.*.pushurl` в локальном config отклоняются;
+- SSH remote (`git@...`, `ssh://...`) обрабатывается как SSH и не переводится в HTTPS;
+- временные файлы удаляются в `finally`; при аварийном завершении остатки `git-auth-*`
+  удаляются при следующем startup;
+- при отсутствии/отклонении токена COMPOSITE переходит в `WAITING_INPUT`, а не зацикливается;
+- `doctor` проверяет GitHub token через `/user`.
+
+Диагностика не печатает токен. Токен не передаётся worker/DSH/Kimi и не попадает в их sandbox.
+
+### Отчёты
+
+Для COMPOSITE отчёт показывает `Python Orchestrator (COMPOSITE)`, статус каждого этапа,
+executor, длительность, hash коммита, результат secret-scan, проверки и remote SHA; время
+планирования учитывается отдельно.
+
 ## Интеграционный сценарий Niri
 
 `tests/test_composite.py::test_niri_composite_publishes_to_github_after_approvals`:
@@ -91,16 +117,22 @@ dispatcher; прямые соединения невозможны. Сокет �
 
 ## Проверено
 
-- `pytest`: **76 passed, 4 skipped**.
+- `pytest`: **86 passed, 4 skipped**.
 - `ruff check .`: без ошибок.
+- `ai-supervisor doctor`: GitHub token принят; egress netns/proxy OK.
+- Реальный `git push --dry-run` из worktree #004 через `GitAuthManager` — rc 0 (без публикации).
 - Реальный DSH runtime в bwrap с egress proxy: **2 integration tests passed** (Messages mock
   через non-loopback hostname; proxy разрешает только нужный host/port).
-- Живой Kimi: chat/classify/plan/review + composite Niri plan — passed.
+- Живой Kimi: chat/classify/plan/review + composite Niri plan — passed (последний успешный
+  прогон; следующий упёрся в 5-часовую квоту 429).
 - Миграция копии рабочей БД v2→v3: schema 3, `task_stages`, backup `pre-migration-v3-*.db`,
   исторические задачи сохранены.
 - COMPOSITE: зависимости, approvals, отказ, повтор, сохранение completed, no-op import,
   auto-discovery, GitHub mock + local bare remote, auto-resume после restart, отсутствие
-  model-вызовов на простых этапах.
+  model-вызовов на простых этапах, auth-blocked auto-resume.
+- Git auth: HTTPS askpass, host allowlist, SSH passthrough, missing/rejected token,
+  отсутствие токена в env/config, единый auth для ls-remote/fetch/push, отсутствие ретраев
+  на auth-error, отчётные поля.
 
 ## Ограничения
 

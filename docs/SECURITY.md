@@ -74,6 +74,20 @@ Git worktree сам по себе не является песочницей.
 - Завершённые этапы сохраняются; повторяется только failed/running этап.
 - SYSTEM/EXTERNAL вне поддерживаемых этапов fail-closed.
 
+### Git authentication
+
+- Все сетевые Git-операции выполняются только через `GitAuthManager`.
+- GITHUB_TOKEN передаётся только HTTPS-хостам из `github.push_hosts`; сторонние хосты
+  не получают credentials.
+- Токен хранится только во временном файле `0600`; askpass-скрипт `0700`; временные файлы
+  удаляются после операции и при следующем startup.
+- Токен не попадает в argv, remote URL, Git config, SQLite, Telegram, отчёты, логи или sandbox.
+- Отключены hooks, credential helpers, redirects и proxy через command-level config;
+  TLS-проверка включена. Опасные `url.*`, `http.*`, `credential.*`, `include.*` в локальном
+  Git config отклоняются.
+- SSH remote продолжает использоваться как SSH без принудительного HTTPS.
+- При отсутствии/недостаточности токена COMPOSITE переходит в `WAITING_INPUT`.
+
 ### Git push
 
 - Только после отдельного одноразового approval владельца.

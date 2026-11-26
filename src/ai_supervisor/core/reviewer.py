@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ai_supervisor.core.usage import UsageService
@@ -136,7 +136,7 @@ def build_report(
         "",
         f"Проект: {project_name}",
         f"Тип: {spec.task_type.value}",
-        "Исполнитель: DeepSeek Harness",
+        f"Исполнитель: {task.worker_name or 'DeepSeek Harness'}",
         f"Ветка: {task.branch or '(нет)'}",
         "",
         "Требовалось выполнить:",
@@ -153,7 +153,8 @@ def build_report(
             f"- Проверки: {checks_summary(evidence.checks)}",
             f"- Ревью: {review.verdict.value} — {review.summary[:500]}",
             f"- Доработок: {task.rework_count}; попыток: {task.attempts}",
-            f"- Время выполнения: {minutes} мин {seconds} сек",
+            f"- Время исполнителя: {minutes} мин {seconds} сек",
+            f"- Время с учётом планирования: {_elapsed_minutes(task)}",
             "",
             "Подтверждено оркестратором:",
         ]
@@ -217,6 +218,16 @@ def build_report(
     if len(text) > 4000:
         text = text[:3900].rsplit("\n", 1)[0] + "\n… (отчёт сокращён)"
     return text
+
+
+def _elapsed_minutes(task: object) -> str:
+    from ai_supervisor.models import TaskRecord
+
+    if not isinstance(task, TaskRecord):
+        return "—"
+    end = task.finished_at or datetime.now(UTC)
+    seconds = max(0, int((end - task.created_at).total_seconds()))
+    return f"{seconds // 60} мин {seconds % 60} сек"
 
 
 def format_time(value: datetime | None) -> str:

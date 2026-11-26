@@ -49,7 +49,7 @@ KIMI_MODEL=k3.1-pro
 DEEPSEEK_API_KEY=...
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_OWNER_ID=123456789
-# Optional: GitHub repo info/create
+# Optional: GitHub repo info/create and HTTPS Git push
 GITHUB_TOKEN=
 ```
 
@@ -92,6 +92,10 @@ enabled = true
 allowed_hosts = ["api.deepseek.com"]
 allowed_ports = [80, 443]
 ```
+
+Для HTTPS-push в GitHub задайте `GITHUB_TOKEN`; токен используется только через временный
+GIT_ASKPASS и не пишется в Git config. Если нужен GitHub Enterprise, добавьте его host в
+`[github].push_hosts` (по умолчанию `["github.com"]`).
 
 Если `DEEPSEEK_BASE_URL` задаёт другой host/port, они добавляются автоматически только для
 этого endpoint. Не добавляйте произвольные хосты без необходимости. Для локального mock

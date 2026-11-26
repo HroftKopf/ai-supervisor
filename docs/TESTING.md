@@ -20,7 +20,7 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 | Проверка | Результат |
 |---|---|
 | `ruff check .` | все проверки пройдены |
-| `pytest -q` | **76 passed, 4 skipped** |
+| `pytest -q` | **86 passed, 4 skipped** |
 | `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py` | **2 passed** |
 | `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py` | **2 passed** |
 | bwrap probe | OK (user namespaces, read-only `/usr`) |
@@ -48,6 +48,10 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 - COMPOSITE: граф/циклы, маршрутизация executor, approvals, reject, повтор, no-op import,
   auto-discovery Niri, mock GitHub + bare remote, сохранение completed этапов.
 - SQLite v3 `task_stages`, миграция v1→v3 с backup.
+- Git auth: HTTPS askpass, ls-remote/fetch/push через единый слой, SSH passthrough,
+  third-party host без токена, отсутствие токена в env/argv/config, auth-error без ретраев,
+  WAITING_INPUT и продолжение publish.
+- COMPOSITE-отчёты: executor, stage status, commit hash, secret-scan, planning time.
 
 ### Что не проверено живьём
 
@@ -57,7 +61,9 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
   bare remote).
 
 Kimi API проверен живьём через `AI_SUPERVISOR_RUN_LIVE_KIMI=1` (chat/classify/plan v2/review
-и composite Niri plan), включая `tool_choice=required` и структурное ревью.
+и composite Niri plan), включая `tool_choice=required` и структурное ревью. Повторный прогон
+2026-11-26 после исчерпания 5-часовой квоты вернул HTTP 429 (`KimiQuotaError`); это ограничение
+аккаунта, а не регрессия кода. Live-тесты в общем `pytest` пропущены.
 Telegram-проверку нужно выполнить после настройки и запуска бота:
 
 ```bash

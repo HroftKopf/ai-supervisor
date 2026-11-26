@@ -133,6 +133,7 @@ TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.VALIDATING,
             TaskStatus.REVIEWING,
             TaskStatus.WAITING_APPROVAL,
+            TaskStatus.WAITING_INPUT,
             TaskStatus.PAUSED,
             TaskStatus.CANCELLED,
             TaskStatus.INTERRUPTED,

@@ -4,9 +4,10 @@
 **Kimi K3.1 Pro** — технический руководитель и ревьюер, **DeepSeek Harness** — исполнитель,
 **Python-оркестратор** — управляющая инфраструктура.
 
-> Статус: **Phase 2.5**. Добавлены исполняемые COMPOSITE-этапы с DAG, детерминированная
+> Статус: **Phase 2.5.1**. Добавлены исполняемые COMPOSITE-этапы с DAG, детерминированная
 > маршрутизация операций, сохраняемое состояние этапов, автоматическое продолжение после
-> approvals, идемпотентные импорт/GitHub/push и сетевая изоляция worker через allowlist-proxy.
+> approvals, идемпотентные импорт/GitHub/push, централизованная Git-аутентификация с
+> host allowlist и сетевая изоляция worker через allowlist-proxy.
 > Живые сценарии Kimi API и реальный DSH в bwrap проверены; Telegram Bot API и реальная
 > публикация пользовательских файлов на GitHub не проверялись. Ограничения явно перечислены
 > в [«Известных ограничениях»](#известные-ограничения-phase-2-5).
@@ -46,6 +47,10 @@
   блокируются до worker; HIGH требует подтверждения.
 - Git push с обязательным подтверждением, без force, с проверкой remote SHA; `/github info|create`
   через GitHub API при заданном `GITHUB_TOKEN`.
+- Централизованный `GitAuthManager`: HTTPS GitHub использует GITHUB_TOKEN только через
+  временный GIT_ASKPASS (0600, удаляется), `GIT_TERMINAL_PROMPT=0`, host allowlist,
+  `http.followRedirects=false`, TLS проверяется; SSH remote не переводится в HTTPS.
+  Токен не попадает в argv, remote URL, Git config, SQLite, Telegram, отчёты или worker.
 - Этапные approvals привязаны к операции, source hash, repository/owner/private, ветке и
   коммиту; после approve задача автоматически продолжается с сохранённого этапа.
 - Идемпотентность: повторный импорт одинакового файла, повторный commit без изменений,
@@ -58,8 +63,11 @@
 - Новые Telegram-команды: `/task`, `/task_info`, `/queue`, `/cancel`, `/pause`, `/retry`, `/doctor`,
   `/push`, `/github`, `/report full`; проектные `/project list|select|permissions|remote|budget|
   extra-read|permission|import-config`.
-- Автоматическое продолжение COMPOSITE после перезапуска (`app.auto_resume_composite`),
-  сохранение завершённых этапов и повтор только неуспешного этапа.
+- Автоматическое продолжение COMPOSITE после перезапуска (`app.auto_resume_composite`);
+  auth-blocked composite после настройки токена возвращается в очередь
+  (`app.auto_resume_git_auth_blocked`) и просит подтверждение публикации.
+- Отчёты COMPOSITE показывают Python Orchestrator, статус и длительность каждого этапа,
+  hash коммита, результат secret-scan, checks, remote SHA и полное время с планированием.
 - FTS5-поиск, резюме, stop/rollback/pause/retry, systemd, doctor, redaction.
 
 Phase 1 намеренно **не** реализует SSH, браузер, Docker/Podman, MCP и распределённый VPS.
@@ -319,16 +327,20 @@ memory_mb = 4096
 
 Выполнено:
 
-- `pytest`: **76 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
+- `pytest`: **86 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
   Проверены запуск runtime, проброс `DEEPSEEK_BASE_URL`, запись результата, usage (input 42,
   output 7, cached 3, requests 1), завершение `completed`, реальный `bash` tool call,
   изменивший файл в worktree, и работу через netns + allowlisted egress proxy.
-- `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest tests/test_kimi_live.py`: **2 passed** — реальные
-  запросы к настроенному Kimi API: обычное общение (`tool_choice=auto`), классификация,
-  формирование ТЗ v2, структурное ревью и COMPOSITE-план Niri
-  (`import → commit → validate → github → publish`).
+- `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest tests/test_kimi_live.py`: **2 passed** на последнем
+  успешном прогоне — реальные запросы к Kimi API: обычное общение (`tool_choice=auto`),
+  классификация, ТЗ v2, структурное ревью и COMPOSITE-план Niri
+  (`import → commit → validate → github → publish`). Повторный прогон после этого упёрся
+  в 5-часовую квоту Kimi (429); это ограничение аккаунта, не падение тестов.
+- `ai-supervisor doctor`: GitHub token принят (`@HroftKopf`), egress netns/proxy OK.
+- `git push --dry-run` из worktree задачи #004 через `GitAuthManager` к её GitHub remote — rc 0,
+  без фактической публикации.
 - `ruff check .`: все проверки пройдены.
 - `bwrap` probe: user namespaces + read-only `/usr` + изолированный worktree.
 - Ручной end-to-end оркестрации с fake Kimi и реальным Git: plan → execute → diff → review →
@@ -379,7 +391,7 @@ ai-supervisor run
 - При несовместимости сохранённой DSH-сессии `/resume` может потребовать нового запуска; система
   не подменяет сессию молча.
 
-### Что ещё не реализовано в Phase 2.5
+### Что ещё не реализовано в Phase 2.5.1
 
 - Параллельное исполнение независимых этапов (сейчас этапы выполняются последовательно в
   топологическом порядке; DAG проверяется).

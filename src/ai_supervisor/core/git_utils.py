@@ -102,8 +102,17 @@ class GitError(RuntimeError):
     pass
 
 
+_SECRET_ENV_KEYS = {
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "KIMI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "TELEGRAM_BOT_TOKEN",
+}
+
+
 def git_env() -> dict[str, str]:
-    env = dict(os.environ)
+    env = {key: value for key, value in os.environ.items() if key not in _SECRET_ENV_KEYS}
     env.update(
         {
             "GIT_TERMINAL_PROMPT": "0",
@@ -121,11 +130,12 @@ async def git(
     *args: str,
     timeout_seconds: float = 60.0,
     check: bool = True,
+    env: Mapping[str, str] | None = None,
 ) -> ProcessResult:
     result = await run_process(
         ("git", *args),
         cwd=cwd,
-        env=git_env(),
+        env=git_env() if env is None else dict(env),
         timeout_seconds=timeout_seconds,
         max_output_bytes=4_000_000,
     )
@@ -134,8 +144,13 @@ async def git(
     return result
 
 
-async def git_output(cwd: Path | str, *args: str, timeout_seconds: float = 60.0) -> str:
-    return (await git(cwd, *args, timeout_seconds=timeout_seconds)).stdout.strip()
+async def git_output(
+    cwd: Path | str,
+    *args: str,
+    timeout_seconds: float = 60.0,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    return (await git(cwd, *args, timeout_seconds=timeout_seconds, env=env)).stdout.strip()
 
 
 async def git_toplevel(path: Path) -> Path:

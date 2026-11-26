@@ -257,7 +257,19 @@ class Doctor:
             self.fail(".env permissions", str(exc))
 
         if s.github_token:
-            self.ok("GitHub API", "GITHUB_TOKEN configured")
+            from ai_supervisor.core.github import GitHubClient, GitHubError
+
+            client = GitHubClient(token=s.github_token, config=s.github)
+            try:
+                user = await client.authenticated_user()
+                login = str(user.get("login") or "")
+                self.ok(
+                    "GitHub auth", f"token accepted for @{login}" if login else "token accepted"
+                )
+            except GitHubError as exc:
+                self.fail("GitHub auth", f"token rejected or insufficient: {type(exc).__name__}")
+            finally:
+                await client.close()
         else:
             self.warn("GitHub API", "GITHUB_TOKEN optional and not configured; /github is disabled")
 

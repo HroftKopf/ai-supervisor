@@ -9,12 +9,19 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from ai_supervisor.agents.supervisor import SupervisorAgent, SupervisorError
 from ai_supervisor.config import Settings
 from ai_supervisor.core.config_import import ConfigImportError, ConfigImportService
 from ai_supervisor.core.context import ContextError, ProjectContextBuilder
+from ai_supervisor.core.git_auth import (
+    GitAuthError,
+    GitAuthManager,
+    GitAuthMissing,
+    GitAuthRejected,
+)
 from ai_supervisor.core.git_ops import (
     GitOpsError,
     ensure_remote,
@@ -182,6 +189,7 @@ class Orchestrator:
             else None
         )
         self.config_import = ConfigImportService(settings)
+        self.git_auth = GitAuthManager(settings)
         self._summaries: dict[int, asyncio.Task[Any]] = {}
 
     # ------------------------------------------------------------------
@@ -190,6 +198,9 @@ class Orchestrator:
 
     async def startup(self) -> None:
         await self.approvals.expire_old()
+        removed_auth = self.git_auth.cleanup_stale()
+        if removed_auth:
+            logger.warning("removed %s stale Git auth temp dirs", removed_auth)
         await self._cleanup_old_task_logs()
         await self.tasks.mark_workers_interrupted_on_startup()
         interrupted = await self.tasks.mark_interrupted_on_startup()
@@ -212,6 +223,53 @@ class Orchestrator:
                             agent="orchestrator",
                         )
                         self._spawn_job(task.id, plan_if_needed=False, manual_instruction=None)
+        if self.settings.app.auto_resume_git_auth_blocked:
+            await self._auto_resume_git_auth_blocked()
+
+    async def _auto_resume_git_auth_blocked(self) -> None:
+        if not self.settings.github_token:
+            return
+        tasks = await self.tasks.list(statuses=[TaskStatus.BLOCKED.value], limit=100)
+        for task in tasks:
+            spec = task.spec
+            if spec is None or spec.task_type is not TaskType.COMPOSITE:
+                continue
+            reason = (task.blocked_reason or task.error or "").lower()
+            if not any(
+                marker in reason
+                for marker in (
+                    "askpass",
+                    "could not read username",
+                    "authentication failed",
+                    "github_token",
+                    "git credentials",
+                    "terminal prompts disabled",
+                )
+            ):
+                continue
+            stages = await self.stages.list(task.id)
+            if not any(
+                stage.operation is StageOperation.PUBLISH
+                and stage.status in {StageStatus.FAILED, StageStatus.BLOCKED}
+                for stage in stages
+            ):
+                continue
+            try:
+                await self.tasks.transition(task.id, TaskStatus.QUEUED)
+            except (TransitionError, TaskError):
+                continue
+            await self.tasks.add_event(
+                task.id,
+                "git-auth-resume",
+                "Задача возвращена в очередь после исправления Git-аутентификации",
+                agent="orchestrator",
+            )
+            await self.notifier.send_text(
+                self._chat_for_task(task),
+                f"Задача #{task.id:03d}: Git-аутентификация настроена, продолжаю с этапа publish. "
+                "Потребуется подтверждение публикации.",
+            )
+            self._spawn_job(task.id, plan_if_needed=False, manual_instruction=None)
 
     async def _cleanup_old_task_logs(self) -> None:
         import shutil
@@ -255,6 +313,7 @@ class Orchestrator:
             await asyncio.gather(*self._summaries.values(), return_exceptions=True)
         if self.github is not None:
             await self.github.close()
+        self.git_auth.close()
 
     # ------------------------------------------------------------------
     # incoming conversation
@@ -1010,6 +1069,9 @@ class Orchestrator:
         if not spec.stages:
             raise CompositeError("COMPOSITE task has no executable stages")
         await self.stages.ensure(task.id, spec.stages)
+        task = await self.tasks.update_fields(
+            task.id, worker_name="Python Orchestrator (COMPOSITE)"
+        )
         if not task.worktree_path:
             prepared = await self.workspace.prepare(task, project)
             dsh_home = self.settings.dsh_homes_dir / f"task-{task.id:04d}"
@@ -1092,7 +1154,10 @@ class Orchestrator:
             if stage.status is StageStatus.PENDING:
                 stage = await self.stages.set_status(stage.id, StageStatus.READY)
             if self._stage_needs_approval(stage) and not stage.approval_granted:
-                await self._request_stage_approval(task, project, stage, worktree)
+                try:
+                    await self._request_stage_approval(task, project, stage, worktree)
+                except GitAuthMissing as exc:
+                    await self._wait_for_git_auth(task, stage, str(exc))
                 return
             await self.stages.set_status(stage.id, StageStatus.RUNNING, increment_attempts=True)
             await self.tasks.add_event(
@@ -1112,11 +1177,18 @@ class Orchestrator:
                 result = await self._dispatch_stage(
                     task, project, stage, worktree, project_context, manual_instruction
                 )
+            except (GitAuthMissing, GitAuthRejected) as exc:
+                stage = await self.stages.set_status(
+                    stage.id, StageStatus.FAILED, error=self.redactor.redact(str(exc))[:4000]
+                )
+                await self._wait_for_git_auth(task, stage, str(exc))
+                return
             except (
                 CompositeError,
                 StageError,
                 WorkspaceError,
                 GitOpsError,
+                GitAuthError,
                 GitHubError,
                 ConfigImportError,
                 WorkerError,
@@ -1220,7 +1292,7 @@ class Orchestrator:
                 )
             elif stage.operation is StageOperation.GITHUB_ENSURE_REPO:
                 if self.github is None:
-                    raise CompositeError("GITHUB_TOKEN не настроен")
+                    raise GitAuthMissing("GITHUB_TOKEN не настроен для GitHub API")
                 owner = stage.repo_owner
                 if not owner:
                     user = await self.github.authenticated_user()
@@ -1241,7 +1313,7 @@ class Orchestrator:
                 if not task.head_commit:
                     raise CompositeError("нет коммита для публикации")
                 branch = stage.branch or project.base_branch
-                if not stage.merge and branch is None and task.branch:
+                if not stage.merge and not stage.branch and task.branch:
                     branch = task.branch
                 if not project.remote_url:
                     raise CompositeError(
@@ -1249,6 +1321,13 @@ class Orchestrator:
                     )
                 actual_remote = await remote_url(Path(project.path), stage.remote)
                 validate_remote_url(actual_remote)
+                parsed_remote = urlsplit(actual_remote)
+                if (
+                    parsed_remote.scheme == "https"
+                    and (parsed_remote.hostname or "").lower() in self.settings.github.push_hosts
+                    and not self.settings.github_token
+                ):
+                    raise GitAuthMissing("GITHUB_TOKEN не настроен для HTTPS-push в GitHub")
                 payload.update(
                     {
                         "remote": stage.remote,
@@ -1463,6 +1542,7 @@ class Orchestrator:
             "bytes": result.total_bytes,
             "already_applied": plan.already_applied,
             "backup": result.backup,
+            "secret_scan": "passed",
         }
 
     async def _stage_commit(
@@ -1530,6 +1610,7 @@ class Orchestrator:
             "checks": [check.model_dump() for check in evidence.checks],
             "changed_files": evidence.changed_files,
             "head_commit": evidence.head_commit,
+            "secret_scan": "passed",
         }
 
     async def _stage_github(
@@ -1577,16 +1658,18 @@ class Orchestrator:
         branch = stage.branch or project.base_branch
         if not stage.merge and not stage.branch and task.branch:
             branch = task.branch
+        repo = Path(project.path).resolve()
+        actual_remote = await remote_url(repo, stage.remote)
+        validate_remote_url(actual_remote)
         if stage.merge:
+            # Validate credentials/remote before changing the local base branch.
+            await remote_branch_sha(repo, stage.remote, branch, auth=self.git_auth)
             if not await self.workspace.is_applied(task, project):
                 new_head = await self.workspace.apply(task, project, cleanup=False)
                 task = await self.tasks.update_fields(task.id, head_commit=new_head)
             branch = project.base_branch
-        repo = Path(project.path).resolve()
-        actual_remote = await remote_url(repo, stage.remote)
-        validate_remote_url(actual_remote)
         local = (await git_output(repo, "rev-parse", f"refs/heads/{branch}")).strip()
-        remote_sha = await remote_branch_sha(repo, stage.remote, branch)
+        remote_sha = await remote_branch_sha(repo, stage.remote, branch, auth=self.git_auth)
         if remote_sha == local:
             return {
                 "remote": stage.remote,
@@ -1594,8 +1677,10 @@ class Orchestrator:
                 "commit": local,
                 "already_published": True,
             }
-        sha = await push_branch(repo, stage.remote, branch)
-        _local, verified = await verify_remote_branch(repo, stage.remote, branch)
+        sha = await push_branch(repo, stage.remote, branch, auth=self.git_auth)
+        _local, verified = await verify_remote_branch(
+            repo, stage.remote, branch, auth=self.git_auth
+        )
         if verified != sha:
             raise CompositeError(
                 f"remote SHA не совпал: local={sha[:12]} remote={str(verified)[:12]}"
@@ -1754,9 +1839,7 @@ class Orchestrator:
             usage_totals=usage_totals,
             final_status=TaskStatus.COMPLETED,
         )
-        report += "\n\n## Этапы\n" + "\n".join(
-            f"- {stage.stage_key}: {stage.status.value} — {stage.goal[:160]}" for stage in stages
-        )
+        report += "\n\n" + await self._composite_stage_report(task.id)
         await self.tasks.update_fields(task.id, report=report)
         await self.tasks.add_event(
             task.id,
@@ -1824,6 +1907,33 @@ class Orchestrator:
             self._chat_for_task(task),
             report,
             [[Button("Повторить", f"res:{task.id}"), Button("Откатить", f"rb:{task.id}")]],
+        )
+
+    async def _wait_for_git_auth(self, task: TaskRecord, stage: StageRecord, reason: str) -> None:
+        safe = self.redactor.redact(reason)[:4000]
+        try:
+            await self.tasks.transition(task.id, TaskStatus.WAITING_INPUT)
+        except (TransitionError, TaskError):
+            await self._block_task(
+                task.id, f"Не удалось приостановить задачу для настройки Git-доступа: {safe}"
+            )
+            return
+        task = await self.tasks.update_fields(task.id, error=safe)
+        await self.tasks.add_event(
+            task.id,
+            "waiting_git_auth",
+            f"Этап {stage.stage_key} ожидает GitHub-аутентификацию",
+            {"error": safe},
+            agent="orchestrator",
+            stage_id=stage.id,
+        )
+        await self.notifier.send_text(
+            self._chat_for_task(task),
+            f"Задача #{task.id:03d}: этап {stage.stage_key} ожидает Git-аутентификацию.\n"
+            f"{safe[:1200]}\n"
+            "Настройте GITHUB_TOKEN (или SSH-ключ для SSH remote), затем нажмите «Повторить». "
+            "Импорт, коммит и проверка уже сохранены.",
+            [[Button("Повторить", f"res:{task.id}"), Button("Отменить", f"stop:{task.id}")]],
         )
 
     async def _block_task(
@@ -2211,6 +2321,18 @@ class Orchestrator:
         except (GitOpsError, ProjectError) as exc:
             await self.notifier.send_text(chat_id, f"Remote не проверен: {exc}")
             return
+        parsed_remote = urlsplit(actual_remote)
+        if (
+            parsed_remote.scheme == "https"
+            and (parsed_remote.hostname or "").lower() in self.settings.github.push_hosts
+            and not self.settings.github_token
+        ):
+            await self.notifier.send_text(
+                chat_id,
+                "GITHUB_TOKEN не настроен: HTTPS-push в GitHub невозможен. "
+                "Настройте токен и повторите публикацию; задача сохранена.",
+            )
+            return
         approval_id = await self.approvals.request(
             action=Action.GIT_PUSH,
             payload={
@@ -2393,10 +2515,14 @@ class Orchestrator:
             try:
                 actual = await remote_url(Path(project.path), remote)
                 validate_remote_url(actual)
-                sha = await push_branch(Path(project.path), remote, branch)
-                _local, remote_sha = await verify_remote_branch(Path(project.path), remote, branch)
-            except (GitOpsError, ProjectError) as exc:
-                await self.notifier.send_text(chat_id, f"Публикация не выполнена: {exc}")
+                sha = await push_branch(Path(project.path), remote, branch, auth=self.git_auth)
+                _local, remote_sha = await verify_remote_branch(
+                    Path(project.path), remote, branch, auth=self.git_auth
+                )
+            except (GitOpsError, ProjectError, GitAuthError) as exc:
+                await self.notifier.send_text(
+                    chat_id, f"Публикация не выполнена: {self.redactor.redact(str(exc))}"
+                )
                 return
             await self.tasks.add_event(
                 task.id,
@@ -2594,6 +2720,44 @@ class Orchestrator:
     # reporting / commands helpers
     # ------------------------------------------------------------------
 
+    async def _composite_stage_report(self, task_id: int) -> str:
+        stages = await self.stages.list(task_id)
+        if not stages:
+            return ""
+        lines = ["## COMPOSITE этапы", ""]
+        for stage in stages:
+            duration = "—"
+            if stage.started_at:
+                end = stage.finished_at or datetime.now(UTC)
+                seconds = max(0, int((end - stage.started_at).total_seconds()))
+                duration = f"{seconds // 60} мин {seconds % 60} сек"
+            result = stage.result or {}
+            details: list[str] = []
+            if "commit" in result:
+                details.append(f"commit={str(result['commit'])[:12]}")
+            if "files" in result:
+                details.append(f"files={result['files']}")
+            if "already_applied" in result:
+                details.append(f"already_applied={result['already_applied']}")
+            if "changed_files" in result:
+                details.append("changed=" + ",".join(str(x) for x in result["changed_files"][:8]))
+            if "secret_scan" in result:
+                details.append(f"secret_scan={result['secret_scan']}")
+            if "repository" in result:
+                details.append(f"repository={result['repository']}")
+            if "branch" in result and "remote" in result:
+                details.append(
+                    f"{result['remote']}/{result['branch']}={str(result.get('commit', ''))[:12]}"
+                )
+            if stage.error:
+                details.append("error=" + self.redactor.redact(stage.error)[:500])
+            detail_text = "; ".join(details) if details else stage.goal[:160]
+            lines.append(
+                f"- {stage.stage_key}: {stage.status.value} "
+                f"[{stage.executor.value}] {duration} — {detail_text}"
+            )
+        return "\n".join(lines)
+
     async def _final_report(
         self, task: TaskRecord, project: ProjectRecord | None, status: TaskStatus
     ) -> str:
@@ -2612,23 +2776,29 @@ class Orchestrator:
             summary=task.error or "Ревью не проводилось.",
         )
         if evidence is None:
-            return (
+            report = (
                 f"Задача #{task.id:03d} — {status.value}\n"
                 f"Проект: {project.name}\n"
                 f"Ошибка: {task.error or 'нет данных'}\n"
                 f"Стоимость: данные об использовании — /usage"
             )
-        usage_totals = await self.usage.by_provider(task_id=task.id)
-        return build_report(
-            task=task,
-            project_name=project.name,
-            spec=spec,
-            evidence=evidence,
-            review=review,
-            usage_service=self.usage,
-            usage_totals=usage_totals,
-            final_status=status,
-        )
+        else:
+            usage_totals = await self.usage.by_provider(task_id=task.id)
+            report = build_report(
+                task=task,
+                project_name=project.name,
+                spec=spec,
+                evidence=evidence,
+                review=review,
+                usage_service=self.usage,
+                usage_totals=usage_totals,
+                final_status=status,
+            )
+        if task.task_type is TaskType.COMPOSITE:
+            suffix = await self._composite_stage_report(task.id)
+            if suffix:
+                report += "\n\n" + suffix
+        return report
 
     @staticmethod
     def _spec_for(task: TaskRecord) -> TaskSpec:
@@ -3001,7 +3171,15 @@ class Orchestrator:
             f"DeepSeek: {self.settings.deepseek_model} (key configured: {bool(self.settings.deepseek_key)})"
         )
         lines.append(f"Telegram owner: {self.settings.owner_id}")
-        lines.append(f"GitHub API: {'configured' if self.github is not None else 'not configured'}")
+        if self.github is not None:
+            try:
+                user = await self.github.authenticated_user()
+                login = str(user.get("login") or "")
+                lines.append(f"GitHub auth: @{login}" if login else "GitHub auth: token accepted")
+            except GitHubError as exc:
+                lines.append(f"GitHub auth: rejected/insufficient ({type(exc).__name__})")
+        else:
+            lines.append("GitHub auth: not configured")
         lines.append(f"Project: {project.name if project else 'none'}")
         lines.append(
             "CLI `ai-supervisor doctor` additionally checks Kimi /models, Telegram getMe and bwrap."
