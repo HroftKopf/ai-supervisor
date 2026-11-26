@@ -50,6 +50,8 @@ HELP_TEXT = """AI Supervisor — команды
 /rollback [id] — откатить изменения задачи (с подтверждением)
 /push [id] — опубликовать завершённый Git-репозиторий (с подтверждением)
 /rework [id] — отправить ожидающую задачу на доработку
+/amend <id> <новые требования> — полная новая revision (approval; не для running/COMPOSITE/published/completed)
+/revisions <id> — история revision без LLM
 /usage [today|week|month|task <id>] — расход токенов
 /memory [query] — память; /memory add <текст>, /memory edit <id> <текст>, /memory stale <id> on|off, /memory delete <id>
 /models — управляющие модели по ролям

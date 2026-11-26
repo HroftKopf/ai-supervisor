@@ -119,7 +119,9 @@ class RevisionService:
         async with self.db.transaction() as conn:
             current = await (
                 await conn.execute(
-                    "SELECT * FROM tasks WHERE id=? AND request_revision=?",
+                    "SELECT * FROM tasks WHERE id=? AND request_revision=? "
+                    "AND status IN ('paused','interrupted','blocked','retry_wait',"
+                    "'waiting_input','waiting_approval','failed')",
                     (task.id, expected_revision),
                 )
             ).fetchone()
@@ -137,12 +139,47 @@ class RevisionService:
                 raise RevisionConflict("предыдущая revision не найдена")
             next_number = expected_revision + 1
             now = iso_now()
+            if any(
+                current[key]
+                for key in (
+                    "session_id",
+                    "dsh_home",
+                    "worktree_path",
+                    "branch",
+                    "logs_path",
+                    "diff_path",
+                )
+            ):
+                await conn.execute(
+                    """
+                    INSERT INTO task_sessions(
+                        task_id, revision_number, session_id, dsh_home, worktree_path,
+                        branch, logs_path, diff_path, retired_at, reason)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'owner_amendment')
+                    """,
+                    (
+                        task.id,
+                        expected_revision,
+                        current["session_id"],
+                        current["dsh_home"],
+                        current["worktree_path"],
+                        current["branch"],
+                        current["logs_path"],
+                        current["diff_path"],
+                        now,
+                    ),
+                )
             cursor = await conn.execute(
                 """
                 UPDATE tasks SET request_revision=?, spec_json='{}',
                     review_json=NULL, evidence_json=NULL, evidence_manifest_json=NULL,
-                    report=NULL, error=NULL, updated_at=?
+                    report=NULL, error=NULL,
+                    session_id=NULL, dsh_home=NULL, worktree_path=NULL,
+                    branch=NULL, logs_path=NULL, diff_path=NULL, base_commit=NULL,
+                    head_commit=NULL, updated_at=?
                 WHERE id=? AND request_revision=?
+                  AND status IN ('paused','interrupted','blocked','retry_wait',
+                                 'waiting_input','waiting_approval','failed')
                 """,
                 (next_number, now, task.id, expected_revision),
             )
@@ -173,7 +210,7 @@ class RevisionService:
             await cursor.close()
             await conn.execute(
                 "UPDATE approvals SET status='revoked', decided_at=? "
-                "WHERE task_id=? AND status='pending'",
+                "WHERE task_id=? AND status IN ('pending','approved')",
                 (now, task.id),
             )
             await conn.execute(

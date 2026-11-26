@@ -66,7 +66,7 @@ source id, transactional task/binding rollback, existing task discovery, classif
 lifecycle, cancellation, long-request rejection, redaction, immutable fields, owner authorization,
 v9→v10 migration preserving tasks/memory.
 
-Current full suite: **201 passed, 4 skipped**; coverage **68% statements / 51% branches**.
+Current full suite: **207 passed, 4 skipped**; coverage **69% statements / 52% branches**.
 
 ## Owner amendments / request revisions
 
@@ -86,10 +86,25 @@ Current full suite: **201 passed, 4 skipped**; coverage **68% statements / 51% b
 - Allowed amendment states: paused, interrupted, blocked, retry_wait, waiting_input,
   waiting_approval, failed. Running/reviewing/completed tasks are rejected.
 
+Revision isolation:
+
+- COMPOSITE with existing executable stages rejects amendment; stages are preserved untouched.
+- Completed/partially completed/published/merged tasks reject amendment.
+- Amendment records old session, DSH home, worktree, branch, logs and diff references in
+  `task_sessions`, then clears active references. Old files are not deleted.
+- New revision uses `task-<id>-r<revision>` worktree/branch, so previous worktree is not reused.
+- Amendment activation rechecks status and job under the per-task action lock; the SQLite update
+  itself requires an allowed status and expected revision.
+- Pending and approved-but-unconsumed approvals are revoked; consume also verifies
+  `request_revision` against the current task.
+- Documentation and Telegram help state COMPOSITE/completed/published limits and full-revision
+  semantics.
+
 Regression tests: original preserved, revision provenance, planner effective text, running/
 completed rejection, unauthorized owner, old approval rejection, concurrent amendments,
 spec/review/evidence invalidation, old approval revocation, SQLite rollback, restart persistence,
-legacy initial revision, `/revisions` without LLM, no automatic worker.
+legacy initial revision, `/revisions` without LLM, no automatic worker, COMPOSITE stages,
+published/merged rejection, session/worktree retirement and preservation, status-change rejection.
 
 ## Provider recovery test matrix
 

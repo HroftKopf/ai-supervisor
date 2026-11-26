@@ -31,7 +31,7 @@
   без поддерживаемого этапа fail-closed.
 - COMPOSITE-этапы: `import_config`, `git_commit`, `validate`, `github_ensure_repo`, `publish`,
   `kimi_analyze`, `deepseek_change`; уникальные id, зависимости, исполнитель, полномочия,
-  критерии, входы/выходы и статус хранятся в SQLite (`task_stages`, schema v11).
+  критерии, входы/выходы и статус хранятся в SQLite (`task_stages`, schema v12).
 - Изолированный git worktree на задачу, отдельная ветка, коммит оркестратора, накопительный diff
   от base commit (включая коммиты предыдущих попыток).
 - DeepSeek Harness через официальный Python SDK (`deepseek-harness-sdk==0.2.2rc2`),
@@ -375,7 +375,7 @@ sandbox_network = true
 
 Выполнено:
 
-- `pytest`: **201 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
+- `pytest`: **207 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
   Проверены запуск runtime, проброс endpoint, запись результата, usage (input 42,

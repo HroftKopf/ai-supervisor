@@ -176,6 +176,12 @@ class ApprovalService:
             raise ApprovalError("approval TTL must be between 30 and 86400 seconds")
         now = datetime.now(UTC)
         expires = now + timedelta(seconds=ttl_seconds)
+        payload = dict(payload)
+        if task_id is not None and "request_revision" not in payload:
+            task = await self.db.fetchone(
+                "SELECT request_revision FROM tasks WHERE id=?", (task_id,)
+            )
+            payload["request_revision"] = int(task["request_revision"]) if task else 1
         cursor = await self.db.execute(
             """
             INSERT INTO approvals(task_id, action, payload_json, status, created_by,
@@ -247,7 +253,24 @@ class ApprovalService:
                     (ApprovalStatus.EXPIRED.value, approval_id),
                 )
                 raise ApprovalError("срок подтверждения истёк")
-            await conn.execute(
+            payload = json.loads(data["payload_json"])
+            if not isinstance(payload, dict):
+                raise ApprovalError("повреждён payload подтверждения")
+            task_id = payload.get("task_id")
+            expected = payload.get("request_revision")
+            if task_id is not None and expected is not None:
+                task = await (
+                    await conn.execute(
+                        "SELECT request_revision FROM tasks WHERE id=?", (int(task_id),)
+                    )
+                ).fetchone()
+                if task is None or int(task["request_revision"]) != int(expected):
+                    await conn.execute(
+                        "UPDATE approvals SET status='revoked', decided_at=? WHERE id=?",
+                        (iso_now(), approval_id),
+                    )
+                    raise ApprovalError("approval относится к предыдущей revision задачи")
+            cursor = await conn.execute(
                 "UPDATE approvals SET status = ?, decided_at = ? WHERE id = ? AND status = ?",
                 (
                     ApprovalStatus.EXECUTED.value,
@@ -256,9 +279,9 @@ class ApprovalService:
                     ApprovalStatus.APPROVED.value,
                 ),
             )
-            payload = json.loads(data["payload_json"])
-            if not isinstance(payload, dict):
-                raise ApprovalError("повреждён payload подтверждения")
+            if cursor.rowcount != 1:
+                raise ApprovalError("подтверждение уже исполнено")
+            await cursor.close()
             return payload
 
     async def approve_pending(self, approval_id: int, *, user_id: int) -> dict[str, Any]:

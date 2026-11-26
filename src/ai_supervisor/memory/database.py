@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 def iso_now() -> str:
@@ -271,6 +271,22 @@ CREATE TABLE IF NOT EXISTS usage_events (
 
 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_events(created_at);
 
+CREATE TABLE IF NOT EXISTS task_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    revision_number INTEGER NOT NULL,
+    session_id TEXT,
+    dsh_home TEXT,
+    worktree_path TEXT,
+    branch TEXT,
+    logs_path TEXT,
+    diff_path TEXT,
+    retired_at TEXT NOT NULL,
+    reason TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_sessions_task ON task_sessions(task_id, id);
+
 CREATE TABLE IF NOT EXISTS request_revisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -466,6 +482,26 @@ class Database:
         )
         await conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS task_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                revision_number INTEGER NOT NULL,
+                session_id TEXT,
+                dsh_home TEXT,
+                worktree_path TEXT,
+                branch TEXT,
+                logs_path TEXT,
+                diff_path TEXT,
+                retired_at TEXT NOT NULL,
+                reason TEXT NOT NULL
+            )
+            """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_sessions_task ON task_sessions(task_id, id)"
+        )
+        await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS request_revisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -481,6 +517,10 @@ class Database:
                 UNIQUE(task_id, revision_number)
             )
             """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_request_revisions_task "
+            "ON request_revisions(task_id, revision_number)"
         )
         await conn.execute(
             """

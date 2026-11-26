@@ -2977,33 +2977,53 @@ class Orchestrator:
         }
     )
 
+    async def _amendment_block_reason(self, task: TaskRecord) -> str | None:
+        if task.status not in self.AMENDABLE_STATUSES:
+            if task.status in {TaskStatus.COMPLETED, TaskStatus.PARTIALLY_COMPLETED}:
+                return "задача уже завершена или интегрирована; создайте отдельную задачу"
+            return f"задача в состоянии {task.status.value}; amendment запрещён"
+        job = self._jobs.get(task.id)
+        if job is not None and not job.done():
+            return "job задачи ещё выполняется; дождитесь штатной остановки"
+        stages = await self.stages.list(task.id)
+        if task.task_type is TaskType.COMPOSITE and stages:
+            return (
+                "у COMPOSITE-задачи уже созданы исполняемые stages предыдущей revision; "
+                "создайте отдельную задачу"
+            )
+        if any(
+            stage.operation in {StageOperation.PUBLISH, StageOperation.GITHUB_ENSURE_REPO}
+            and stage.status is StageStatus.COMPLETED
+            for stage in stages
+        ):
+            return "задача уже выполнила публикацию/внешнюю операцию; создайте отдельную задачу"
+        events = await self.tasks.db.fetchall(
+            "SELECT event_type FROM task_events WHERE task_id=? "
+            "AND event_type IN ('merged','merged-recovered','pushed','published')",
+            (task.id,),
+        )
+        if events:
+            return "задача уже выполнила merge/publish; создайте отдельную задачу"
+        return None
+
     async def request_amendment(
         self, task_id: int, requirements: str, user_id: int, chat_id: int
     ) -> None:
         self._assert_owner(user_id)
         self._assert_owner_chat(chat_id)
         task = await self.tasks.get(task_id)
-        if task.status not in self.AMENDABLE_STATUSES:
+        reason = await self._amendment_block_reason(task)
+        if reason:
             if task.status in {
                 TaskStatus.RUNNING,
                 TaskStatus.VALIDATING,
                 TaskStatus.REVIEWING,
                 TaskStatus.REWORK,
             }:
-                await self.notifier.send_text(
-                    chat_id,
-                    f"Задача #{task.id:03d} сейчас выполняется. Сначала штатно приостановите "
-                    "её, затем повторите /amend.",
+                reason = (
+                    f"задача #{task.id:03d} сейчас выполняется; сначала штатно приостановите её"
                 )
-            elif task.status in {TaskStatus.COMPLETED, TaskStatus.PARTIALLY_COMPLETED}:
-                await self.notifier.send_text(
-                    chat_id,
-                    f"Задача #{task.id:03d} уже завершена/интегрирована. Создайте отдельную задачу.",
-                )
-            else:
-                await self.notifier.send_text(
-                    chat_id, f"Задача #{task.id:03d} в состоянии {task.status.value}."
-                )
+            await self.notifier.send_text(chat_id, f"Amendment запрещён: {reason}.")
             return
         clean = self.redactor.redact(requirements.strip())
         if not clean:
@@ -3047,13 +3067,18 @@ class Orchestrator:
         )
 
     async def _apply_amendment(self, payload: dict[str, Any], user_id: int, chat_id: int) -> None:
+        task_id = int(payload["task_id"])
+        lock = self._action_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            await self._apply_amendment_locked(payload, user_id, chat_id)
+
+    async def _apply_amendment_locked(
+        self, payload: dict[str, Any], user_id: int, chat_id: int
+    ) -> None:
         task = await self.tasks.get(int(payload["task_id"]))
-        if task.status not in self.AMENDABLE_STATUSES:
-            await self.notifier.send_text(
-                chat_id,
-                f"Задача #{task.id:03d} изменила состояние на {task.status.value}; "
-                "amendment не применён.",
-            )
+        reason = await self._amendment_block_reason(task)
+        if reason:
+            await self.notifier.send_text(chat_id, f"Amendment не применён: {reason}.")
             return
         requirements = str(payload.get("requirements") or "")
         digest = str(payload.get("fingerprint") or "")

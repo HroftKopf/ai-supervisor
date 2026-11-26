@@ -39,10 +39,12 @@ class WorkspaceManager:
 
     def branch_name(self, task: TaskRecord) -> str:
         slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", task.title.lower()).strip("-")[:40] or "task"
-        return f"ai-supervisor/task-{task.id:04d}-{slug}"
+        suffix = f"-r{task.request_revision}" if task.request_revision > 1 else ""
+        return f"ai-supervisor/task-{task.id:04d}{suffix}-{slug}"
 
     def worktree_path(self, task: TaskRecord) -> Path:
-        return (self.settings.worktrees_dir / f"task-{task.id:04d}").resolve()
+        suffix = f"-r{task.request_revision}" if task.request_revision > 1 else ""
+        return (self.settings.worktrees_dir / f"task-{task.id:04d}{suffix}").resolve()
 
     async def prepare(self, task: TaskRecord, project: ProjectRecord) -> dict[str, str]:
         repo = Path(project.path).resolve()
