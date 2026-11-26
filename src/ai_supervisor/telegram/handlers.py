@@ -567,6 +567,34 @@ class Handlers:
             )
             await self.notifier.send_text(message.chat.id, f"Сохранено в памяти #{memory.id}.")
             return
+        if arg.startswith("edit "):
+            parts = arg.split(maxsplit=2)
+            if len(parts) < 3 or not parts[1].isdigit():
+                await self.notifier.send_text(
+                    message.chat.id, "Использование: /memory edit <id> <текст>"
+                )
+                return
+            updated = await self.orchestrator.conversations.update_memory(
+                int(parts[1]), content=parts[2]
+            )
+            await self.notifier.send_text(
+                message.chat.id, "Обновлено." if updated else "Запись не найдена."
+            )
+            return
+        if arg.startswith("stale "):
+            parts = arg.split()
+            if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in {"on", "off"}:
+                await self.notifier.send_text(
+                    message.chat.id, "Использование: /memory stale <id> on|off"
+                )
+                return
+            updated = await self.orchestrator.conversations.update_memory(
+                int(parts[1]), stale=parts[2] == "on"
+            )
+            await self.notifier.send_text(
+                message.chat.id, "Обновлено." if updated else "Запись не найдена."
+            )
+            return
         if arg.startswith("delete "):
             ident = arg.split(maxsplit=1)[1]
             if not ident.isdigit():

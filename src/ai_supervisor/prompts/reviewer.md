@@ -32,6 +32,10 @@
 ## Формат
 
 - `summary`: краткий фактический итог на русском.
+- `root_cause`: `unknown`, `executor_error`, `planner_error`, `environment_error`,
+  `permission_error`, `insufficient_evidence` или `external_service_error`.
+  Не отправляй исполнителя на доработку при planner_error; не перепланируй при временной
+  внешней ошибке.
 - `issues`: массив объектов:
   - `criterion` — конкретный нарушенный критерий;
   - `evidence` — доказательство нарушения;

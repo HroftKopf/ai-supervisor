@@ -4,7 +4,7 @@
 **Kimi K3.1 Pro** — технический руководитель и ревьюер, **DeepSeek Harness** — исполнитель,
 **Python-оркестратор** — управляющая инфраструктура.
 
-> Статус: **Phase 2.6**. Добавлены централизованный Presentation Layer, компактные
+> Статус: **Phase 2.7**. Добавлены централизованный Presentation Layer, компактные
 > редактируемые карточки прогресса, режимы compact/detailed/debug, меню /start, разделение
 > и версионирование промптов, адаптивная маршрутизация Level 0–3 и профили reasoning.
 > Сохранены COMPOSITE, GitAuthManager, approvals, sandbox, egress, auto-resume и миграции.
@@ -79,6 +79,10 @@
 - Адаптивная маршрутизация Level 0–3 и per-level reasoning/token limits; routing level и
   prompt version сохраняются в usage/task events.
 - Prompt Evaluation Framework: 24 сценария и детерминированный harness.
+- Adaptive planning: capability registry, только релевантные strategy profiles, автозаполнение
+  детерминированных полей, classifier с контекстными ссылками.
+- Reviewer root cause: planner/executor/environment/permission/evidence/external service.
+- Structured experience memory schema v5, deterministic extraction, stale/verified/categories.
 - FTS5-поиск, резюме, stop/rollback/pause/retry, systemd, doctor, redaction.
 
 Phase 1 намеренно **не** реализует SSH, браузер, Docker/Podman, MCP и распределённый VPS.
@@ -338,7 +342,7 @@ memory_mb = 4096
 
 Выполнено:
 
-- `pytest`: **97 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
+- `pytest`: **103 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
   Проверены запуск runtime, проброс `DEEPSEEK_BASE_URL`, запись результата, usage (input 42,
@@ -416,7 +420,7 @@ ai-supervisor run
 - Реальная публикация пользовательских файлов не входит в автоматические тесты; используется
   mock GitHub API и временный bare remote.
 
-Полный список: [docs/PHASE2_6.md](docs/PHASE2_6.md).
+Полный список: [docs/PHASE2_7.md](docs/PHASE2_7.md).
 
 ---
 

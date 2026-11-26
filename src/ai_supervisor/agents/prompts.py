@@ -46,6 +46,11 @@ class PromptRegistry:
                 sha256=hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
             )
 
+    def compose(self, name: str) -> str:
+        common = self._profiles.get("common")
+        profile = self.get(name)
+        return ((common.text + "\n\n") if common is not None else "") + profile.text
+
     def get(self, name: str) -> PromptProfile:
         try:
             return self._profiles[name]

@@ -50,7 +50,7 @@ def test_scenario_library_has_categories_and_offline_harness() -> None:
 
 def test_prompt_profiles_are_versioned_and_role_specific() -> None:
     active = PromptRegistry(PROMPTS_DIR)
-    assert active.version == "2.6.0"
+    assert active.version == "2.7.0"
     assert "submit_intent" in active.get("classifier").text
     assert "submit_intent" not in active.get("planner").text
     assert "COMPOSITE" in active.get("planner").text
@@ -65,3 +65,15 @@ def test_routing_levels_and_reasoning_profiles() -> None:
     assert policy.for_request("Перепиши README") is RoutingLevel.STANDARD
     assert policy.reasoning(RoutingLevel.SIMPLE).max_tokens == 2048
     assert policy.reasoning(RoutingLevel.COMPLEX).effort == "max"
+
+
+def test_prompt_diagnostics_are_safe_and_describe_actual_requests(settings) -> None:
+    from ai_supervisor.agents.supervisor import SupervisorAgent
+    from ai_supervisor.core.redaction import SecretRedactor
+
+    agent = SupervisorAgent(object(), settings, SecretRedactor(["topsecret"]))  # type: ignore[arg-type]
+    diagnostics = agent.request_diagnostics()
+    assert diagnostics["version"] == "2.7.0"
+    assert "planner" in diagnostics["profiles"]
+    assert diagnostics["tools"]["planner"] == ["submit_task_spec"]
+    assert "topsecret" not in str(diagnostics)

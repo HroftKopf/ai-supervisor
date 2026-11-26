@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from ai_supervisor.core.capabilities import CAPABILITIES, capability_block
+from ai_supervisor.core.strategies import StrategyLibrary
+from ai_supervisor.memory.conversations import ConversationService
+from ai_supervisor.memory.experience import ExperienceExtractor
+from ai_supervisor.models import (
+    StageExecutor,
+    StageOperation,
+    StageRecord,
+    StageStatus,
+    TaskRecord,
+    TaskStatus,
+)
+
+
+def test_capabilities_and_strategy_library_are_explicit() -> None:
+    text = capability_block()
+    for capability in CAPABILITIES:
+        assert capability.name in text
+    lib = StrategyLibrary(Path("src/ai_supervisor/strategies"))
+    bug = lib.select("Исправь падение теста и добавь регрессию")
+    assert "bug_fix" in bug
+    config = lib.select("Импортируй конфигурацию Niri и опубликуй в GitHub")
+    assert "config_import" in config or "git_publish" in config
+    assert "project_bootstrap" not in config
+
+
+@pytest.mark.asyncio
+async def test_memory_categories_upsert_and_stale(database, settings, project) -> None:
+    service = ConversationService(database, settings)
+    first = await service.add_memory(
+        "project",
+        "Проверенная стратегия X",
+        project_id=project.id,
+        key="strategy-x",
+        category="successful_strategy",
+        verified=True,
+    )
+    assert first.category == "successful_strategy"
+    assert first.verified is True
+    updated = await service.upsert_experience(
+        project_id=project.id,
+        key="strategy-x",
+        content="Проверенная стратегия X v2",
+        category="successful_strategy",
+        task_id=1,
+    )
+    assert updated.content.endswith("v2")
+    await service.update_memory(updated.id, stale=True)
+    listed = await service.get_memories(project_id=project.id)
+    assert all(item.id != updated.id for item in listed)
+
+
+@pytest.mark.asyncio
+async def test_deterministic_experience_extraction(database, settings, project) -> None:
+    service = ConversationService(database, settings)
+    extractor = ExperienceExtractor(service)
+    now = __import__("datetime").datetime.now(__import__("datetime").UTC)
+    task = TaskRecord(
+        id=77,
+        project_id=project.id,
+        conversation_id=1,
+        title="Niri publish",
+        status=TaskStatus.COMPLETED,
+        created_at=now,
+        updated_at=now,
+    )
+    stages = [
+        StageRecord(
+            id=1,
+            task_id=77,
+            stage_key="publish",
+            position=0,
+            operation=StageOperation.PUBLISH,
+            executor=StageExecutor.GIT,
+            goal="publish",
+            status=StageStatus.COMPLETED,
+            result={"commit": "a" * 40, "remote": "origin", "branch": "main"},
+            created_at=now,
+            updated_at=now,
+        )
+    ]
+    await extractor.record_success(task, project, stages)
+    memories = await service.get_memories(project_id=project.id)
+    assert any(item.category == "successful_strategy" for item in memories)
+    assert any(item.category == "verified_fact" for item in memories)

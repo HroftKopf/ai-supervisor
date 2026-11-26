@@ -1,12 +1,34 @@
 {
-  "version": "2.6.0",
+  "version": "2.7.0",
   "baseline": "2.5.1",
   "profiles": {
-    "supervisor": {"file": "supervisor.md", "description": "Базовые правила роли и безопасности"},
-    "classifier": {"file": "classifier.md", "description": "Только классификация намерения"},
-    "planner": {"file": "planner.md", "description": "Планирование ТЗ и COMPOSITE DAG"},
-    "reviewer": {"file": "reviewer.md", "description": "Фактическое ревью результата"},
-    "summarizer": {"file": "summarizer.md", "description": "Сжатие истории"},
-    "worker": {"file": "worker.md", "description": "Исполнитель DeepSeek Harness"}
+    "supervisor": {
+      "file": "supervisor.md",
+      "description": "Базовые правила роли и безопасности"
+    },
+    "classifier": {
+      "file": "classifier.md",
+      "description": "Только классификация намерения"
+    },
+    "planner": {
+      "file": "planner.md",
+      "description": "Планирование ТЗ и COMPOSITE DAG"
+    },
+    "reviewer": {
+      "file": "reviewer.md",
+      "description": "Фактическое ревью результата"
+    },
+    "summarizer": {
+      "file": "summarizer.md",
+      "description": "Сжатие истории"
+    },
+    "worker": {
+      "file": "worker.md",
+      "description": "Исполнитель DeepSeek Harness"
+    },
+    "common": {
+      "file": "common.md",
+      "description": "Общие обязательные правила"
+    }
   }
 }

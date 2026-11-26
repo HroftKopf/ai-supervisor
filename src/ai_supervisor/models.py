@@ -468,6 +468,16 @@ class IssueSeverity(StrEnum):
     CRITICAL = "critical"
 
 
+class RootCause(StrEnum):
+    UNKNOWN = "unknown"
+    EXECUTOR_ERROR = "executor_error"
+    PLANNER_ERROR = "planner_error"
+    ENVIRONMENT_ERROR = "environment_error"
+    PERMISSION_ERROR = "permission_error"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    EXTERNAL_SERVICE_ERROR = "external_service_error"
+
+
 class ReviewVerdict(StrEnum):
     APPROVED = "approved"
     REWORK_REQUIRED = "rework_required"
@@ -513,6 +523,7 @@ class ReviewResult(BaseModel):
 
     verdict: ReviewVerdict
     summary: str = Field(min_length=1, max_length=4000)
+    root_cause: RootCause = RootCause.UNKNOWN
     issues: list[ReviewIssue] = Field(default_factory=list, max_length=30)
     required_changes: list[str] = Field(default_factory=list, max_length=30)
 
@@ -838,6 +849,12 @@ class MemoryRecord(BaseModel):
     content: str
     source: str = "user"
     user_confirmed: bool = False
+    category: str = "verified_fact"
+    task_id: int | None = None
+    applicability: str = ""
+    verified: bool = False
+    stale: bool = False
+    last_confirmed_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

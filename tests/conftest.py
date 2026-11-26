@@ -28,6 +28,7 @@ from ai_supervisor.models import (
     ProjectRecord,
     ReviewResult,
     ReviewVerdict,
+    RootCause,
     TaskRecord,
     TaskSpec,
     TokenUsage,
@@ -45,6 +46,7 @@ class FakeSupervisor:
     def __init__(self) -> None:
         self.intent = IntentKind.TASK
         self.review_verdict = ReviewVerdict.ACCEPT
+        self.review_root_cause = RootCause.UNKNOWN
         self.review_sequence: list[ReviewVerdict] = []
         self.chat_calls = 0
         self.review_calls = 0
@@ -85,6 +87,7 @@ class FakeSupervisor:
             result = ReviewResult(
                 verdict=ReviewVerdict.REWORK,
                 summary="нужна доработка",
+                root_cause=self.review_root_cause,
                 issues=["неполное изменение"],
                 required_changes=["дополнить README"],
             )

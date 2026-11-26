@@ -1,0 +1,130 @@
+{
+  "version": "2.7.0",
+  "strategies": [
+    {
+      "id": "bug_fix",
+      "file": "bug_fix.md",
+      "markers": [
+        "ошибк",
+        "падает",
+        "паден",
+        "баг",
+        "bug",
+        "traceback",
+        "исправ",
+        "регресс"
+      ]
+    },
+    {
+      "id": "new_feature",
+      "file": "new_feature.md",
+      "markers": [
+        "добавь",
+        "новый",
+        "feature",
+        "функци",
+        "реализуй"
+      ]
+    },
+    {
+      "id": "code_review",
+      "file": "code_review.md",
+      "markers": [
+        "ревью",
+        "review",
+        "аудит",
+        "проверь код"
+      ]
+    },
+    {
+      "id": "git_publish",
+      "file": "git_publish.md",
+      "markers": [
+        "github",
+        "git push",
+        "опубликуй",
+        "залей",
+        "remote"
+      ]
+    },
+    {
+      "id": "config_import",
+      "file": "config_import.md",
+      "markers": [
+        "конфиг",
+        "config",
+        "импорт",
+        "niri"
+      ]
+    },
+    {
+      "id": "refactoring",
+      "file": "refactoring.md",
+      "markers": [
+        "рефактор",
+        "refactor",
+        "перепиши"
+      ]
+    },
+    {
+      "id": "performance",
+      "file": "performance.md",
+      "markers": [
+        "производительн",
+        "медлен",
+        "performance",
+        "оптимиз"
+      ]
+    },
+    {
+      "id": "security_audit",
+      "file": "security_audit.md",
+      "markers": [
+        "безопасн",
+        "security",
+        "секрет",
+        "уязвим"
+      ]
+    },
+    {
+      "id": "diagnostics",
+      "file": "diagnostics.md",
+      "markers": [
+        "диагност",
+        "логи",
+        "status",
+        "причин"
+      ]
+    },
+    {
+      "id": "documentation",
+      "file": "documentation.md",
+      "markers": [
+        "readme",
+        "документац",
+        "docs",
+        "опиши"
+      ]
+    },
+    {
+      "id": "testing",
+      "file": "testing.md",
+      "markers": [
+        "тест",
+        "test",
+        "проверк",
+        "pytest"
+      ]
+    },
+    {
+      "id": "project_bootstrap",
+      "file": "project_bootstrap.md",
+      "markers": [
+        "новый проект",
+        "создай проект",
+        "bootstrap",
+        "init"
+      ]
+    }
+  ]
+}

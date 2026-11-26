@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from ai_supervisor.agents.supervisor import SupervisorAgent, SupervisorError
 from ai_supervisor.config import Settings
+from ai_supervisor.core.capabilities import capability_block
 from ai_supervisor.core.config_import import ConfigImportError, ConfigImportService
 from ai_supervisor.core.context import ContextError, ProjectContextBuilder
 from ai_supervisor.core.git_auth import (
@@ -43,11 +44,13 @@ from ai_supervisor.core.permissions import (
 from ai_supervisor.core.redaction import SecretRedactor
 from ai_supervisor.core.reviewer import ReviewGate, build_report
 from ai_supervisor.core.routing import RoutingLevel, RoutingPolicy
+from ai_supervisor.core.strategies import StrategyLibrary
 from ai_supervisor.core.usage import LimitExceeded, UsageService
 from ai_supervisor.core.validation import TaskValidator
 from ai_supervisor.core.worker_manager import WorkerError, WorkerManager, WorkerScheduler
 from ai_supervisor.core.workspace import WorkspaceError, WorkspaceManager
 from ai_supervisor.memory.conversations import ConversationService
+from ai_supervisor.memory.experience import ExperienceExtractor
 from ai_supervisor.memory.projects import ProjectError, ProjectService, validate_remote_url
 from ai_supervisor.memory.stages import StageError, TaskStageService
 from ai_supervisor.memory.tasks import TaskError, TaskService
@@ -58,6 +61,7 @@ from ai_supervisor.models import (
     ReviewResult,
     ReviewVerdict,
     RiskLevel,
+    RootCause,
     StageOperation,
     StageRecord,
     StageStatus,
@@ -173,6 +177,7 @@ class Orchestrator:
         self.conversations = conversations
         self.tasks = tasks
         self.stages = TaskStageService(tasks.db)
+        self.experience = ExperienceExtractor(conversations)
         self.progress = ProgressManager(
             settings=settings,
             tasks=tasks,
@@ -192,6 +197,7 @@ class Orchestrator:
         self.redactor = redactor
         self.notifier = notifier
         self.permissions = PermissionManager()
+        self.strategies = StrategyLibrary(Path(__file__).resolve().parent.parent / "strategies")
         self.routing = RoutingPolicy(
             level1_effort=settings.routing.level1_effort,
             level1_max_tokens=settings.routing.level1_max_tokens,
@@ -415,6 +421,16 @@ class Orchestrator:
             return
 
         ambiguous = intent_result.clarification or intent_result.confidence < 0.6
+        if intent_result.clarification:
+            question = self.redactor.redact(intent_result.clarification)[:1500]
+            await self.conversations.add_message(
+                conversation.id,
+                "assistant",
+                question,
+                meta={"kind": "clarification"},
+            )
+            await self.notifier.send_text(message.chat_id, question)
+            return
         if intent_result.kind is IntentKind.TASK and not ambiguous:
             await self._begin_task(
                 project=project,
@@ -762,9 +778,23 @@ class Orchestrator:
             conversation_id=conversation.id,
             reasoning_effort=plan_profile.effort,
             max_completion_tokens=plan_profile.max_tokens,
+            capabilities_block=capability_block(),
+            strategy_block=self.strategies.select(latest_user),
         )
         final_level = max(int(requested_level), int(self.routing.for_spec(spec)))
-        spec = spec.model_copy(update={"routing_level": final_level})
+        updates: dict[str, object] = {
+            "routing_level": final_level,
+            "schema_version": 2,
+        }
+        if not spec.scope.strip():
+            updates["scope"] = spec.goal[:8000]
+        if not spec.source_request.strip():
+            updates["source_request"] = latest_user[:8000]
+        if spec.max_attempts == 0:
+            updates["max_attempts"] = self.settings.limits.max_iterations
+        if spec.max_minutes == 0:
+            updates["max_minutes"] = self.settings.limits.max_task_minutes
+        spec = spec.model_copy(update=updates)
         await self._record_kimi_usage(
             plan_usage,
             task_id=task.id,
@@ -1052,6 +1082,7 @@ class Orchestrator:
                 f"Ревью: {review.verdict.value}",
                 {
                     "summary": review.summary,
+                    "root_cause": review.root_cause.value,
                     "issues": [item.model_dump() for item in review.issues],
                 },
             )
@@ -1059,6 +1090,30 @@ class Orchestrator:
                 await self._finish_for_acceptance(
                     task.id, project, spec_evidence=evidence, review=review
                 )
+                return
+            if review.root_cause is RootCause.PLANNER_ERROR:
+                await self._block_task(
+                    task.id,
+                    "Ошибка планировщика: требуется пересмотр плана, исполнитель не отправлен "
+                    "на доработку.\n" + review.summary,
+                    review=review,
+                )
+                return
+            if (
+                review.root_cause
+                in {
+                    RootCause.ENVIRONMENT_ERROR,
+                    RootCause.EXTERNAL_SERVICE_ERROR,
+                }
+                and review.verdict is not ReviewVerdict.APPROVED
+            ):
+                await self._retry_wait(task.id, review.summary)
+                return
+            if (
+                review.root_cause is RootCause.PERMISSION_ERROR
+                and review.verdict is not ReviewVerdict.APPROVED
+            ):
+                await self._await_required_approval(task.id, review)
                 return
             if review.verdict is ReviewVerdict.BLOCKED:
                 await self._block_task(task.id, review.summary, review=review)
@@ -1932,6 +1987,7 @@ class Orchestrator:
             {"stages": [stage.stage_key for stage in stages]},
             agent="orchestrator",
         )
+        await self.experience.record_success(task, project, stages)
         await self._maybe_usage_warning(task.id)
         mode = await self.conversations.get_ui_mode(self._chat_for_task(task))
         usage_totals = await self.usage.by_provider(task_id=task.id)
@@ -2070,10 +2126,14 @@ class Orchestrator:
             review_json=review.model_dump_json() if review else None,
         )
         await self.tasks.add_event(task.id, "blocked", safe_reason, agent="orchestrator")
-        report = await self._final_report(task, None, TaskStatus.BLOCKED)
+        project = await self.projects.get(task.project_id)
+        if project is not None:
+            await self.experience.record_failure(
+                task, project, category="blocked", reason=safe_reason
+            )
+        report = await self._final_report(task, project, TaskStatus.BLOCKED)
         await self.tasks.update_fields(task.id, report=report)
         stages = await self.stages.list(task.id)
-        project = await self.projects.get(task.project_id)
         mode = await self.conversations.get_ui_mode(self._chat_for_task(task))
         await self.progress.update(task.id, force=True, chat_id=self._chat_for_task(task))
         await self.notifier.send_text(
@@ -2196,12 +2256,34 @@ class Orchestrator:
         await self._try_transition(task.id, TaskStatus.COMPLETED)
         task = await self.tasks.update_fields(task.id, head_commit=new_head)
         await self.tasks.add_event(task.id, "merged", f"Изменения слиты в {project.base_branch}")
+        await self.experience.record_success(task, project, [])
         report = await self._final_report(task, project, TaskStatus.COMPLETED)
         await self.tasks.update_fields(task.id, report=report)
-        buttons = (
-            [[Button("Опубликовать в Git", f"push:{task.id}")]] if project.remote_url else None
+        mode = await self.conversations.get_ui_mode(chat_id)
+        stages = await self.stages.list(task.id)
+        await self.progress.update(task.id, force=True, chat_id=chat_id)
+        buttons = [
+            [Button("Подробности", f"det:{task.id}"), Button("Расход токенов", f"use:{task.id}")],
+            [Button("Журнал", f"log:{task.id}")],
+        ]
+        if project.remote_url and project.remote_url.startswith(("https://", "http://")):
+            buttons.insert(0, [Button("Открыть репозиторий", url=project.remote_url)])
+        if project.remote_url:
+            buttons.insert(0, [Button("Опубликовать в Git", f"push:{task.id}")])
+        await self.notifier.send_text(
+            chat_id,
+            completion_card(
+                task,
+                project,
+                evidence=self._load_evidence(task),
+                review=task.review,
+                stages=stages,
+                mode=mode,
+                repo_url=project.remote_url,
+            ),
+            buttons,
+            parse_mode="HTML",
         )
-        await self.notifier.send_text(chat_id, report, buttons)
         await self.conversations.add_message(
             task.conversation_id,
             "assistant",
@@ -3286,14 +3368,21 @@ class Orchestrator:
             memories = await self.conversations.search_memories(query.strip())
             if not memories:
                 return "Совпадений в памяти нет."
-            return "\n".join(f"#{item.id} [{item.scope}] {item.content[:500]}" for item in memories)
+            return "\n".join(
+                f"#{item.id} [{item.scope}/{item.category}{' · устарело' if item.stale else ''}] "
+                f"{item.content[:500]}"
+                for item in memories
+            )
         items = await self.conversations.get_memories(project_id=project.id if project else None)
         if not items:
             return "Память пуста. Добавить: /memory add <текст>"
         lines = ["Память (последние записи):"]
-        for item in items[:15]:
-            confirmed = "" if item.user_confirmed else " (неподтверждено)"
-            lines.append(f"#{item.id} [{item.scope}{confirmed}] {item.content[:300]}")
+        for item in items[:20]:
+            confirmed = "" if item.verified else " (неподтверждено)"
+            stale = " · устарело" if item.stale else ""
+            lines.append(
+                f"#{item.id} [{item.scope}/{item.category}{confirmed}{stale}] {item.content[:300]}"
+            )
         return "\n".join(lines)
 
     async def doctor_text(self, chat_id: int) -> str:

@@ -327,6 +327,11 @@ class ConversationService:
         key: str = "",
         source: str = "user",
         user_confirmed: bool = True,
+        category: str = "verified_fact",
+        task_id: int | None = None,
+        applicability: str = "",
+        verified: bool = False,
+        stale: bool = False,
     ) -> MemoryRecord:
         content = self.redactor.redact(content.strip())
         if not content:
@@ -335,12 +340,24 @@ class ConversationService:
             raise ConversationError("запись памяти слишком длинная (максимум 8000 символов)")
         if scope not in {"user", "project", "conversation"}:
             raise ConversationError("некорректная область памяти")
+        categories = {
+            "verified_fact",
+            "architectural_decision",
+            "owner_preference",
+            "successful_strategy",
+            "failure_pattern",
+            "hypothesis",
+            "temporary_state",
+        }
+        if category not in categories:
+            raise ConversationError(f"неизвестная категория памяти: {category}")
         now = iso_now()
         cursor = await self.db.execute(
             """
             INSERT INTO memories(scope, project_id, conversation_id, key, content, source,
-                                 user_confirmed, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 user_confirmed, category, task_id, applicability, verified,
+                                 stale, last_confirmed_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 scope,
@@ -350,6 +367,12 @@ class ConversationService:
                 content,
                 source[:80],
                 1 if user_confirmed else 0,
+                category,
+                task_id,
+                applicability[:500],
+                1 if verified else 0,
+                1 if stale else 0,
+                now if verified else None,
                 now,
                 now,
             ),
@@ -359,6 +382,97 @@ class ConversationService:
         row = await self.db.fetchone("SELECT * FROM memories WHERE id = ?", (memory_id,))
         return MemoryRecord.model_validate(row_to_dict(row))
 
+    async def find_memory(
+        self, *, scope: str, project_id: int | None, key: str
+    ) -> MemoryRecord | None:
+        row = await self.db.fetchone(
+            "SELECT * FROM memories WHERE scope = ? AND project_id IS ? AND key = ? ORDER BY id DESC LIMIT 1",
+            (scope, project_id, key),
+        )
+        return MemoryRecord.model_validate(row_to_dict(row)) if row else None
+
+    async def update_memory(
+        self,
+        memory_id: int,
+        *,
+        content: str | None = None,
+        category: str | None = None,
+        applicability: str | None = None,
+        verified: bool | None = None,
+        stale: bool | None = None,
+    ) -> MemoryRecord | None:
+        row = await self.db.fetchone("SELECT * FROM memories WHERE id = ?", (memory_id,))
+        if row is None:
+            return None
+        current = MemoryRecord.model_validate(row_to_dict(row))
+        fields: dict[str, Any] = {}
+        if content is not None:
+            fields["content"] = self.redactor.redact(content.strip())[:8000]
+        if category is not None:
+            if category not in {
+                "verified_fact",
+                "architectural_decision",
+                "owner_preference",
+                "successful_strategy",
+                "failure_pattern",
+                "hypothesis",
+                "temporary_state",
+            }:
+                raise ConversationError(f"неизвестная категория памяти: {category}")
+            fields["category"] = category
+        if applicability is not None:
+            fields["applicability"] = applicability[:500]
+        if verified is not None:
+            fields["verified"] = 1 if verified else 0
+            fields["last_confirmed_at"] = iso_now() if verified else current.last_confirmed_at
+        if stale is not None:
+            fields["stale"] = 1 if stale else 0
+        if not fields:
+            return current
+        fields["updated_at"] = iso_now()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        await self.db.execute(
+            f"UPDATE memories SET {assignments} WHERE id = ?", (*fields.values(), memory_id)
+        )
+        row = await self.db.fetchone("SELECT * FROM memories WHERE id = ?", (memory_id,))
+        return MemoryRecord.model_validate(row_to_dict(row)) if row else None
+
+    async def upsert_experience(
+        self,
+        *,
+        project_id: int | None,
+        key: str,
+        content: str,
+        category: str,
+        task_id: int | None,
+        applicability: str = "",
+        verified: bool = True,
+    ) -> MemoryRecord:
+        existing = await self.find_memory(scope="project", project_id=project_id, key=key)
+        if existing:
+            updated = await self.update_memory(
+                existing.id,
+                content=content,
+                category=category,
+                applicability=applicability,
+                verified=verified,
+                stale=False,
+            )
+            if updated is not None:
+                return updated
+        return await self.add_memory(
+            "project",
+            content,
+            project_id=project_id,
+            key=key,
+            source="experience",
+            user_confirmed=False,
+            category=category,
+            task_id=task_id,
+            applicability=applicability,
+            verified=verified,
+        )
+
     async def get_memories(
         self,
         *,
@@ -366,6 +480,8 @@ class ConversationService:
         project_id: int | None = None,
         conversation_id: int | None = None,
         limit: int = 50,
+        category: str | None = None,
+        include_stale: bool = False,
     ) -> list[MemoryRecord]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -378,6 +494,11 @@ class ConversationService:
         if conversation_id is not None:
             clauses.append("(scope != 'conversation' OR conversation_id = ?)")
             params.append(conversation_id)
+        if category is not None:
+            clauses.append("category = ?")
+            params.append(category)
+        if not include_stale:
+            clauses.append("stale = 0")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = await self.db.fetchall(
             f"SELECT * FROM memories{where} ORDER BY id DESC LIMIT ?", (*params, limit)
@@ -397,8 +518,12 @@ class ConversationService:
             return ""
         lines = []
         for item in items:
-            marker = "" if item.user_confirmed else " (неподтверждённое предположение)"
-            lines.append(f"- [{item.scope}{marker}] {item.content}")
+            marker = ""
+            if item.category == "hypothesis" or not item.verified:
+                marker = " (неподтверждённое предположение)"
+            if item.stale:
+                marker += " (устарело)"
+            lines.append(f"- [{item.scope}/{item.category}{marker}] {item.content}")
         return "\n".join(lines)
 
     async def search_memories(self, query: str, limit: int = 20) -> list[MemoryRecord]:
@@ -414,7 +539,7 @@ class ConversationService:
                     """
                     SELECT m.* FROM memories_fts
                     JOIN memories m ON m.id = memories_fts.memory_id
-                    WHERE memories_fts MATCH ?
+                    WHERE memories_fts MATCH ? AND m.stale = 0
                     ORDER BY rank LIMIT ?
                     """,
                     (fts_query, limit),
@@ -423,7 +548,7 @@ class ConversationService:
             except Exception:
                 pass
         rows = await self.db.fetchall(
-            "SELECT * FROM memories WHERE content LIKE ? ORDER BY id DESC LIMIT ?",
+            "SELECT * FROM memories WHERE content LIKE ? AND stale = 0 ORDER BY id DESC LIMIT ?",
             (f"%{clean_query}%", limit),
         )
         return [MemoryRecord.model_validate(row_to_dict(row)) for row in rows]

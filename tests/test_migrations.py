@@ -49,7 +49,7 @@ async def test_v1_database_is_migrated_with_backup(tmp_path: Path) -> None:
     await db.connect()
     try:
         version = await db.scalar("SELECT value FROM schema_meta WHERE key='schema_version'")
-        assert version == "4"
+        assert version == "5"
         task_columns = {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(tasks)")}
         project_columns = {
             str(row["name"]) for row in await db.fetchall("PRAGMA table_info(projects)")
@@ -64,6 +64,10 @@ async def test_v1_database_is_migrated_with_backup(tmp_path: Path) -> None:
             str(row["name"]) for row in await db.fetchall("PRAGMA table_info(tasks)")
         }
         assert {"ui_chat_id", "ui_message_id", "ui_hash"} <= task_ui_columns
+        memory_columns = {
+            str(row["name"]) for row in await db.fetchall("PRAGMA table_info(memories)")
+        }
+        assert {"category", "task_id", "applicability", "verified", "stale"} <= memory_columns
         stage_columns = {
             str(row["name"]) for row in await db.fetchall("PRAGMA table_info(task_stages)")
         }
@@ -74,6 +78,6 @@ async def test_v1_database_is_migrated_with_backup(tmp_path: Path) -> None:
             "status",
             "result_json",
         } <= stage_columns
-        assert list((tmp_path / "backups").glob("pre-migration-v4-*.db"))
+        assert list((tmp_path / "backups").glob("pre-migration-v5-*.db"))
     finally:
         await db.close()

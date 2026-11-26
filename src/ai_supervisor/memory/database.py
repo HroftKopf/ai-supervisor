@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def iso_now() -> str:
@@ -266,6 +266,12 @@ CREATE TABLE IF NOT EXISTS memories (
     content TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'user',
     user_confirmed INTEGER NOT NULL DEFAULT 0,
+    category TEXT NOT NULL DEFAULT 'verified_fact',
+    task_id INTEGER,
+    applicability TEXT NOT NULL DEFAULT '',
+    verified INTEGER NOT NULL DEFAULT 0,
+    stale INTEGER NOT NULL DEFAULT 0,
+    last_confirmed_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -384,6 +390,14 @@ class Database:
                 "stage_id": "INTEGER",
                 "duration_ms": "INTEGER",
                 "error_category": "TEXT",
+            },
+            "memories": {
+                "category": "TEXT NOT NULL DEFAULT 'verified_fact'",
+                "task_id": "INTEGER",
+                "applicability": "TEXT NOT NULL DEFAULT ''",
+                "verified": "INTEGER NOT NULL DEFAULT 0",
+                "stale": "INTEGER NOT NULL DEFAULT 0",
+                "last_confirmed_at": "TEXT",
             },
             "usage_events": {
                 "prompt_version": "TEXT",
