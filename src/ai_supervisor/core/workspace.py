@@ -159,7 +159,7 @@ class WorkspaceManager:
     ) -> list[CheckResult]:
         dsh_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        paths = self.sandbox_paths(worktree, dsh_home, state_dir)
+        paths = self.sandbox_paths(worktree, dsh_home, state_dir, self.extra_read_paths(project))
         commands = [("test", project.test_command), ("build", project.build_command)]
         results: list[CheckResult] = []
         for name, command in commands:
@@ -184,11 +184,22 @@ class WorkspaceManager:
             )
         return results
 
-    def sandbox_paths(self, worktree: Path, dsh_home: Path, state_dir: Path) -> SandboxPaths:
+    def sandbox_paths(
+        self,
+        worktree: Path,
+        dsh_home: Path,
+        state_dir: Path,
+        readonly_roots: tuple[Path, ...] = (),
+    ) -> SandboxPaths:
         # Derive the worktree-specific gitdir synchronously; this happens once per task.
         common = self._common_dir_sync(worktree)
         if common is None:
-            return SandboxPaths(worktree=worktree, dsh_home=dsh_home, state_dir=state_dir)
+            return SandboxPaths(
+                worktree=worktree,
+                dsh_home=dsh_home,
+                state_dir=state_dir,
+                readonly_roots=readonly_roots,
+            )
         git_dir = self._worktree_git_dir_sync(worktree, common)
         return SandboxPaths(
             worktree=worktree,
@@ -196,7 +207,27 @@ class WorkspaceManager:
             state_dir=state_dir,
             git_common_dir=common,
             git_worktree_name=git_dir.name if git_dir else None,
+            readonly_roots=readonly_roots,
         )
+
+    @staticmethod
+    def extra_read_paths(project: ProjectRecord) -> tuple[Path, ...]:
+        import json
+
+        try:
+            raw = json.loads(project.extra_read_paths_json or "[]")
+        except json.JSONDecodeError:
+            return ()
+        result: list[Path] = []
+        for item in raw if isinstance(raw, list) else []:
+            try:
+                path = Path(str(item)).expanduser().resolve(strict=True)
+            except OSError:
+                continue
+            if path == Path("/") or path == Path.home():
+                continue
+            result.append(path)
+        return tuple(result)
 
     def _common_dir_sync(self, worktree: Path) -> Path | None:
         import subprocess
@@ -259,8 +290,16 @@ class WorkspaceManager:
         staged = await git(worktree, "add", "-A", timeout_seconds=60, check=False)
         if staged.returncode != 0:
             raise WorkspaceError(f"git add failed: {staged.stderr.strip()}")
+        base_commit = task.base_commit or "HEAD"
         changed_result = await git(
-            worktree, "diff", "--cached", "--name-only", "-z", timeout_seconds=30, check=False
+            worktree,
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            base_commit,
+            timeout_seconds=30,
+            check=False,
         )
         changed_files = [item for item in changed_result.stdout.split("\x00") if item]
         self._guard_sensitive_paths(changed_files)
@@ -272,11 +311,12 @@ class WorkspaceManager:
             "--no-color",
             "--src-prefix=a/",
             "--dst-prefix=b/",
+            base_commit,
             timeout_seconds=120,
             check=False,
         )
         stat_result = await git(
-            worktree, "diff", "--cached", "--stat", timeout_seconds=60, check=False
+            worktree, "diff", "--cached", "--stat", base_commit, timeout_seconds=60, check=False
         )
         full_diff = self.redactor.redact(diff_result.stdout)
         diff_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -284,7 +324,6 @@ class WorkspaceManager:
         diff_path.chmod(0o600)
         truncated = len(full_diff) > self.settings.security.max_diff_chars
         diff = _truncate_middle(full_diff, self.settings.security.max_diff_chars)
-        base_commit = task.base_commit or ""
         head_commit = (await git_output(worktree, "rev-parse", "HEAD")).strip()
         verification_note = ""
         if not checks:
@@ -311,6 +350,11 @@ class WorkspaceManager:
     async def commit_changes(self, *, task: TaskRecord, worktree: Path, changed: bool) -> str:
         if not changed:
             return (await git_output(worktree, "rev-parse", "HEAD")).strip()
+        staged = await git(worktree, "diff", "--cached", "--quiet", "HEAD", check=False)
+        if staged.returncode == 0:
+            # The cumulative task diff may be non-empty after an earlier rework
+            # commit while this attempt introduced no new changes.
+            return (await git_output(worktree, "rev-parse", "HEAD")).strip()
         message = f"{self.settings.git.commit_prefix}: task {task.id:04d} — {task.title}"[:200]
         result = await git(
             worktree,
@@ -332,6 +376,24 @@ class WorkspaceManager:
         if result.returncode != 0:
             raise WorkspaceError(f"git commit failed: {result.stderr.strip()[:2000]}")
         return (await git_output(worktree, "rev-parse", "HEAD")).strip()
+
+    async def is_applied(self, task: TaskRecord, project: ProjectRecord) -> bool:
+        """Detect a merge that completed before the DB transition (crash recovery)."""
+        if not task.head_commit:
+            return False
+        repo = Path(project.path).resolve()
+        base_head = (await git_output(repo, "rev-parse", project.base_branch)).strip()
+        if base_head == task.head_commit:
+            return True
+        result = await git(
+            repo,
+            "merge-base",
+            "--is-ancestor",
+            task.head_commit,
+            project.base_branch,
+            check=False,
+        )
+        return result.returncode == 0
 
     async def apply(self, task: TaskRecord, project: ProjectRecord) -> str:
         repo = Path(project.path).resolve()

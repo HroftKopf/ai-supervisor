@@ -102,7 +102,13 @@ async def test_live_kimi_chat_classify_plan_review() -> None:
             project_context="README.md: # Demo\nhello\n",
         )
         assert isinstance(review, ReviewResult)
-        assert review.verdict.value in {"accept", "rework", "fail"}
+        assert review.verdict.value in {
+            "approved",
+            "rework_required",
+            "approval_required",
+            "blocked",
+            "failed",
+        }
         print("live review:", review.verdict.value, review.summary[:120].replace("\n", " "))
     finally:
         await client.close()

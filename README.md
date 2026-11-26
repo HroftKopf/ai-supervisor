@@ -4,11 +4,13 @@
 **Kimi K3.1 Pro** — технический руководитель и ревьюер, **DeepSeek Harness** — исполнитель,
 **Python-оркестратор** — управляющая инфраструктура.
 
-> Статус: **Phase 1 (MVP) реализован**. Код, unit-тесты и изолированный запуск DeepSeek Harness
-> проверены локально. Живые сценарии Kimi API (общение, классификация, ТЗ, ревью) проверены
-> через настроенный endpoint; Telegram Bot API и платный DeepSeek endpoint ещё не проверялись.
-> Это явно указано в разделе [«Что проверено»](#что-проверено). Система не заявляет о
-> непроверенных функциях как о работающих.
+> Статус: **Phase 1 + Phase 2 core**. Добавлены типы задач, контракт v2, новые состояния,
+> детерминированная проверка по типу задачи, структурное ревью, progress detection, миграции,
+> политики/подтверждения, per-model usage и Git push. Живые сценарии Kimi API проверены;
+> Telegram Bot API и платный DeepSeek endpoint ещё не проверялись. Часть требований
+> (полная декомпозиция, routing, GitHub API, system/external executor) вынесена в следующий
+> этап и явно перечислена в [«Известных ограничениях»](#известные-ограничения-phase-2).
+> Система не заявляет о непроверенных функциях как о работающих.
 
 ---
 
@@ -16,20 +18,33 @@
 
 - Telegram long polling, только личный чат numeric owner ID, защита от чужих сообщений и callback.
 - Обычный диалог с Kimi на естественном языке; классификация «обсуждение / задача».
-- Формирование ТЗ инструментом `submit_task_spec` (tool calling, reasoning_content сохраняется).
-- Изолированный git worktree на задачу, отдельная ветка, коммит оркестратора.
+- Формирование ТЗ v2 инструментом `submit_task_spec`: тип задачи, область, разрешённые пути,
+  инструменты, полномочия, артефакты, бюджеты, критерии; `reasoning_content` сохраняется.
+- Типы задач: `READ_ONLY`, `MODIFY`, `GIT_OPERATION`, `EXECUTE`, `SYSTEM_OPERATION`,
+  `EXTERNAL_OPERATION`, `COMPOSITE`. Небезопасные/нереализованные типы fail-closed.
+- Изолированный git worktree на задачу, отдельная ветка, коммит оркестратора, накопительный diff
+  от base commit (включая коммиты предыдущих попыток).
 - DeepSeek Harness через официальный Python SDK (`deepseek-harness-sdk==0.2.2rc2`),
   профиль `sdk-minimal`, отдельный `DSH_HOME` на задачу.
 - Запуск worker внутри bubblewrap: read-only `/usr`, только worktree/DSH-home/state доступны на запись,
   без домашней директории и без Kimi/Telegram-ключей.
-- Сбор фактических доказательств: `git diff`, список файлов, exit codes проверок, вывод тестов/сборки.
-- Детерминированные проверки, которые модель не может отменить; Kimi-ревью и автоматические доработки.
-- Конечный автомат задачи, сохранение в SQLite WAL, восстановление истории после перезапуска.
-- Остановка зависшего исполнителя, откат с сохранением patch, подтверждения на опасные действия.
-- Учёт токенов и запросов Kimi/DeepSeek, лимиты на задачу/сутки/параллельность/время.
-- FTS5-поиск по истории и памяти; резюмирование длинных диалогов.
-- Inline-кнопки: принять, доработать, diff, логи, откатить.
-- `systemd` unit, doctor, ротация логов, redaction секретов из логов/отчётов/diff.
+- Сбор фактических доказательств: накопительный `git diff`, список файлов, exit codes проверок,
+  вывод тестов/сборки, проверка expected artifacts.
+- Проверка по типу задачи: READ_ONLY не требует diff; MODIFY требует изменения только если
+  `requires_file_changes=true`; EXECUTE учитывает проверки; запрет выхода за `allowed_paths`.
+- Структурное ревью: `approved`, `rework_required`, `approval_required`, `blocked`, `failed`;
+  замечания с criterion/evidence/severity/recommendation/within_authority.
+- Progress detection: одинаковый diff/проверки/замечания останавливают цикл как `BLOCKED`,
+  а не бесконечно дорабатывают.
+- Новые состояния: `VALIDATING`, `WAITING_INPUT`, `RETRY_WAIT`, `PARTIALLY_COMPLETED`, `BLOCKED`;
+  миграции SQLite v1→v2 с backup.
+- Preflight-контракт: неизвестные tools, CRITICAL-полномочия и нереализованные privileged-типы
+  блокируются до worker; HIGH требует подтверждения.
+- Git push с обязательным подтверждением, без force, с проверкой remote SHA.
+- Per-model usage/pricing, кэш/reasoning, duration; команды `/usage today|week|month|task N`.
+- Новые Telegram-команды: `/task`, `/task_info`, `/queue`, `/cancel`, `/pause`, `/retry`, `/doctor`,
+  `/push`; проектные `/project list|select|permissions|remote|budget|extra-read|permission`.
+- FTS5-поиск, резюме, stop/rollback/pause/retry, systemd, doctor, redaction.
 
 Phase 1 намеренно **не** реализует SSH, браузер, Docker/Podman, MCP и распределённый VPS.
 Это следующие этапы, а не скрытые заглушки.
@@ -121,6 +136,9 @@ DEEPSEEK_MODEL=
 
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_OWNER_ID=
+
+# Optional: GitHub repository info/create. Never passed to the worker.
+GITHUB_TOKEN=
 ```
 
 - `.env` должен иметь режим `600`; при `require_env_mode_600=true` сервис откажется запускаться с
@@ -177,9 +195,12 @@ SDK запускает собственный bundled runtime; системны�
 По умолчанию бот работает только в private chat. Сообщения, команды, файлы и callback-запросы
 других пользователей отклоняются. Long polling означает отсутствие публичного IP и вебхуков.
 
-Команды: `/start`, `/help`, `/projects`, `/project`, `/new`, `/tasks`, `/status`, `/agents`,
-`/logs`, `/diff`, `/report`, `/approve`, `/reject`, `/stop`, `/resume`, `/rollback`, `/rework`,
-`/usage`, `/memory`, `/settings`. Команды не обязательны — можно писать обычным языком.
+Команды: `/start`, `/help`, `/projects`, `/project` (`list|select|info|add|create|remove|
+permissions|remote|budget|max-rework|extra-read|permission|test|build|instructions`),
+`/new`, `/task`, `/task_info`, `/tasks`, `/queue`, `/status`, `/agents`, `/logs`, `/diff`,
+`/report`, `/approve`, `/reject`, `/stop`, `/cancel`, `/pause`, `/resume`, `/retry`,
+`/rollback`, `/rework`, `/push`, `/github info|create`, `/usage` (`today|week|month|task N`),
+`/memory`, `/settings`, `/doctor`. Команды не обязательны — можно писать обычным языком.
 
 ### Проекты
 
@@ -282,7 +303,7 @@ memory_mb = 4096
 
 Выполнено:
 
-- `pytest`: **34 passed, 3 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
+- `pytest`: **59 passed, 3 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
   Проверены запуск runtime, проброс `DEEPSEEK_BASE_URL`, запись результата, usage (input 42,
@@ -290,7 +311,7 @@ memory_mb = 4096
   изменивший файл в worktree.
 - `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest tests/test_kimi_live.py`: **1 passed** — реальные
   запросы к настроенному Kimi API: обычное общение (`tool_choice=auto`), классификация,
-  формирование ТЗ и ревью (`tool_choice=required` + ровно один инструмент).
+  формирование ТЗ v2 и структурное ревью (`tool_choice=required` + ровно один инструмент).
 - `ruff check .`: все проверки пройдены.
 - `bwrap` probe: user namespaces + read-only `/usr` + изолированный worktree.
 - Ручной end-to-end оркестрации с fake Kimi и реальным Git: plan → execute → diff → review →
@@ -318,7 +339,7 @@ ai-supervisor run
 
 ---
 
-## Известные ограничения Phase 1
+## Известные ограничения Phase 2
 
 - **Сеть worker не изолирована по allowlist.** bwrap изолирует файлы/PID/UID, но worker должен
   достучаться до DeepSeek API, поэтому сеть общая. Это позволяет exfiltration данных проекта
@@ -338,7 +359,19 @@ ai-supervisor run
 - При несовместимости сохранённой DSH-сессии `/resume` может потребовать нового запуска; система
   не подменяет сессию молча.
 
-Полный список: [docs/PHASE1.md](docs/PHASE1.md#ограничения).
+### Что ещё не реализовано в Phase 2
+
+- Полная декомпозиция `COMPOSITE` на зависимые этапы, DAG и параллельные подзадачи.
+- Маршрутизация Level 0–3 между моделями/исполнителями (кроме детерминированных Telegram-команд).
+- Продвинутые GitHub PR/checks и настройки организаций; базовые repo info/create и Git push реализованы.
+- Полноценный привилегированный исполнитель для `SYSTEM_OPERATION`/`EXTERNAL_OPERATION`;
+  сейчас эти типы блокируются до отдельного этапа.
+- Config import как отдельный approval-tool; вместо него worker получает только явно разрешённые
+  read-only paths и может скопировать конфиг в worktree с secret-сканом diff.
+- Ретенция task-логов/событий и JSON-корреляция логов; файловые логи ротируются, task-каталоги
+  пока требуют периодической очистки.
+
+Полный список: [docs/PHASE2.md](docs/PHASE2.md).
 
 ---
 
@@ -348,6 +381,7 @@ ai-supervisor run
 .venv/bin/ruff check .
 .venv/bin/pytest -q
 AI_SUPERVISOR_RUN_INTEGRATION=1 .venv/bin/pytest -q tests/test_worker_integration.py
+AI_SUPERVISOR_RUN_LIVE_KIMI=1 .venv/bin/pytest -q tests/test_kimi_live.py -s
 ```
 
 Тесты не требуют реальных API-ключей. Интеграционный тест поднимает локальный mock Messages API
@@ -362,7 +396,8 @@ src/ai_supervisor/
   agents/            Kimi supervisor (prompt orchestration)
   providers/         Kimi OpenAI-compatible client
   core/              orchestrator, scheduler, worker manager, workspace,
-                     sandbox, permissions, review gates, usage, redaction
+                     sandbox, validation, review gates, Git/GitHub,
+                     permissions, usage, redaction
   memory/            SQLite WAL, projects, conversations, tasks, FTS5
   telegram/          bot, owner auth, handlers, notifications
   tools/             reserved for Phase 4 tools
@@ -370,15 +405,15 @@ src/ai_supervisor/
 config/dsh/          privacy patch for DSH session-log upload
 systemd/             user service
 tests/               unit + optional real DSH integration
-docs/                API notes, install, security, testing, phase 1
+docs/                API notes, install, security, testing, phase 1/2
 ```
 
 ---
 
 ## Следующий этап
 
-1. **Phase 2:** egress allowlist/proxy для worker, автодетект тестов/сборки, усиление memory,
-   расширенные approvals и интеграционные тесты с реальными ключами.
+1. **Phase 2.5:** egress allowlist/proxy для worker, полная декомпозиция COMPOSITE, routing,
+   GitHub API, привилегированный system/external executor, retention/structured logs.
 2. **Phase 3:** несколько исполнителей, граф зависимостей, интеграционная ветка и разрешение
    конфликтов, параллельные worktree.
 3. **Phase 4:** SSH, Podman, браузер, MCP, системный мониторинг — отдельными модулями с политиками.

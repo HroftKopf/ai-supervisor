@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Any
 
 from ai_supervisor.memory.database import Database, iso_now, json_dumps, row_to_dict
-from ai_supervisor.models import ApprovalStatus
+from ai_supervisor.models import ApprovalStatus, RiskLevel
 
 
 class ApprovalError(RuntimeError):
@@ -43,6 +43,11 @@ class Action(StrEnum):
     DELETE_IMPORTANT_DATA = "delete_important_data"
     SEND_SECRET_EXTERNALLY = "send_secret_externally"
     DESTRUCTIVE_COMMAND = "destructive_command"
+    TASK_APPROVAL = "task_approval"
+    GIT_PUSH = "git_push"
+    GIT_REMOTE_CHANGE = "git_remote_change"
+    GITHUB_REPOSITORY_CREATE = "github_repository_create"
+    CONFIG_IMPORT = "config_import"
     BYPASS_PERMISSIONS = "bypass_permissions"
     EXPAND_OWN_PERMISSIONS = "expand_own_permissions"
     READ_OTHER_SECRETS = "read_other_secrets"
@@ -50,6 +55,39 @@ class Action(StrEnum):
     UNCONTROLLED_ROOT = "uncontrolled_root"
     HIDE_ACTIONS = "hide_actions"
 
+
+RISK_LEVELS: dict[Action, RiskLevel] = {
+    Action.READ_PROJECT: RiskLevel.LOW,
+    Action.ANALYZE_CODE: RiskLevel.LOW,
+    Action.RUN_LOCAL_TESTS: RiskLevel.LOW,
+    Action.RUN_BUILD: RiskLevel.LOW,
+    Action.EDIT_WORKTREE: RiskLevel.MEDIUM,
+    Action.CREATE_TEMP: RiskLevel.MEDIUM,
+    Action.APPLY_MERGE: RiskLevel.HIGH,
+    Action.ROLLBACK: RiskLevel.HIGH,
+    Action.CHANGE_ARCHITECTURE: RiskLevel.HIGH,
+    Action.CHANGE_PUBLIC_API: RiskLevel.HIGH,
+    Action.ADD_DEPENDENCY: RiskLevel.HIGH,
+    Action.INSTALL_SYSTEM_PACKAGE: RiskLevel.HIGH,
+    Action.CHANGE_SYSTEM_CONFIG: RiskLevel.HIGH,
+    Action.PRIVILEGED_OPERATION: RiskLevel.HIGH,
+    Action.CHANGE_DEFAULT_BRANCH: RiskLevel.HIGH,
+    Action.PUBLISH: RiskLevel.HIGH,
+    Action.GIT_PUSH: RiskLevel.HIGH,
+    Action.GIT_REMOTE_CHANGE: RiskLevel.HIGH,
+    Action.GITHUB_REPOSITORY_CREATE: RiskLevel.HIGH,
+    Action.CONFIG_IMPORT: RiskLevel.HIGH,
+    Action.DELETE_IMPORTANT_DATA: RiskLevel.HIGH,
+    Action.SEND_SECRET_EXTERNALLY: RiskLevel.HIGH,
+    Action.DESTRUCTIVE_COMMAND: RiskLevel.HIGH,
+    Action.TASK_APPROVAL: RiskLevel.HIGH,
+    Action.BYPASS_PERMISSIONS: RiskLevel.CRITICAL,
+    Action.EXPAND_OWN_PERMISSIONS: RiskLevel.CRITICAL,
+    Action.READ_OTHER_SECRETS: RiskLevel.CRITICAL,
+    Action.DISABLE_SECURITY: RiskLevel.CRITICAL,
+    Action.UNCONTROLLED_ROOT: RiskLevel.CRITICAL,
+    Action.HIDE_ACTIONS: RiskLevel.CRITICAL,
+}
 
 LEVELS: dict[Action, PermissionLevel] = {
     Action.READ_PROJECT: PermissionLevel.AUTO,
@@ -71,6 +109,11 @@ LEVELS: dict[Action, PermissionLevel] = {
     Action.DELETE_IMPORTANT_DATA: PermissionLevel.APPROVAL_REQUIRED,
     Action.SEND_SECRET_EXTERNALLY: PermissionLevel.APPROVAL_REQUIRED,
     Action.DESTRUCTIVE_COMMAND: PermissionLevel.APPROVAL_REQUIRED,
+    Action.TASK_APPROVAL: PermissionLevel.APPROVAL_REQUIRED,
+    Action.GIT_PUSH: PermissionLevel.APPROVAL_REQUIRED,
+    Action.GIT_REMOTE_CHANGE: PermissionLevel.APPROVAL_REQUIRED,
+    Action.GITHUB_REPOSITORY_CREATE: PermissionLevel.APPROVAL_REQUIRED,
+    Action.CONFIG_IMPORT: PermissionLevel.APPROVAL_REQUIRED,
     Action.BYPASS_PERMISSIONS: PermissionLevel.DENIED,
     Action.EXPAND_OWN_PERMISSIONS: PermissionLevel.DENIED,
     Action.READ_OTHER_SECRETS: PermissionLevel.DENIED,
@@ -85,6 +128,9 @@ class PermissionManager:
 
     def level(self, action: Action) -> PermissionLevel:
         return LEVELS.get(action, PermissionLevel.DENIED)
+
+    def risk(self, action: Action) -> RiskLevel:
+        return RISK_LEVELS.get(action, RiskLevel.CRITICAL)
 
     def require_auto(self, action: Action) -> None:
         level = self.level(action)

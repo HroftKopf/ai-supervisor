@@ -81,7 +81,9 @@ class WorkerManager:
             dsh_home=str(dsh_home),
         )
         await self.tasks.update_worker(worker_id, status="starting")
-        paths = self.workspace.sandbox_paths(worktree, dsh_home, state_dir)
+        paths = self.workspace.sandbox_paths(
+            worktree, dsh_home, state_dir, self.workspace.extra_read_paths(project)
+        )
         argv = self.sandbox.worker_argv(
             paths,
             session_id=session_id,
@@ -166,6 +168,7 @@ class WorkerManager:
                     "stdout_tail": stdout_tail,
                     "stderr_tail": stderr_tail,
                     "duration_seconds": duration,
+                    "usage": result.usage.model_copy(update={"duration_ms": int(duration * 1000)}),
                     "final_response": self.redactor.redact(result.final_response),
                     "error": self.redactor.redact(result.error) if result.error else None,
                 }

@@ -15,7 +15,7 @@ from ai_supervisor.config import Settings
 from ai_supervisor.core.interfaces import Attachment, IncomingMessage
 from ai_supervisor.core.orchestrator import Orchestrator
 from ai_supervisor.memory.projects import ProjectError, ProjectService
-from ai_supervisor.models import TaskRecord
+from ai_supervisor.models import ProjectPolicy, TaskRecord
 from ai_supervisor.telegram.auth import OwnerMiddleware
 from ai_supervisor.telegram.notifications import BotNotifier
 
@@ -26,9 +26,12 @@ HELP_TEXT = """AI Supervisor — команды
 /start — начать и показать состояние
 /help — эта справка
 /projects — список проектов
-/project — текущий проект; /project use|add|create|remove|test|build|instructions
+/project — текущий проект; /project list|select|add|create|remove|info|permissions|test|build|instructions
 /new — начать новый диалог
 /tasks — последние задачи
+/task <текст> — создать задачу без классификатора
+/task_info [id] — подробности задачи
+/queue — очередь и активные задачи
 /status [id] — состояние системы или задачи
 /agents — активные исполнители
 /logs [id] — журнал задачи
@@ -37,12 +40,19 @@ HELP_TEXT = """AI Supervisor — команды
 /approve [id] — подтвердить ожидающее действие
 /reject [id] — отклонить подтверждение
 /stop [id] — остановить задачу
+/cancel [id] — отменить задачу (алиас /stop)
+/pause [id] — безопасно приостановить
 /resume [id] — продолжить приостановленную задачу
+/retry [id] — повторить неудачную/заблокированную задачу
 /rollback [id] — откатить изменения задачи (с подтверждением)
+/push [id] — опубликовать завершённый Git-репозиторий (с подтверждением)
 /rework [id] — отправить ожидающую задачу на доработку
-/usage — расход токенов
+/usage [today|week|month|task <id>] — расход токенов
 /memory [query] — память; /memory add <текст>, /memory delete <id>
 /settings — настройки без секретов
+/doctor — быстрая диагностика
+/github info <owner/repo> — информация о репозитории
+/github create <name> [private|public] — создать репозиторий (с подтверждением)
 
 Можно писать обычным языком: Kimi сам решит, обсуждать идею или запускать работу.
 """
@@ -79,6 +89,9 @@ class Handlers:
         r.message.register(self.cmd_project, Command("project"))
         r.message.register(self.cmd_new, Command("new"))
         r.message.register(self.cmd_tasks, Command("tasks"))
+        r.message.register(self.cmd_task, Command("task"))
+        r.message.register(self.cmd_task_info, Command("task_info"))
+        r.message.register(self.cmd_queue, Command("queue"))
         r.message.register(self.cmd_status, Command("status"))
         r.message.register(self.cmd_agents, Command("agents"))
         r.message.register(self.cmd_logs, Command("logs"))
@@ -87,12 +100,18 @@ class Handlers:
         r.message.register(self.cmd_approve, Command("approve"))
         r.message.register(self.cmd_reject, Command("reject"))
         r.message.register(self.cmd_stop, Command("stop"))
+        r.message.register(self.cmd_cancel, Command("cancel"))
+        r.message.register(self.cmd_pause, Command("pause"))
         r.message.register(self.cmd_resume, Command("resume"))
+        r.message.register(self.cmd_retry, Command("retry"))
         r.message.register(self.cmd_rollback, Command("rollback"))
+        r.message.register(self.cmd_push, Command("push"))
         r.message.register(self.cmd_rework, Command("rework"))
         r.message.register(self.cmd_usage, Command("usage"))
         r.message.register(self.cmd_memory, Command("memory"))
         r.message.register(self.cmd_settings, Command("settings"))
+        r.message.register(self.cmd_doctor, Command("doctor"))
+        r.message.register(self.cmd_github, Command("github"))
         r.message.register(self.cmd_unknown, F.text.startswith("/"))
         r.message.register(self.on_document, F.document)
         r.message.register(self.on_photo, F.photo)
@@ -140,15 +159,30 @@ class Handlers:
         parts = text.split(maxsplit=1)
         sub = parts[0].lower()
         rest = parts[1] if len(parts) > 1 else ""
-        if sub == "use":
+        if sub in {"use", "select"}:
             await self._project_use(message.chat.id, rest)
+        elif sub == "list":
+            await self.cmd_projects(message)
         elif sub == "add":
             await self._project_add(message.chat.id, rest)
         elif sub == "create":
             await self._project_create(message.chat.id, rest)
         elif sub == "remove":
             await self._project_remove(message.chat.id, rest)
-        elif sub in {"test", "build", "instructions", "desc", "stack", "check"}:
+        elif sub in {
+            "test",
+            "build",
+            "instructions",
+            "desc",
+            "stack",
+            "check",
+            "permissions",
+            "remote",
+            "budget",
+            "max-rework",
+            "extra-read",
+            "permission",
+        }:
             await self._project_update(message.chat.id, sub, rest)
         else:
             await self.notifier.send_text(
@@ -170,6 +204,11 @@ class Handlers:
             f"Базовая ветка: {project.base_branch}\n"
             f"Тестовая команда: {project.test_command or '(не настроена)'}\n"
             f"Сборочная команда: {project.build_command or '(не настроена)'}\n"
+            f"Remote: {project.remote_url or '(не задан)'}\n"
+            f"Бюджет токенов: {project.token_budget or 'не задан'}\n"
+            f"Max rework: {project.max_rework}\n"
+            f"Доп. пути чтения: {project.extra_read_paths_json}\n"
+            f"Policy: {project.policy_json}\n"
             f"Инструкции: {project.instructions[:1000] or '(нет)'}",
         )
 
@@ -251,7 +290,58 @@ class Handlers:
                 await self.projects.validate_repository(Path(project.path))
                 await self.notifier.send_text(chat_id, "Проект доступен, Git-репозиторий валиден.")
                 return
-            if sub == "test":
+            if sub == "permissions":
+                await self.notifier.send_text(
+                    chat_id,
+                    f"Политика проекта {project.name}:\n{project.policy_json}\n"
+                    f"Remote: {project.remote_url or '(не задан)'}\n"
+                    f"Бюджет: {project.token_budget or 'не задан'}\n"
+                    f"Max rework: {project.max_rework}",
+                )
+                return
+            if sub == "remote":
+                updated = await self.projects.update_instructions(
+                    project.id, remote_url=rest.strip()
+                )
+            elif sub == "budget":
+                if not rest.strip().isdigit():
+                    raise ProjectError("бюджет должен быть числом токенов")
+                updated = await self.projects.update_instructions(
+                    project.id, token_budget=int(rest.strip())
+                )
+            elif sub == "max-rework":
+                if not rest.strip().isdigit():
+                    raise ProjectError("max-rework должен быть числом")
+                updated = await self.projects.update_instructions(
+                    project.id, max_rework=int(rest.strip())
+                )
+            elif sub == "extra-read":
+                paths = [item.strip() for item in rest.split(",") if item.strip()]
+                updated = await self.projects.update_instructions(
+                    project.id, extra_read_paths=paths
+                )
+            elif sub == "permission":
+                parts = rest.split()
+                if len(parts) != 2 or parts[1].lower() not in {"on", "off"}:
+                    raise ProjectError(
+                        "использование: /project permission <allow_git_push|allow_remote_change|"
+                        "allow_system_changes|allow_config_import> on|off"
+                    )
+                policy = ProjectPolicy.model_validate_json(project.policy_json)
+                key = parts[0]
+                if key not in {
+                    "allow_git_push",
+                    "allow_remote_change",
+                    "allow_system_changes",
+                    "allow_config_import",
+                }:
+                    raise ProjectError(f"неизвестная политика: {key}")
+                values = policy.model_dump()
+                values[key] = parts[1].lower() == "on"
+                updated = await self.projects.update_instructions(
+                    project.id, policy=ProjectPolicy.model_validate(values)
+                )
+            elif sub == "test":
                 updated = await self.projects.update_instructions(project.id, test_command=rest)
             elif sub == "build":
                 updated = await self.projects.update_instructions(project.id, build_command=rest)
@@ -261,7 +351,7 @@ class Handlers:
                 updated = await self.projects.update_instructions(project.id, description=rest)
             else:
                 updated = await self.projects.update_instructions(project.id, stack=rest)
-        except ProjectError as exc:
+        except (ProjectError, ValueError) as exc:
             await self.notifier.send_text(chat_id, f"Не удалось обновить проект: {exc}")
             return
         await self.notifier.send_text(chat_id, f"Проект {updated.name} обновлён.")
@@ -278,6 +368,23 @@ class Handlers:
     async def cmd_tasks(self, message: Message) -> None:
         await self.notifier.send_text(
             message.chat.id, await self.orchestrator.tasks_text(message.chat.id)
+        )
+
+    async def cmd_task(self, message: Message) -> None:
+        text = _command_tail(message.text or "")
+        if not text:
+            await self.notifier.send_text(message.chat.id, "Использование: /task <текст задачи>")
+            return
+        await self.orchestrator.create_task_from_text(message.chat.id, message.from_user.id, text)
+
+    async def cmd_task_info(self, message: Message) -> None:
+        task = await self._task_from_message(message)
+        if task:
+            await self.notifier.send_text(message.chat.id, self._task_details(task))
+
+    async def cmd_queue(self, message: Message) -> None:
+        await self.notifier.send_text(
+            message.chat.id, await self.orchestrator.queue_text(message.chat.id)
         )
 
     async def cmd_status(self, message: Message) -> None:
@@ -330,6 +437,30 @@ class Handlers:
         arg = _command_tail(message.text or "")
         await self.orchestrator.stop_latest_or(message.chat.id, int(arg) if arg.isdigit() else None)
 
+    async def cmd_cancel(self, message: Message) -> None:
+        await self.cmd_stop(message)
+
+    async def cmd_pause(self, message: Message) -> None:
+        arg = _command_tail(message.text or "")
+        if arg and not arg.isdigit():
+            await self.notifier.send_text(message.chat.id, "ID задачи должен быть числом.")
+            return
+        task = (
+            await self.orchestrator.tasks.get_optional(int(arg))
+            if arg.isdigit()
+            else await self.orchestrator.latest_task(message.chat.id)
+        )
+        if task is None:
+            await self.notifier.send_text(message.chat.id, "Задача не найдена.")
+            return
+        await self.orchestrator.pause_task(task.id, message.from_user.id, message.chat.id)
+
+    async def cmd_retry(self, message: Message) -> None:
+        arg = _command_tail(message.text or "")
+        await self.orchestrator.resume_by_id(
+            message.chat.id, int(arg) if arg.isdigit() else None, message.from_user.id
+        )
+
     async def cmd_resume(self, message: Message) -> None:
         arg = _command_tail(message.text or "")
         await self.orchestrator.resume_by_id(
@@ -341,14 +472,36 @@ class Handlers:
         if task:
             await self.orchestrator.request_rollback(task.id, message.from_user.id, message.chat.id)
 
+    async def cmd_push(self, message: Message) -> None:
+        task = await self._task_from_message(message)
+        if task:
+            await self.orchestrator.request_push(task.id, message.from_user.id, message.chat.id)
+
     async def cmd_rework(self, message: Message) -> None:
         task = await self._task_from_message(message)
         if task:
             await self.orchestrator.rework_task(task.id, message.from_user.id, message.chat.id)
 
     async def cmd_usage(self, message: Message) -> None:
+        arg = _command_tail(message.text or "").strip().lower()
+        task_id = None
+        period = "today"
+        if arg.startswith("task "):
+            value = arg.split(maxsplit=1)[1]
+            if not value.isdigit():
+                await self.notifier.send_text(message.chat.id, "Использование: /usage task <id>")
+                return
+            task_id = int(value)
+        elif arg in {"week", "month", "today"}:
+            period = arg
+        elif arg:
+            await self.notifier.send_text(
+                message.chat.id, "Использование: /usage [today|week|month|task <id>]"
+            )
+            return
         await self.notifier.send_text(
-            message.chat.id, await self.orchestrator.usage_text(message.chat.id)
+            message.chat.id,
+            await self.orchestrator.usage_text(message.chat.id, period, task_id),
         )
 
     async def cmd_memory(self, message: Message) -> None:
@@ -380,6 +533,33 @@ class Handlers:
             return
         await self.notifier.send_text(
             message.chat.id, await self.orchestrator.memory_text(message.chat.id, arg)
+        )
+
+    async def cmd_doctor(self, message: Message) -> None:
+        await self.notifier.send_text(
+            message.chat.id, await self.orchestrator.doctor_text(message.chat.id)
+        )
+
+    async def cmd_github(self, message: Message) -> None:
+        arg = _command_tail(message.text or "").strip()
+        parts = arg.split()
+        if len(parts) >= 3 and parts[0].lower() == "info":
+            await self.orchestrator.github_info(message.chat.id, parts[1], parts[2])
+            return
+        if len(parts) >= 2 and parts[0].lower() == "create":
+            visibility = parts[2].lower() if len(parts) > 2 else "private"
+            if visibility not in {"private", "public"}:
+                await self.notifier.send_text(
+                    message.chat.id, "Видимость должна быть private или public."
+                )
+                return
+            await self.orchestrator.request_github_create(
+                parts[1], visibility == "private", message.from_user.id, message.chat.id
+            )
+            return
+        await self.notifier.send_text(
+            message.chat.id,
+            "Использование: /github info <owner/repo> | /github create <name> [private|public]",
         )
 
     async def cmd_settings(self, message: Message) -> None:
@@ -520,6 +700,8 @@ class Handlers:
                 await self.orchestrator.send_logs(task_id, chat_id)
             elif action == "rb" and task_id is not None:
                 await self.orchestrator.request_rollback(task_id, user_id, chat_id)
+            elif action == "push" and task_id is not None:
+                await self.orchestrator.request_push(task_id, user_id, chat_id)
             elif action == "stop" and task_id is not None:
                 await self.orchestrator.stop_task(task_id, chat_id)
             elif action == "res" and task_id is not None:

@@ -118,3 +118,36 @@ async def test_repository_with_tracked_secret_is_rejected(
     service = ProjectService(database, settings)
     with pytest.raises(ProjectError):
         await service.add("with-secret", str(root))
+
+
+@pytest.mark.asyncio
+async def test_project_settings_and_remote_validation(database, settings, repo, project) -> None:
+    from ai_supervisor.models import ProjectPolicy
+
+    service = ProjectService(database, settings)
+    extra = repo / "README.md"
+    project = await service.update_instructions(
+        project.id,
+        remote_url="https://github.com/owner/repo",
+        token_budget=12345,
+        max_rework=4,
+        extra_read_paths=[str(extra)],
+        policy=ProjectPolicy(allow_git_push=True, max_rework=4),
+    )
+    assert project.remote_url == "https://github.com/owner/repo"
+    assert project.token_budget == 12345
+    assert project.max_rework == 4
+    assert "allow_git_push" in project.policy_json
+    assert str(extra) in project.extra_read_paths_json
+    with pytest.raises(ProjectError):
+        await service.update_instructions(project.id, remote_url="https://github.com/owner")
+    with pytest.raises(ProjectError):
+        await service.update_instructions(project.id, remote_url="https://user:pass@github.com/a/b")
+
+
+def test_unknown_top_level_config_section_is_rejected(monkeypatch, tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text("[app]\ndata_dir='var'\n[unknown]\nvalue=1\n", encoding="utf-8")
+    # A minimal config plus an unknown section must fail before defaults apply.
+    with pytest.raises(ConfigError):
+        load_settings(config_path=config, env_path=tmp_path / ".env", check_env_permissions=False)

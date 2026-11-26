@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -10,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def iso_now() -> str:
@@ -42,6 +43,12 @@ CREATE TABLE IF NOT EXISTS projects (
     base_branch TEXT NOT NULL DEFAULT 'main',
     test_command TEXT,
     build_command TEXT,
+    remote_url TEXT,
+    permissions_json TEXT NOT NULL DEFAULT '{}',
+    extra_read_paths_json TEXT NOT NULL DEFAULT '[]',
+    token_budget INTEGER NOT NULL DEFAULT 0,
+    max_rework INTEGER NOT NULL DEFAULT 3,
+    policy_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -87,6 +94,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     conversation_id INTEGER NOT NULL REFERENCES conversations(id),
     title TEXT NOT NULL,
     status TEXT NOT NULL,
+    task_type TEXT NOT NULL DEFAULT 'modify',
+    parent_task_id INTEGER,
     spec_json TEXT NOT NULL DEFAULT '{}',
     worker_name TEXT,
     worktree_path TEXT,
@@ -96,6 +105,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     head_commit TEXT,
     rework_count INTEGER NOT NULL DEFAULT 0,
     max_rework INTEGER NOT NULL DEFAULT 3,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    stalled_count INTEGER NOT NULL DEFAULT 0,
+    progress_hash TEXT,
+    blocked_reason TEXT,
     review_json TEXT,
     evidence_json TEXT,
     report TEXT,
@@ -120,6 +133,10 @@ CREATE TABLE IF NOT EXISTS task_events (
     event_type TEXT NOT NULL,
     message TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
+    agent TEXT,
+    stage_id INTEGER,
+    duration_ms INTEGER,
+    error_category TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -176,6 +193,10 @@ CREATE TABLE IF NOT EXISTS usage_events (
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     reasoning_tokens INTEGER NOT NULL DEFAULT 0,
     requests INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    error_category TEXT,
+    cost REAL,
+    currency TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -261,18 +282,78 @@ class Database:
         await conn.execute("PRAGMA foreign_keys=ON")
         await conn.execute("PRAGMA busy_timeout=5000")
         await conn.executescript(SCHEMA)
+        await self._migrate(conn)
         try:
             await conn.executescript(FTS_SCHEMA)
             self.fts_available = True
         except aiosqlite.OperationalError:
             self.fts_available = False
-        await conn.execute(
-            "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (str(SCHEMA_VERSION),),
-        )
         await conn.commit()
         self._connection = conn
+
+    async def _migrate(self, conn: aiosqlite.Connection) -> None:
+        row = await (
+            await conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'")
+        ).fetchone()
+        current = int(row[0]) if row else 1
+        if current > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema version {current} is newer than supported {SCHEMA_VERSION}; "
+                "refusing to downgrade it"
+            )
+        if current == SCHEMA_VERSION:
+            return
+        if self.path.exists() and self.path.stat().st_size > 0:
+            await asyncio.to_thread(_backup_before_migration, self.path)
+        additions = {
+            "projects": {
+                "remote_url": "TEXT",
+                "permissions_json": "TEXT NOT NULL DEFAULT '{}'",
+                "extra_read_paths_json": "TEXT NOT NULL DEFAULT '[]'",
+                "token_budget": "INTEGER NOT NULL DEFAULT 0",
+                "max_rework": "INTEGER NOT NULL DEFAULT 3",
+                "policy_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+            "tasks": {
+                "task_type": "TEXT NOT NULL DEFAULT 'modify'",
+                "parent_task_id": "INTEGER",
+                "attempts": "INTEGER NOT NULL DEFAULT 0",
+                "stalled_count": "INTEGER NOT NULL DEFAULT 0",
+                "progress_hash": "TEXT",
+                "blocked_reason": "TEXT",
+            },
+            "task_events": {
+                "agent": "TEXT",
+                "stage_id": "INTEGER",
+                "duration_ms": "INTEGER",
+                "error_category": "TEXT",
+            },
+            "usage_events": {
+                "duration_ms": "INTEGER NOT NULL DEFAULT 0",
+                "error_category": "TEXT",
+                "cost": "REAL",
+                "currency": "TEXT",
+            },
+        }
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            for table, columns in additions.items():
+                existing = {
+                    str(r["name"])
+                    for r in await (await conn.execute(f"PRAGMA table_info({table})")).fetchall()
+                }
+                for name, definition in columns.items():
+                    if name not in existing:
+                        await conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+            await conn.execute(
+                "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(SCHEMA_VERSION),),
+            )
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
 
     async def close(self) -> None:
         if self._connection is not None:
@@ -333,3 +414,21 @@ def row_to_dict(row: aiosqlite.Row | None) -> dict[str, Any] | None:
 
 def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _backup_before_migration(path: Path) -> Path:
+    backup_dir = path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = (
+        backup_dir
+        / f"pre-migration-v{SCHEMA_VERSION}-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.db"
+    )
+    source = sqlite3.connect(path)
+    destination = sqlite3.connect(target)
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+    target.chmod(0o600)
+    return target

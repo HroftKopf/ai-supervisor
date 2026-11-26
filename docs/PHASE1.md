@@ -97,7 +97,10 @@
 
 ## Следующий этап
 
-Phase 2: egress proxy, автодетект тестов, live E2E, усиление review и memory.
+Phase 2 core реализован: task types, contract v2, новые статусы, type-aware validation,
+структурное ревью, progress detection, migrations, approvals, Git push, per-model usage.
+Остальное (egress proxy, COMPOSITE/DAG, routing, GitHub API, system/external executor) —
+см. [PHASE2.md](PHASE2.md).
 Phase 3: multi-agent, DAG, integration branch.
 Phase 4: расширенные инструменты.
 Phase 5: production/backup/VPS split.

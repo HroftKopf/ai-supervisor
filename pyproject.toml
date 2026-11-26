@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 license = "MIT"
 authors = [{ name = "AI Supervisor" }]
 dependencies = [
+  "aiohttp>=3.9,<4",
   "aiogram>=3.30,<4",
   "aiosqlite>=0.21,<1",
   "deepseek-harness-sdk==0.2.2rc2",

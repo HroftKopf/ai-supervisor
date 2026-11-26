@@ -247,6 +247,11 @@ class Doctor:
         except ConfigError as exc:
             self.fail(".env permissions", str(exc))
 
+        if s.github_token:
+            self.ok("GitHub API", "GITHUB_TOKEN configured")
+        else:
+            self.warn("GitHub API", "GITHUB_TOKEN optional and not configured; /github is disabled")
+
         if s.kimi_key:
             from ai_supervisor.core.redaction import SecretRedactor
             from ai_supervisor.providers.kimi import KimiClient, KimiClientConfig

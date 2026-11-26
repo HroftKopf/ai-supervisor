@@ -15,7 +15,7 @@ from ai_supervisor.core.worker_manager import WorkerManager
 from ai_supervisor.core.workspace import WorkspaceManager
 from ai_supervisor.memory.conversations import ConversationService
 from ai_supervisor.memory.tasks import TaskService
-from ai_supervisor.models import TaskStatus, TokenUsage
+from ai_supervisor.models import TaskStatus
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("AI_SUPERVISOR_RUN_INTEGRATION") != "1" or shutil.which("bwrap") is None,
@@ -110,12 +110,11 @@ async def test_real_dsh_worker_in_bwrap(monkeypatch, settings, repo, database, p
         assert result.final_response
         assert result.usage.input_tokens >= 42
         assert result.usage.requests >= 1
-        assert result.usage == TokenUsage(
-            input_tokens=42,
-            output_tokens=7,
-            cached_tokens=3,
-            requests=1,
-        )
+        assert result.usage.input_tokens == 42
+        assert result.usage.output_tokens == 7
+        assert result.usage.cached_tokens == 3
+        assert result.usage.requests == 1
+        assert result.usage.duration_ms >= 1
     finally:
         await runner.cleanup()
 

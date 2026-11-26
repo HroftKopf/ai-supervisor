@@ -3,12 +3,13 @@ from __future__ import annotations
 import re
 import shlex
 from pathlib import Path
+from urllib.parse import urlparse
 
 from ai_supervisor.config import Settings
 from ai_supervisor.core.git_utils import git, git_toplevel, is_git_repository
 from ai_supervisor.core.redaction import SecretRedactor
 from ai_supervisor.memory.database import Database, iso_now, row_to_dict
-from ai_supervisor.models import ProjectRecord
+from ai_supervisor.models import ProjectPolicy, ProjectRecord
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 DANGEROUS_COMMANDS = {"rm", "shutdown", "reboot", "poweroff", "mkfs", "dd"}
@@ -78,6 +79,11 @@ class ProjectService:
         base_branch: str | None = None,
         test_command: str | None = None,
         build_command: str | None = None,
+        remote_url: str | None = None,
+        token_budget: int = 0,
+        max_rework: int = 3,
+        policy: ProjectPolicy | None = None,
+        extra_read_paths: list[str] | None = None,
     ) -> ProjectRecord:
         clean_name = self.validate_name(name)
         path = self.resolve_allowed_path(raw_path)
@@ -100,12 +106,19 @@ class ProjectService:
         ensure_safe_command(build_command)
         self._reject_command_secrets(test_command)
         self._reject_command_secrets(build_command)
+        remote = validate_remote_url(remote_url) if remote_url else None
+        if token_budget < 0 or max_rework < 0:
+            raise ProjectError("token_budget/max_rework must be non-negative")
+        policy = policy or ProjectPolicy(max_rework=max_rework, token_budget=token_budget)
+        extra = validate_extra_read_paths(extra_read_paths or [])
         now = iso_now()
         cursor = await self.db.execute(
             """
             INSERT INTO projects(name, path, description, stack, instructions, base_branch,
-                                 test_command, build_command, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 test_command, build_command, remote_url, permissions_json,
+                                 extra_read_paths_json, token_budget, max_rework, policy_json,
+                                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 clean_name,
@@ -116,6 +129,12 @@ class ProjectService:
                 branch,
                 test_command.strip() if test_command else None,
                 build_command.strip() if build_command else None,
+                remote,
+                "{}",
+                __import__("json").dumps(extra),
+                token_budget,
+                max_rework,
+                policy.model_dump_json(),
                 now,
                 now,
             ),
@@ -170,15 +189,31 @@ class ProjectService:
                 timeout_seconds=30,
             )
         except Exception:
-            # Do not leave a half-created unregistered project silently.
+            # The directory was created by us and is not yet registered; avoid a
+            # half-initialized project that looks usable.
+            import shutil
+
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                pass
             raise
-        return await self.add(
-            clean_name,
-            str(path),
-            description=description,
-            stack=stack,
-            instructions=self.redactor.redact(instructions),
-        )
+        try:
+            return await self.add(
+                clean_name,
+                str(path),
+                description=description,
+                stack=stack,
+                instructions=self.redactor.redact(instructions),
+            )
+        except Exception:
+            import shutil
+
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                pass
+            raise
 
     async def get(self, project_id: int) -> ProjectRecord | None:
         row = await self.db.fetchone("SELECT * FROM projects WHERE id = ?", (project_id,))
@@ -206,6 +241,11 @@ class ProjectService:
         test_command: str | None = None,
         build_command: str | None = None,
         base_branch: str | None = None,
+        remote_url: str | None = None,
+        token_budget: int | None = None,
+        max_rework: int | None = None,
+        policy: ProjectPolicy | None = None,
+        extra_read_paths: list[str] | None = None,
     ) -> ProjectRecord:
         project = await self.get(project_id)
         if project is None:
@@ -218,7 +258,11 @@ class ProjectService:
             self._reject_command_secrets(build_command)
         if base_branch is not None:
             await self._check_branch(Path(project.path), base_branch)
-        fields: dict[str, str | None] = {}
+        if token_budget is not None and token_budget < 0:
+            raise ProjectError("token_budget must be non-negative")
+        if max_rework is not None and max_rework < 0:
+            raise ProjectError("max_rework must be non-negative")
+        fields: dict[str, str | int | None] = {}
         for key, value in {
             "instructions": instructions,
             "description": description,
@@ -226,13 +270,23 @@ class ProjectService:
             "test_command": test_command,
             "build_command": build_command,
             "base_branch": base_branch,
+            "token_budget": token_budget,
+            "max_rework": max_rework,
         }.items():
             if value is not None:
                 fields[key] = (
-                    self.redactor.redact(value.strip())
+                    self.redactor.redact(str(value).strip())
                     if key in {"instructions", "description", "stack"}
-                    else value.strip()
+                    else value
                 )
+        if remote_url is not None:
+            fields["remote_url"] = validate_remote_url(remote_url) if remote_url.strip() else None
+        if policy is not None:
+            fields["policy_json"] = policy.model_dump_json()
+        if extra_read_paths is not None:
+            fields["extra_read_paths_json"] = __import__("json").dumps(
+                validate_extra_read_paths(extra_read_paths)
+            )
         if not fields:
             return project
         fields["updated_at"] = iso_now()
@@ -314,3 +368,53 @@ def ensure_safe_command(command: str | None) -> None:
             )
         if arg.startswith("/etc/") or arg.startswith("/boot/"):
             raise ProjectError("команда проверки не должна изменять системные пути")
+
+
+def validate_remote_url(url: str) -> str:
+    """Validate a repository URL, never a GitHub profile URL."""
+    value = url.strip()
+    if not value:
+        raise ProjectError("remote URL is empty")
+    if value.startswith("/"):
+        if Path(value).is_absolute():
+            return value
+        raise ProjectError("local remote must be an absolute path")
+    if value.startswith("git@"):
+        host, _, path = value.partition(":")
+        parts = [part for part in path.strip("/").split("/") if part]
+        if host != "git@github.com" or len(parts) != 2:
+            raise ProjectError("remote must identify an owner/repository, not a GitHub profile")
+        return value
+    parsed = urlparse(value)
+    if parsed.scheme == "file":
+        if not parsed.path or not Path(parsed.path).is_absolute():
+            raise ProjectError("file remote must use an absolute path")
+        return value
+    if parsed.scheme not in {"https", "http", "ssh"} or not parsed.hostname:
+        raise ProjectError("remote URL must use https/ssh and include a host")
+    if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise ProjectError("http remotes are allowed only for localhost")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ProjectError("remote URL must not embed credentials, query or fragment")
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(parts) < 2:
+        raise ProjectError("remote URL must identify an owner/repository, not a profile")
+    return value
+
+
+def validate_extra_read_paths(paths: list[str]) -> list[str]:
+    result: list[str] = []
+    for raw in paths:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            raise ProjectError(f"extra read path must be absolute: {raw}")
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise ProjectError(f"extra read path does not exist: {raw}") from exc
+        if resolved == Path("/") or resolved == Path.home():
+            raise ProjectError(f"refusing over-broad extra read path: {resolved}")
+        if not (resolved.is_file() or resolved.is_dir()):
+            raise ProjectError(f"invalid extra read path: {resolved}")
+        result.append(str(resolved))
+    return result

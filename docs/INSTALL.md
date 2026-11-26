@@ -49,6 +49,8 @@ KIMI_MODEL=k3.1-pro
 DEEPSEEK_API_KEY=...
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_OWNER_ID=123456789
+# Optional: GitHub repo info/create
+GITHUB_TOKEN=
 ```
 
 `DEEPSEEK_BASE_URL` оставьте пустым для официального endpoint SDK. Если задаёте свой,
@@ -73,6 +75,12 @@ TELEGRAM_OWNER_ID=123456789
 
 Бот использует long polling. Порты, домен, HTTPS-сертификат и публичный IP не нужны.
 Работает только private chat владельца.
+
+## 4.1. Обновление с Phase 1
+
+При первом запуске новой версии `Database` сделает backup
+`var/backups/pre-migration-v2-*.db` и обновит схему v1→v2. Старые задачи сохраняются.
+Перед обновлением можно дополнительно выполнить `scripts/backup.sh`.
 
 ## 5. systemd user service
 
@@ -118,8 +126,17 @@ ai-supervisor doctor
 секретные файлы. Затем:
 
 ```text
+Проведи аудит README без изменений.
+```
+
+READ_ONLY-задача должна завершиться без diff. Для изменения:
+
+```text
 Добавь в README раздел «Установка» и проверь тесты.
 ```
+
+Команды Phase 2: `/task`, `/task_info`, `/queue`, `/pause`, `/retry`, `/doctor`, `/push`,
+`/usage week`, `/project permissions`.
 
 После отчёта используйте кнопки или:
 

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -214,11 +215,15 @@ class KimiClient:
 
         attempts = self.config.max_retries + 1
         last_error: Exception | None = None
+        started = time.monotonic()
         for attempt in range(1, attempts + 1):
             try:
                 async with self._semaphore:
                     response = await self._stream_once(kwargs, purpose=purpose)
-                return response
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                return response.model_copy(
+                    update={"usage": response.usage.model_copy(update={"duration_ms": elapsed_ms})}
+                )
             except KimiQuotaError:
                 raise
             except (KimiRateLimitError, KimiConnectionError) as exc:

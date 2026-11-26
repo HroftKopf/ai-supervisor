@@ -19,9 +19,13 @@ ACTIVE_TASK_STATUSES = (
     TaskStatus.PLANNING.value,
     TaskStatus.QUEUED.value,
     TaskStatus.RUNNING.value,
+    TaskStatus.VALIDATING.value,
     TaskStatus.REVIEWING.value,
     TaskStatus.REWORK.value,
     TaskStatus.WAITING_APPROVAL.value,
+    TaskStatus.WAITING_INPUT.value,
+    TaskStatus.RETRY_WAIT.value,
+    TaskStatus.BLOCKED.value,
     TaskStatus.PAUSED.value,
     TaskStatus.INTERRUPTED.value,
 )
@@ -33,6 +37,7 @@ INTERRUPTIBLE_TASK_STATUSES = (
     TaskStatus.PLANNING.value,
     TaskStatus.QUEUED.value,
     TaskStatus.RUNNING.value,
+    TaskStatus.VALIDATING.value,
     TaskStatus.REVIEWING.value,
     TaskStatus.REWORK.value,
 )
@@ -144,13 +149,24 @@ class TaskService:
             )
             finished_at = (
                 "COALESCE(finished_at, ?)"
-                if new_status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+                if new_status
+                in {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.PARTIALLY_COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                }
                 else "finished_at"
             )
             params: list[Any] = [new_status.value, now]
             if new_status == TaskStatus.RUNNING:
                 params.append(now)
-            if new_status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            if new_status in {
+                TaskStatus.COMPLETED,
+                TaskStatus.PARTIALLY_COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            }:
                 params.append(now)
             params.extend([task_id, current.value])
             cursor = await conn.execute(
@@ -173,6 +189,8 @@ class TaskService:
     async def update_fields(self, task_id: int, **fields: Any) -> TaskRecord:
         allowed = {
             "title",
+            "task_type",
+            "parent_task_id",
             "spec_json",
             "worker_name",
             "worktree_path",
@@ -181,6 +199,10 @@ class TaskService:
             "base_commit",
             "head_commit",
             "rework_count",
+            "attempts",
+            "stalled_count",
+            "progress_hash",
+            "blocked_reason",
             "review_json",
             "evidence_json",
             "report",
@@ -206,8 +228,15 @@ class TaskService:
 
     async def save_spec(self, task_id: int, spec: Any) -> TaskRecord:
         payload = spec.model_dump() if hasattr(spec, "model_dump") else spec
+        task_type = payload.get("task_type", "modify")
+        if hasattr(task_type, "value"):
+            task_type = task_type.value
         return await self.update_fields(
-            task_id, title=payload.get("title", "Задача")[:120], spec_json=json_dumps(payload)
+            task_id,
+            title=payload.get("title", "Задача")[:120],
+            task_type=task_type,
+            parent_task_id=payload.get("parent_task_id"),
+            spec_json=json_dumps(payload),
         )
 
     async def reset_started_at(self, task_id: int) -> None:
@@ -223,14 +252,34 @@ class TaskService:
         await self.update_fields(task_id, cancel_requested=False)
 
     async def add_event(
-        self, task_id: int, event_type: str, message: str, payload: dict[str, Any] | None = None
+        self,
+        task_id: int,
+        event_type: str,
+        message: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        agent: str | None = None,
+        stage_id: int | None = None,
+        duration_ms: int | None = None,
+        error_category: str | None = None,
     ) -> None:
         await self.db.execute(
             """
-            INSERT INTO task_events(task_id, event_type, message, payload_json, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO task_events(task_id, event_type, message, payload_json, agent,
+                                    stage_id, duration_ms, error_category, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, event_type, message[:8000], json_dumps(payload or {}), iso_now()),
+            (
+                task_id,
+                event_type,
+                message[:8000],
+                json_dumps(payload or {}),
+                agent,
+                stage_id,
+                duration_ms,
+                error_category,
+                iso_now(),
+            ),
         )
 
     async def events(self, task_id: int, limit: int = 200) -> list[dict[str, Any]]:

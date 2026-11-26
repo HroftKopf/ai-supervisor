@@ -72,6 +72,24 @@ class TelegramSection(BaseModel):
     max_message_chars: int = Field(default=4000, ge=500, le=4096)
 
 
+class GitHubSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    api_url: str = "https://api.github.com"
+    timeout_seconds: float = Field(default=30.0, gt=0, le=180)
+    default_private: bool = True
+
+    @model_validator(mode="after")
+    def _valid_api_url(self) -> GitHubSection:
+        parsed = urlparse(self.api_url)
+        if parsed.scheme not in {"https", "http"} or not parsed.hostname:
+            raise ValueError("github.api_url must be an absolute http(s) URL")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("github.api_url must not contain credentials/query/fragment")
+        if parsed.scheme != "https" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("github.api_url must use https outside localhost")
+        return self
+
+
 class SecuritySection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     allowed_project_roots: list[str] = Field(
@@ -147,16 +165,40 @@ class MemorySection(BaseModel):
     max_search_results: int = Field(default=20, ge=1, le=100)
 
 
-class UsageSection(BaseModel):
+class ModelPrice(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kimi_input: float = Field(default=0.0, ge=0)
-    kimi_output: float = Field(default=0.0, ge=0)
-    deepseek_input: float = Field(default=0.0, ge=0)
-    deepseek_output: float = Field(default=0.0, ge=0)
+    input_per_mtok: float = Field(default=0.0, ge=0)
+    output_per_mtok: float = Field(default=0.0, ge=0)
+    cache_read_per_mtok: float = Field(default=0.0, ge=0)
+    cache_write_per_mtok: float = Field(default=0.0, ge=0)
+    currency: str = "USD"
 
     @property
     def configured(self) -> bool:
         return any(
+            value > 0
+            for value in (
+                self.input_per_mtok,
+                self.output_per_mtok,
+                self.cache_read_per_mtok,
+                self.cache_write_per_mtok,
+            )
+        )
+
+
+class UsageSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # Legacy flat prices remain supported.
+    kimi_input: float = Field(default=0.0, ge=0)
+    kimi_output: float = Field(default=0.0, ge=0)
+    deepseek_input: float = Field(default=0.0, ge=0)
+    deepseek_output: float = Field(default=0.0, ge=0)
+    currency: str = "USD"
+    prices: dict[str, ModelPrice] = Field(default_factory=dict)
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.prices) or any(
             value > 0
             for value in (
                 self.kimi_input,
@@ -166,12 +208,31 @@ class UsageSection(BaseModel):
             )
         )
 
+    def price_for(self, provider: str, model: str) -> ModelPrice | None:
+        for key in (f"{provider}/{model}", f"{provider}:{model}", model):
+            if key in self.prices:
+                return self.prices[key]
+        if provider == "kimi" and (self.kimi_input or self.kimi_output):
+            return ModelPrice(
+                input_per_mtok=self.kimi_input,
+                output_per_mtok=self.kimi_output,
+                currency=self.currency,
+            )
+        if provider == "deepseek" and (self.deepseek_input or self.deepseek_output):
+            return ModelPrice(
+                input_per_mtok=self.deepseek_input,
+                output_per_mtok=self.deepseek_output,
+                currency=self.currency,
+            )
+        return None
+
 
 class Secrets(BaseModel):
     model_config = ConfigDict(extra="ignore")
     kimi_api_key: SecretStr = SecretStr("")
     deepseek_api_key: SecretStr = SecretStr("")
     telegram_bot_token: SecretStr = SecretStr("")
+    github_token: SecretStr = SecretStr("")
     telegram_owner_id: int | None = None
 
     def missing(self) -> list[str]:
@@ -197,6 +258,7 @@ class Settings(BaseModel):
     kimi: KimiSection
     telegram: TelegramSection
     security: SecuritySection
+    github: GitHubSection
     limits: LimitsSection
     deepseek: DeepSeekSection
     sandbox: SandboxSection
@@ -292,6 +354,10 @@ class Settings(BaseModel):
         return self.secrets.kimi_api_key.get_secret_value().strip()
 
     @property
+    def github_token(self) -> str:
+        return self.secrets.github_token.get_secret_value().strip()
+
+    @property
     def telegram_token(self) -> str:
         return self.secrets.telegram_bot_token.get_secret_value().strip()
 
@@ -355,6 +421,10 @@ class Settings(BaseModel):
             "telegram": {
                 "owner_id": self.secrets.telegram_owner_id,
                 "private_chat_only": self.telegram.private_chat_only,
+            },
+            "github": {
+                "default_private": self.github.default_private,
+                "configured": bool(self.github_token),
             },
             "limits": self.limits.model_dump(),
             "sandbox": self.sandbox.model_dump(),
@@ -455,7 +525,29 @@ def load_settings(
         deepseek_api_key=SecretStr(os.environ.get("DEEPSEEK_API_KEY", "").strip()),
         telegram_bot_token=SecretStr(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()),
         telegram_owner_id=owner_id,
+        github_token=SecretStr(
+            (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+        ),
     )
+
+    allowed_top_level = {
+        "app",
+        "kimi",
+        "telegram",
+        "security",
+        "limits",
+        "deepseek",
+        "sandbox",
+        "git",
+        "github",
+        "memory",
+        "usage",
+    }
+    unknown_sections = set(raw) - allowed_top_level
+    if unknown_sections:
+        raise ConfigError(
+            "unknown top-level config section(s): " + ", ".join(sorted(unknown_sections))
+        )
 
     try:
         settings = Settings(
@@ -466,6 +558,7 @@ def load_settings(
             kimi=KimiSection.model_validate(kimi),
             telegram=TelegramSection.model_validate(raw.get("telegram", {})),
             security=SecuritySection.model_validate(raw.get("security", {})),
+            github=GitHubSection.model_validate(raw.get("github", {})),
             limits=LimitsSection.model_validate(raw.get("limits", {})),
             deepseek=DeepSeekSection.model_validate(deepseek),
             sandbox=SandboxSection.model_validate(raw.get("sandbox", {})),

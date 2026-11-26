@@ -42,6 +42,7 @@ class SandboxPaths:
     state_dir: Path
     git_common_dir: Path | None = None
     git_worktree_name: str | None = None
+    readonly_roots: tuple[Path, ...] = ()
 
 
 @dataclass(slots=True)
@@ -300,6 +301,15 @@ class BwrapSandbox:
             self._append_etc_file(args, rel)
         for rel in ETC_DIRS:
             self._append_etc_dir(args, rel)
+        for readonly in paths.readonly_roots:
+            # Never shadow writable task paths with a read-only parent mount.
+            if any(
+                target == readonly or target.is_relative_to(readonly)
+                for target in (paths.worktree, paths.dsh_home, paths.state_dir)
+            ):
+                continue
+            # Mount only the explicitly allowed path, at its real absolute path.
+            args.extend(["--ro-bind", str(readonly), str(readonly)])
         if paths.git_common_dir is not None:
             args.extend(["--ro-bind", str(paths.git_common_dir), "/repo-git"])
             sanitized = _sanitized_git_config(paths.git_common_dir, paths.state_dir)

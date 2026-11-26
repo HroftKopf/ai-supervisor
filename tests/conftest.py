@@ -42,6 +42,7 @@ class FakeSupervisor:
     def __init__(self) -> None:
         self.intent = IntentKind.TASK
         self.review_verdict = ReviewVerdict.ACCEPT
+        self.review_sequence: list[ReviewVerdict] = []
         self.chat_response = "Привет! Это ответ Kimi."
         self.plan_spec = TaskSpec(
             title="Append line",
@@ -66,14 +67,15 @@ class FakeSupervisor:
         return self.plan_spec, TokenUsage(input_tokens=10, output_tokens=5, requests=1)
 
     async def review(self, **_: object) -> tuple[ReviewResult, TokenUsage]:
-        if self.review_verdict is ReviewVerdict.ACCEPT:
+        verdict = self.review_sequence.pop(0) if self.review_sequence else self.review_verdict
+        if verdict is ReviewVerdict.ACCEPT:
             result = ReviewResult(
                 verdict=ReviewVerdict.ACCEPT,
                 summary="diff соответствует ТЗ",
                 issues=[],
                 required_changes=[],
             )
-        elif self.review_verdict is ReviewVerdict.REWORK:
+        elif verdict is ReviewVerdict.REWORK:
             result = ReviewResult(
                 verdict=ReviewVerdict.REWORK,
                 summary="нужна доработка",
@@ -106,6 +108,7 @@ class FakeSupervisor:
 class FakeWorkers:
     def __init__(self) -> None:
         self.write_content: str | None = "verified line\n"
+        self.write_sequence: list[str | None] | None = None
         self.calls = 0
         self.started = asyncio.Event()
         self.block = False
@@ -126,11 +129,12 @@ class FakeWorkers:
         self.started.set()
         if self.block:
             await asyncio.Event().wait()
-        if self.write_content is not None:
+        content = self.write_sequence.pop(0) if self.write_sequence else self.write_content
+        if content is not None:
             worktree = Path(task.worktree_path or "")
             readme = worktree / "README.md"
             with readme.open("a", encoding="utf-8") as handle:
-                handle.write(self.write_content)
+                handle.write(content)
         return WorkerResult(
             session_id=task.session_id or "session-fake",
             final_response="готово",

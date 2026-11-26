@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 from collections.abc import Callable, Coroutine
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ai_supervisor.agents.supervisor import SupervisorAgent, SupervisorError
 from ai_supervisor.config import Settings
 from ai_supervisor.core.context import ContextError, ProjectContextBuilder
+from ai_supervisor.core.git_ops import GitOpsError, push_branch, remote_url, verify_remote_branch
+from ai_supervisor.core.github import GitHubClient, GitHubError
 from ai_supervisor.core.interfaces import Button, IncomingMessage, Notifier
 from ai_supervisor.core.permissions import (
     Action,
@@ -26,7 +30,7 @@ from ai_supervisor.core.usage import LimitExceeded, UsageService
 from ai_supervisor.core.worker_manager import WorkerError, WorkerManager, WorkerScheduler
 from ai_supervisor.core.workspace import WorkspaceError, WorkspaceManager
 from ai_supervisor.memory.conversations import ConversationService
-from ai_supervisor.memory.projects import ProjectError, ProjectService
+from ai_supervisor.memory.projects import ProjectError, ProjectService, validate_remote_url
 from ai_supervisor.memory.tasks import TaskError, TaskService
 from ai_supervisor.models import (
     Evidence,
@@ -34,9 +38,11 @@ from ai_supervisor.models import (
     ProjectRecord,
     ReviewResult,
     ReviewVerdict,
+    RiskLevel,
     TaskRecord,
     TaskSpec,
     TaskStatus,
+    TaskType,
     TransitionError,
     ensure_transition,
 )
@@ -47,6 +53,16 @@ from ai_supervisor.providers.kimi import (
 )
 
 logger = logging.getLogger(__name__)
+
+ALLOWED_TOOL_NAMES = {
+    "filesystem",
+    "git",
+    "terminal",
+    "exec",
+    "external",
+    "github",
+    "config_import",
+}
 
 ALLOWED_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp"}
 TEXT_SUFFIXES = {
@@ -138,7 +154,13 @@ class Orchestrator:
         self._creation_lock = asyncio.Lock()
         self._action_locks: dict[int, asyncio.Lock] = {}
         self._last_usage_warning: str | None = None
+        self._pause_requests: set[int] = set()
         self._stopping = False
+        self.github = (
+            GitHubClient(token=settings.github_token, config=settings.github)
+            if settings.github_token
+            else None
+        )
         self._summaries: dict[int, asyncio.Task[Any]] = {}
 
     # ------------------------------------------------------------------
@@ -166,6 +188,8 @@ class Orchestrator:
             job.cancel()
         if self._summaries:
             await asyncio.gather(*self._summaries.values(), return_exceptions=True)
+        if self.github is not None:
+            await self.github.close()
 
     # ------------------------------------------------------------------
     # incoming conversation
@@ -354,7 +378,8 @@ class Orchestrator:
             f"description: {project.description or '(нет)'}\n"
             f"stack: {project.stack or '(не указан)'}\n"
             f"base_branch: {project.base_branch}\n"
-            f"instructions:\n{instructions}"
+            f"instructions:\n{instructions}\n"
+            f"extra_read_paths: {project.extra_read_paths_json}"
         )
 
     @staticmethod
@@ -504,7 +529,7 @@ class Orchestrator:
         except KimiQuotaError as exc:
             await self._pause_task(task_id, str(exc))
         except KimiRateLimitError as exc:
-            await self._pause_task(task_id, str(exc))
+            await self._retry_wait(task_id, str(exc))
         except (
             KimiError,
             SupervisorError,
@@ -567,6 +592,10 @@ class Orchestrator:
         )
         if task.status is not TaskStatus.QUEUED:
             task = await self.tasks.transition(task.id, TaskStatus.QUEUED)
+        preflight = await self._preflight_contract(task, project, spec)
+        if preflight.status is not TaskStatus.QUEUED:
+            return preflight
+        task = preflight
         criteria = "\n".join(f"• {item}" for item in spec.acceptance_criteria[:5])
         await self.notifier.send_text(
             self._chat_for_task(task),
@@ -574,6 +603,72 @@ class Orchestrator:
             [[Button("Остановить", f"stop:{task.id}")]],
         )
         return task
+
+    async def _preflight_contract(
+        self, task: TaskRecord, project: ProjectRecord, spec: TaskSpec
+    ) -> TaskRecord:
+        """Fail closed before the worker sees a contradictory or privileged contract."""
+        unknown_tools = [tool for tool in spec.required_tools if tool not in ALLOWED_TOOL_NAMES]
+        if unknown_tools:
+            reason = "Неизвестные инструменты в контракте: " + ", ".join(unknown_tools)
+            await self._block_task(task.id, reason)
+            return await self.tasks.get(task.id)
+        if RiskLevel.CRITICAL in spec.required_permissions:
+            reason = "Контракт требует CRITICAL-полномочия; автоматическое выполнение запрещено."
+            await self._block_task(task.id, reason)
+            return await self.tasks.get(task.id)
+        if spec.task_type in {
+            TaskType.SYSTEM_OPERATION,
+            TaskType.EXTERNAL_OPERATION,
+            TaskType.COMPOSITE,
+        }:
+            reason = (
+                f"Тип {spec.task_type.value} требует отдельного привилегированного исполнителя "
+                "или декомпозиции; Phase 2 пока не исполняет его автоматически. "
+                "Для Git-публикации используйте завершённую задачу и /push."
+            )
+            await self._block_task(task.id, reason)
+            return await self.tasks.get(task.id)
+        needs_approval = RiskLevel.HIGH in spec.required_permissions or spec.task_type in {
+            TaskType.SYSTEM_OPERATION,
+            TaskType.EXTERNAL_OPERATION,
+        }
+        if needs_approval:
+            await self._request_task_approval(
+                task,
+                "Контракт требует подтверждения владельца: "
+                f"тип={spec.task_type.value}, permissions="
+                + ",".join(level.value for level in spec.required_permissions)
+                + (", tools=" + ",".join(spec.required_tools) if spec.required_tools else ""),
+            )
+            return await self.tasks.get(task.id)
+        return task
+
+    async def _request_task_approval(self, task: TaskRecord, reason: str) -> int:
+        if task.status is not TaskStatus.WAITING_APPROVAL:
+            await self._try_transition(task.id, TaskStatus.WAITING_APPROVAL)
+        approval_id = await self.approvals.request(
+            action=Action.TASK_APPROVAL,
+            payload={"task_id": task.id, "reason": reason},
+            created_by=self.settings.owner_id,
+            task_id=task.id,
+            ttl_seconds=1800,
+        )
+        await self.tasks.add_event(
+            task.id, "approval-requested", reason[:2000], agent="orchestrator"
+        )
+        await self.notifier.send_text(
+            self._chat_for_task(task),
+            f"Задача #{task.id:03d}: требуется подтверждение владельца.\n{reason[:1500]}",
+            [
+                [
+                    Button("Разрешить один раз", f"apv:{approval_id}"),
+                    Button("Отклонить", f"rej:{approval_id}"),
+                ],
+                [Button("Показать diff", f"dif:{task.id}"), Button("Отменить", f"stop:{task.id}")],
+            ],
+        )
+        return approval_id
 
     async def _execute_task(
         self,
@@ -614,9 +709,17 @@ class Orchestrator:
         resume = bool(task.session_id)
         while True:
             now = datetime.now(UTC)
-            deadline = (task.started_at or now).astimezone(UTC) + timedelta(
-                minutes=self.settings.limits.max_task_minutes
-            )
+            spec = self._spec_for(task)
+            limit_minutes = spec.max_minutes or self.settings.limits.max_task_minutes
+            deadline = (task.started_at or now).astimezone(UTC) + timedelta(minutes=limit_minutes)
+            if spec.token_budget > 0:
+                totals = await self.usage.task_totals(task.id)
+                if totals.total_tokens >= spec.token_budget:
+                    await self._block_task(
+                        task.id,
+                        f"Исчерпан token_budget задачи ({totals.total_tokens}/{spec.token_budget}).",
+                    )
+                    return
             if now >= deadline:
                 await self._fail_task(
                     task_id, "Превышен максимальный лимит времени выполнения задачи."
@@ -624,8 +727,9 @@ class Orchestrator:
                 return
             attempt += 1
             if attempt > self.settings.limits.max_iterations:
-                await self._fail_task(task_id, "Превышен максимальный лимит итераций исполнителя.")
+                await self._block_task(task_id, "Превышен максимальный лимит итераций исполнителя.")
                 return
+            task = await self.tasks.update_fields(task.id, attempts=task.attempts + 1)
             state_dir = self.settings.task_logs_dir / f"task-{task.id:04d}" / f"attempt-{attempt}"
             timeout_seconds = max(30.0, (deadline - now).total_seconds())
             await self.usage.ensure_kimi_budget(task.id)
@@ -668,7 +772,7 @@ class Orchestrator:
                     "Задача остановлена. Незавершённые изменения сохранены в worktree.",
                 )
                 return
-            await self._try_transition(task.id, TaskStatus.REVIEWING)
+            await self._try_transition(task.id, TaskStatus.VALIDATING)
             evidence = await self.workspace.collect_evidence(
                 task=task,
                 project=project,
@@ -704,8 +808,9 @@ class Orchestrator:
                 f"Задача #{task.id:03d}: исполнитель завершил работу. Провожу проверку diff и результатов.",
             )
             spec = self._spec_for(task)
-            precheck = ReviewGate.precheck(evidence, spec)
+            precheck = ReviewGate.precheck(evidence, spec, worktree=Path(task.worktree_path or ""))
             if precheck is None:
+                await self._try_transition(task.id, TaskStatus.REVIEWING)
                 await self.usage.ensure_kimi_budget(task.id)
                 review, review_usage = await self.supervisor.review(
                     project_block=self._project_block(project),
@@ -716,33 +821,71 @@ class Orchestrator:
                 await self._record_kimi_usage(review_usage, task_id=task.id, project_id=project.id)
             else:
                 review = precheck
-            review = ReviewGate.enforce(review, evidence)
-            task = await self.tasks.update_fields(task.id, review_json=review.model_dump_json())
+            review = ReviewGate.enforce(
+                review, evidence, spec, worktree=Path(task.worktree_path or "")
+            )
+            task = await self.tasks.update_fields(
+                task.id,
+                review_json=review.model_dump_json(),
+            )
             await self.tasks.add_event(
                 task.id,
                 "review",
                 f"Ревью: {review.verdict.value}",
-                {"summary": review.summary, "issues": review.issues},
+                {
+                    "summary": review.summary,
+                    "issues": [item.model_dump() for item in review.issues],
+                },
             )
-            if review.verdict is ReviewVerdict.ACCEPT:
+            if review.verdict is ReviewVerdict.APPROVED:
                 await self._finish_for_acceptance(
                     task.id, project, spec_evidence=evidence, review=review
                 )
                 return
-            if review.verdict is ReviewVerdict.FAIL:
+            if review.verdict is ReviewVerdict.BLOCKED:
+                await self._block_task(task.id, review.summary, review=review)
+                return
+            if review.verdict is ReviewVerdict.APPROVAL_REQUIRED:
+                await self._await_required_approval(task.id, review)
+                return
+            if review.verdict is ReviewVerdict.FAILED:
                 await self._fail_task(
                     task.id, "Ревьюер отклонил работу: " + review.summary, review=review
                 )
                 return
-            if task.rework_count >= task.max_rework:
-                await self._fail_task(
+            exhausted = (
+                task.attempts >= self._max_attempts(task) or task.rework_count >= task.max_rework
+            )
+            if exhausted:
+                critical_or_major = any(
+                    issue.severity.value in {"critical", "major"} for issue in review.issues
+                )
+                if review.issues and not critical_or_major:
+                    await self._partial_task(task.id, review)
+                    return
+                await self._block_task(
                     task.id,
-                    f"Исчерпан лимит доработок ({task.max_rework}). Требуется решение владельца.\n"
+                    "Исчерпан лимит доработок/попыток. Требуется решение владельца.\n"
                     + review.summary,
                     review=review,
                 )
                 return
-            task = await self.tasks.update_fields(task.id, rework_count=task.rework_count + 1)
+            new_hash = self._progress_hash(evidence, review)
+            same_state = bool(task.progress_hash) and new_hash == task.progress_hash
+            stalled = task.stalled_count + 1 if same_state else 0
+            if stalled >= 2:
+                await self._block_task(
+                    task.id,
+                    "Нет прогресса: повторная попытка дала то же состояние и те же замечания.",
+                    review=review,
+                )
+                return
+            task = await self.tasks.update_fields(
+                task.id,
+                rework_count=task.rework_count + 1,
+                stalled_count=stalled,
+                progress_hash=new_hash,
+            )
             await self._try_transition(task.id, TaskStatus.REWORK)
             await self._try_transition(task.id, TaskStatus.QUEUED)
             task = await self.tasks.get(task.id)
@@ -756,12 +899,104 @@ class Orchestrator:
                 self._chat_for_task(task),
                 f"Задача #{task.id:03d}: отправлена на доработку "
                 f"({task.rework_count}/{task.max_rework}).\n"
-                + "\n".join(f"• {item}" for item in review.required_changes[:5]),
+                + "\n".join(
+                    f"• {item}"
+                    for item in (
+                        review.required_changes
+                        or [issue.recommendation or issue.evidence for issue in review.issues]
+                    )[:5]
+                ),
             )
             await self._try_transition(task.id, TaskStatus.RUNNING)
             task = await self.tasks.get(task.id)
             resume = True
             manual_instruction = None
+
+    def _max_attempts(self, task: TaskRecord) -> int:
+        spec = self._spec_for(task)
+        return spec.max_attempts or self.settings.limits.max_iterations
+
+    @staticmethod
+    def _progress_hash(evidence: Evidence, review: ReviewResult) -> str:
+        digest = hashlib.sha256()
+        digest.update(evidence.diff.encode())
+        digest.update(evidence.head_commit.encode())
+        for name in sorted(evidence.changed_files):
+            digest.update(name.encode())
+        for check in evidence.checks:
+            digest.update(f"{check.name}:{check.exit_code}:{check.timed_out}".encode())
+        digest.update(review.verdict.value.encode())
+        for issue in review.issues:
+            digest.update(f"{issue.criterion}:{issue.evidence}".encode())
+        return digest.hexdigest()
+
+    async def _retry_wait(self, task_id: int, reason: str) -> None:
+        task = await self.tasks.get_optional(task_id)
+        if task is None or task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
+            return
+        try:
+            await self.tasks.transition(task.id, TaskStatus.RETRY_WAIT)
+        except (TransitionError, TaskError):
+            await self._pause_task(task_id, reason)
+            return
+        safe = self.redactor.redact(reason)[:4000]
+        await self.tasks.update_fields(task.id, error=safe)
+        await self.tasks.add_event(task.id, "retry_wait", safe, agent="orchestrator")
+        await self.notifier.send_text(
+            self._chat_for_task(task),
+            f"Задача #{task.id:03d}: временная ошибка API; ожидаю повтора.\n{safe[:1000]}",
+            [[Button("Повторить", f"res:{task.id}"), Button("Отменить", f"stop:{task.id}")]],
+        )
+
+    async def _partial_task(self, task_id: int, review: ReviewResult) -> None:
+        task = await self.tasks.get(task_id)
+        try:
+            await self.tasks.transition(task.id, TaskStatus.PARTIALLY_COMPLETED)
+        except (TransitionError, TaskError):
+            await self._block_task(task_id, review.summary, review=review)
+            return
+        task = await self.tasks.update_fields(task.id, review_json=review.model_dump_json())
+        report = await self._final_report(task, None, TaskStatus.PARTIALLY_COMPLETED)
+        await self.tasks.update_fields(task.id, report=report)
+        await self.notifier.send_text(
+            self._chat_for_task(task),
+            report,
+            [[Button("Повторить", f"res:{task.id}"), Button("Откатить", f"rb:{task.id}")]],
+        )
+
+    async def _block_task(
+        self, task_id: int, reason: str, *, review: ReviewResult | None = None
+    ) -> None:
+        task = await self.tasks.get_optional(task_id)
+        if task is None or task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
+            return
+        try:
+            await self.tasks.transition(task.id, TaskStatus.BLOCKED)
+        except (TransitionError, TaskError):
+            logger.warning("could not transition task #%s to blocked", task_id)
+        safe_reason = self.redactor.redact(reason)[:8000]
+        task = await self.tasks.update_fields(
+            task.id,
+            blocked_reason=safe_reason,
+            error=safe_reason,
+            review_json=review.model_dump_json() if review else None,
+        )
+        await self.tasks.add_event(task.id, "blocked", safe_reason, agent="orchestrator")
+        report = await self._final_report(task, None, TaskStatus.BLOCKED)
+        await self.tasks.update_fields(task.id, report=report)
+        await self.notifier.send_text(
+            self._chat_for_task(task),
+            report,
+            [
+                [Button("Продолжить", f"res:{task.id}"), Button("Показать diff", f"dif:{task.id}")],
+                [Button("Логи", f"log:{task.id}"), Button("Откатить", f"rb:{task.id}")],
+            ],
+        )
+
+    async def _await_required_approval(self, task_id: int, review: ReviewResult) -> None:
+        task = await self.tasks.get(task_id)
+        await self.tasks.update_fields(task.id, review_json=review.model_dump_json())
+        await self._request_task_approval(task, review.summary)
 
     async def _finish_for_acceptance(
         self,
@@ -773,7 +1008,7 @@ class Orchestrator:
     ) -> None:
         task = await self.tasks.get(task_id)
         await self._try_transition(task.id, TaskStatus.WAITING_APPROVAL)
-        task = await self.tasks.get(task_id)
+        task = await self.tasks.get(task.id)
         usage_totals = await self.usage.by_provider(task_id=task.id)
         task = await self.tasks.update_fields(task.id, review_json=review.model_dump_json())
         report = build_report(
@@ -801,13 +1036,10 @@ class Orchestrator:
             },
         )
 
-    # ------------------------------------------------------------------
-    # user actions
-    # ------------------------------------------------------------------
-
     @_locked_action
     async def accept_task(self, task_id: int, user_id: int, chat_id: int) -> None:
         self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
         task = await self.tasks.get(task_id)
         if task.status is not TaskStatus.WAITING_APPROVAL:
             await self.notifier.send_text(chat_id, f"Задача #{task.id:03d} не ожидает принятия.")
@@ -815,6 +1047,22 @@ class Orchestrator:
         project = await self.projects.get(task.project_id)
         if project is None:
             await self.notifier.send_text(chat_id, "Проект задачи не найден.")
+            return
+        if await self.workspace.is_applied(task, project):
+            warnings = await self.workspace.cleanup(task, project, remove_branch=True, strict=False)
+            await self._try_transition(task.id, TaskStatus.COMPLETED)
+            task = await self.tasks.get(task.id)
+            await self.tasks.add_event(
+                task.id,
+                "merged-recovered",
+                "Изменения уже присутствуют в базовой ветке; задача завершена идемпотентно.",
+            )
+            report = await self._final_report(task, project, TaskStatus.COMPLETED)
+            report += "\n\nПримечание: merge уже был выполнен; повторная операция не запускалась."
+            await self.tasks.update_fields(task.id, report=report)
+            await self.notifier.send_text(chat_id, report)
+            for warning in warnings:
+                logger.warning("post-merge cleanup: %s", warning)
             return
         try:
             self.permissions.require_allowed(Action.APPLY_MERGE)
@@ -838,10 +1086,10 @@ class Orchestrator:
         await self.tasks.add_event(task.id, "merged", f"Изменения слиты в {project.base_branch}")
         report = await self._final_report(task, project, TaskStatus.COMPLETED)
         await self.tasks.update_fields(task.id, report=report)
-        await self.notifier.send_text(
-            chat_id,
-            report,
+        buttons = (
+            [[Button("Опубликовать в Git", f"push:{task.id}")]] if project.remote_url else None
         )
+        await self.notifier.send_text(chat_id, report, buttons)
         await self.conversations.add_message(
             task.conversation_id,
             "assistant",
@@ -852,6 +1100,7 @@ class Orchestrator:
     @_locked_action
     async def rework_task(self, task_id: int, user_id: int, chat_id: int) -> None:
         self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
         task = await self.tasks.get(task_id)
         if task.status is not TaskStatus.WAITING_APPROVAL:
             await self.notifier.send_text(chat_id, f"Задача #{task.id:03d} не ожидает доработки.")
@@ -861,7 +1110,13 @@ class Orchestrator:
         if review and review.required_changes:
             instruction = "\n".join(f"- {item}" for item in review.required_changes)
         elif review:
-            instruction = review.summary
+            instruction = (
+                "\n".join(
+                    f"- {issue.criterion}: {issue.recommendation or issue.evidence}"
+                    for issue in review.issues
+                )
+                or review.summary
+            )
         # A manual rework is an explicit owner decision; allow one extra cycle.
         if task.rework_count >= task.max_rework:
             await self.tasks.update_fields(task.id, max_rework=task.rework_count + 1)
@@ -878,8 +1133,16 @@ class Orchestrator:
     @_locked_action
     async def resume_task(self, task_id: int, user_id: int, chat_id: int) -> None:
         self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
         task = await self.tasks.get(task_id)
-        if task.status not in {TaskStatus.PAUSED, TaskStatus.INTERRUPTED, TaskStatus.FAILED}:
+        if task.status not in {
+            TaskStatus.PAUSED,
+            TaskStatus.INTERRUPTED,
+            TaskStatus.FAILED,
+            TaskStatus.BLOCKED,
+            TaskStatus.RETRY_WAIT,
+            TaskStatus.WAITING_INPUT,
+        }:
             await self.notifier.send_text(
                 chat_id,
                 f"Задача #{task.id:03d} не может быть продолжена из статуса {task.status.value}.",
@@ -900,13 +1163,56 @@ class Orchestrator:
         await self._try_transition(task.id, TaskStatus.QUEUED)
         await self.tasks.update_fields(task.id, cancel_requested=False)
         await self.tasks.reset_started_at(task.id)
+        self._pause_requests.discard(task.id)
         self.workers.clear_cancel(task.id)
         await self.tasks.add_event(task.id, "resumed", "Задача продолжена владельцем")
         await self.notifier.send_text(chat_id, f"Задача #{task.id:03d} продолжается.")
         self._spawn_job(task.id, plan_if_needed=task.spec is None, manual_instruction=None)
 
     @_locked_action
+    async def pause_task(self, task_id: int, user_id: int, chat_id: int) -> None:
+        self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
+        task = await self.tasks.get(task_id)
+        if task.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.PARTIALLY_COMPLETED,
+            TaskStatus.CANCELLED,
+            TaskStatus.FAILED,
+        }:
+            await self.notifier.send_text(chat_id, f"Задача #{task.id:03d} уже завершена.")
+            return
+        if task.status is TaskStatus.PAUSED:
+            await self.notifier.send_text(chat_id, f"Задача #{task.id:03d} уже приостановлена.")
+            return
+        if task.status in {
+            TaskStatus.BLOCKED,
+            TaskStatus.WAITING_INPUT,
+            TaskStatus.RETRY_WAIT,
+        }:
+            await self.notifier.send_text(
+                chat_id, f"Задача #{task.id:03d} не выполняется ({task.status.value})."
+            )
+            return
+        self._pause_requests.add(task.id)
+        job = self._jobs.get(task.id)
+        if job is not None and not job.done():
+            await self.workers.cancel(task.id)
+            await self.scheduler.cancel(task.id)
+            job.cancel()
+            await self.notifier.send_text(chat_id, f"Приостанавливаю задачу #{task.id:03d}…")
+            return
+        await self.workers.cancel(task.id)
+        await self._try_transition(task.id, TaskStatus.PAUSED)
+        await self.notifier.send_text(
+            chat_id,
+            f"Задача #{task.id:03d} приостановлена. /resume — продолжить.",
+            [[Button("Продолжить", f"res:{task.id}"), Button("Отменить", f"stop:{task.id}")]],
+        )
+
+    @_locked_action
     async def stop_task(self, task_id: int, chat_id: int) -> None:
+        self._assert_owner_chat(chat_id)
         task = await self.tasks.get(task_id)
         if task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED}:
             await self.notifier.send_text(
@@ -932,9 +1238,105 @@ class Orchestrator:
             job.cancel()
         await self.notifier.send_text(chat_id, f"Останавливаю задачу #{task.id:03d}…")
 
+    async def github_info(self, chat_id: int, owner: str, repo: str) -> None:
+        if self.github is None:
+            await self.notifier.send_text(chat_id, "GITHUB_TOKEN не настроен.")
+            return
+        try:
+            info = await self.github.repository_info(owner, repo)
+        except GitHubError as exc:
+            await self.notifier.send_text(chat_id, f"GitHub: {exc}")
+            return
+        if info is None:
+            await self.notifier.send_text(chat_id, f"Репозиторий {owner}/{repo} не найден.")
+            return
+        await self.notifier.send_text(
+            chat_id,
+            f"GitHub {owner}/{repo}:\n"
+            f"private={info.get('private')} default_branch={info.get('default_branch')}\n"
+            f"url={info.get('html_url')}",
+        )
+
+    async def request_github_create(
+        self, name: str, private: bool, user_id: int, chat_id: int
+    ) -> None:
+        self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
+        if self.github is None:
+            await self.notifier.send_text(chat_id, "GITHUB_TOKEN не настроен.")
+            return
+        approval_id = await self.approvals.request(
+            action=Action.GITHUB_REPOSITORY_CREATE,
+            payload={"name": name, "private": private},
+            created_by=user_id,
+            ttl_seconds=600,
+        )
+        await self.notifier.send_text(
+            chat_id,
+            f"Создание GitHub-репозитория {name}.\n"
+            f"Видимость: {'private' if private else 'public'}\n"
+            "Репозиторий будет создан от имени владельца токена. Подтвердите.",
+            [
+                [Button("Разрешить один раз", f"apv:{approval_id}")],
+                [Button("Отклонить", f"rej:{approval_id}")],
+            ],
+        )
+
+    @_locked_action
+    async def request_push(self, task_id: int, user_id: int, chat_id: int) -> None:
+        self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
+        task = await self.tasks.get(task_id)
+        if task.status is not TaskStatus.COMPLETED:
+            await self.notifier.send_text(
+                chat_id,
+                f"Публикация доступна только для завершённой задачи; сейчас {task.status.value}.",
+            )
+            return
+        project = await self.projects.get(task.project_id)
+        if project is None or not project.remote_url:
+            await self.notifier.send_text(
+                chat_id, "У проекта не задан remote. Укажите: /project remote <repo-url>."
+            )
+            return
+        try:
+            actual_remote = await remote_url(Path(project.path), "origin")
+            validate_remote_url(actual_remote)
+        except (GitOpsError, ProjectError) as exc:
+            await self.notifier.send_text(chat_id, f"Remote не проверен: {exc}")
+            return
+        approval_id = await self.approvals.request(
+            action=Action.GIT_PUSH,
+            payload={
+                "task_id": task.id,
+                "remote": "origin",
+                "branch": project.base_branch,
+                "remote_url": self.redactor.redact(project.remote_url),
+            },
+            created_by=user_id,
+            task_id=task.id,
+            ttl_seconds=600,
+        )
+        await self.notifier.send_text(
+            chat_id,
+            f"Задача #{task.id:03d}: публикация в Git.\n"
+            f"Проект: {project.name}\n"
+            f"Операция: git push origin {project.base_branch}\n"
+            f"Remote: {project.remote_url}\n"
+            "Force-push не используется. Подтвердите операцию.",
+            [
+                [
+                    Button("Разрешить один раз", f"apv:{approval_id}"),
+                    Button("Отклонить", f"rej:{approval_id}"),
+                ],
+                [Button("Показать diff", f"dif:{task.id}"), Button("Отмена", f"rej:{approval_id}")],
+            ],
+        )
+
     @_locked_action
     async def request_rollback(self, task_id: int, user_id: int, chat_id: int) -> None:
         self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
         task = await self.tasks.get(task_id)
         if task.status is TaskStatus.COMPLETED:
             await self.notifier.send_text(
@@ -973,6 +1375,7 @@ class Orchestrator:
 
     async def approve_action(self, approval_id: int, user_id: int, chat_id: int) -> None:
         self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
         try:
             approval = await self.approvals.approve_pending(approval_id, user_id=user_id)
             payload = await self.approvals.consume(approval_id, user_id=user_id)
@@ -983,6 +1386,17 @@ class Orchestrator:
         if action is Action.ROLLBACK:
             task_id = int(payload["task_id"])
             task = await self.tasks.get(task_id)
+            if task.status in {
+                TaskStatus.COMPLETED,
+                TaskStatus.PARTIALLY_COMPLETED,
+                TaskStatus.CANCELLED,
+            }:
+                await self.notifier.send_text(
+                    chat_id,
+                    f"Задача #{task.id:03d} уже завершена ({task.status.value}); "
+                    "откат по старому подтверждению не выполняется.",
+                )
+                return
             project = await self.projects.get(task.project_id)
             if project is None:
                 await self.notifier.send_text(chat_id, "Проект задачи не найден.")
@@ -999,8 +1413,72 @@ class Orchestrator:
                 chat_id,
                 f"Задача #{task.id:03d} откатана. Патч сохранён: {patch_path}",
             )
+        elif action is Action.GITHUB_REPOSITORY_CREATE:
+            if self.github is None:
+                await self.notifier.send_text(chat_id, "GITHUB_TOKEN не настроен.")
+                return
+            try:
+                repo = await self.github.create_repository(
+                    str(payload["name"]), private=bool(payload.get("private", True))
+                )
+            except GitHubError as exc:
+                await self.notifier.send_text(chat_id, f"GitHub: {exc}")
+                return
+            await self.notifier.send_text(
+                chat_id,
+                "GitHub-репозиторий создан: "
+                f"{repo.get('full_name') or payload['name']} ({repo.get('html_url')}).\n"
+                "Remote проекта не изменялся; при необходимости задайте /project remote <url>.",
+            )
+        elif action is Action.GIT_PUSH:
+            task = await self.tasks.get(int(payload["task_id"]))
+            project = await self.projects.get(task.project_id)
+            if project is None or task.status is not TaskStatus.COMPLETED:
+                await self.notifier.send_text(
+                    chat_id, "Публикация отменена: задача/проект не в нужном состоянии."
+                )
+                return
+            branch = str(payload.get("branch") or project.base_branch)
+            remote = str(payload.get("remote") or "origin")
+            try:
+                actual = await remote_url(Path(project.path), remote)
+                validate_remote_url(actual)
+                sha = await push_branch(Path(project.path), remote, branch)
+                _local, remote_sha = await verify_remote_branch(Path(project.path), remote, branch)
+            except (GitOpsError, ProjectError) as exc:
+                await self.notifier.send_text(chat_id, f"Публикация не выполнена: {exc}")
+                return
+            await self.tasks.add_event(
+                task.id,
+                "pushed",
+                f"{remote}/{branch} -> {sha[:12]}; remote={remote_sha[:12]}",
+                agent="orchestrator",
+            )
+            await self.notifier.send_text(
+                chat_id,
+                f"Задача #{task.id:03d}: опубликовано.\n"
+                f"{remote}/{branch}: {sha[:12]}\n"
+                f"Удалённая вершина подтверждена: {str(remote_sha)[:12]}",
+            )
         elif action is Action.APPLY_MERGE:
             await self.accept_task(int(payload["task_id"]), user_id, chat_id)
+        elif action is Action.TASK_APPROVAL:
+            target = await self.tasks.get(int(payload["task_id"]))
+            if target.status is not TaskStatus.WAITING_APPROVAL:
+                await self.notifier.send_text(
+                    chat_id,
+                    f"Задача #{target.id:03d} уже не ожидает подтверждения ({target.status.value}).",
+                )
+                return
+            if not await self._try_transition(target.id, TaskStatus.QUEUED):
+                await self.notifier.send_text(chat_id, "Не удалось перевести задачу в очередь.")
+                return
+            await self.tasks.reset_started_at(target.id)
+            await self.tasks.update_fields(target.id, cancel_requested=False)
+            await self.notifier.send_text(
+                chat_id, f"Задача #{target.id:03d}: подтверждение получено, продолжаю."
+            )
+            self._spawn_job(target.id, plan_if_needed=False, manual_instruction=None)
         else:
             await self.notifier.send_text(
                 chat_id, f"Действие {action.value} пока не поддерживается."
@@ -1008,6 +1486,7 @@ class Orchestrator:
 
     async def reject_action(self, approval_id: int, user_id: int, chat_id: int) -> None:
         self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
         changed = await self.approvals.reject_pending(approval_id, user_id=user_id)
         await self.notifier.send_text(
             chat_id,
@@ -1065,7 +1544,14 @@ class Orchestrator:
         task = await self.tasks.get_optional(task_id)
         if task is None:
             return
-        if task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
+        if task.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.PARTIALLY_COMPLETED,
+            TaskStatus.CANCELLED,
+        }:
+            return
+        if task.status is TaskStatus.WAITING_APPROVAL:
+            await self._block_task(task_id, reason, review=review)
             return
         if task.status is not TaskStatus.FAILED:
             try:
@@ -1073,6 +1559,9 @@ class Orchestrator:
                 await self.tasks.transition(task.id, TaskStatus.FAILED)
             except (TransitionError, TaskError) as exc:
                 logger.error("cannot mark task #%s failed: %s", task_id, exc)
+                if task.status not in {TaskStatus.FAILED, TaskStatus.BLOCKED}:
+                    await self._block_task(task_id, reason, review=review)
+                return
         safe_reason = self.redactor.redact(reason)[:8000]
         task = await self.tasks.update_fields(task.id, error=safe_reason)
         await self.tasks.add_event(task.id, "failed", safe_reason[:2000])
@@ -1097,9 +1586,17 @@ class Orchestrator:
         task = await self.tasks.get_optional(task_id)
         if task is None:
             return
-        if task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED}:
+        if task.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.PARTIALLY_COMPLETED,
+            TaskStatus.CANCELLED,
+            TaskStatus.FAILED,
+        }:
             return
-        target = TaskStatus.INTERRUPTED if self._stopping else TaskStatus.CANCELLED
+        if task_id in self._pause_requests:
+            target = TaskStatus.PAUSED
+        else:
+            target = TaskStatus.INTERRUPTED if self._stopping else TaskStatus.CANCELLED
         try:
             ensure_transition(task.status, target)
             await self.tasks.transition(task.id, target)
@@ -1136,8 +1633,13 @@ class Orchestrator:
             return f"Задача #{task.id:03d}: проект не найден. Статус: {status.value}."
         spec = self._spec_for(task)
         evidence = self._load_evidence(task)
+        fallback_verdict = {
+            TaskStatus.FAILED: ReviewVerdict.FAILED,
+            TaskStatus.BLOCKED: ReviewVerdict.BLOCKED,
+            TaskStatus.PARTIALLY_COMPLETED: ReviewVerdict.REWORK_REQUIRED,
+        }.get(status, ReviewVerdict.APPROVED)
         review = task.review or ReviewResult(
-            verdict=ReviewVerdict.FAIL if status is TaskStatus.FAILED else ReviewVerdict.ACCEPT,
+            verdict=fallback_verdict,
             summary=task.error or "Ревью не проводилось.",
         )
         if evidence is None:
@@ -1204,9 +1706,13 @@ class Orchestrator:
         review = task.review
         previous = ""
         if review is not None and task.rework_count > 0:
+            findings = review.required_changes or [
+                f"{issue.criterion}: {issue.recommendation or issue.evidence}"
+                for issue in review.issues
+            ]
             previous = (
                 "\n## Замечания предыдущего ревью\n"
-                + "\n".join(f"- {item}" for item in review.required_changes or review.issues)[:8000]
+                + "\n".join(f"- {item}" for item in findings)[:8000]
                 + "\n"
             )
         if manual_instruction:
@@ -1218,6 +1724,8 @@ class Orchestrator:
             f"Базовая ветка: {project.base_branch}\n\n"
             f"## Техническое задание\n{json.dumps(spec.model_dump(), ensure_ascii=False, indent=2)}\n\n"
             f"## Инструкции проекта\n{project.instructions or '(нет)'}\n"
+            f"## Дополнительные read-only пути\n"
+            f"{project.extra_read_paths_json if project.extra_read_paths_json != '[]' else '(нет)'}\n"
             f"{previous}\n"
             "## Правила\n"
             "- Работай только в /workspace. Не читай и не изменяй данные вне него.\n"
@@ -1282,6 +1790,10 @@ class Orchestrator:
         if user_id != self.settings.owner_id:
             raise PermissionDenied("управление разрешено только владельцу")
 
+    def _assert_owner_chat(self, chat_id: int) -> None:
+        if chat_id != self.settings.owner_id:
+            raise PermissionDenied("управление разрешено только в личном чате владельца")
+
     def _schedule_summary(self, conversation_id: int, project_id: int) -> None:
         existing = self._summaries.get(conversation_id)
         if existing is not None and not existing.done():
@@ -1311,6 +1823,49 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # formatting for commands
     # ------------------------------------------------------------------
+
+    async def create_task_from_text(self, chat_id: int, user_id: int, text: str) -> None:
+        self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
+        project = await self._current_project(chat_id)
+        if project is None:
+            await self.notifier.send_text(chat_id, "Сначала выберите или создайте проект.")
+            return
+        conversation = await self.conversations.get_or_create_conversation(chat_id, project.id)
+        await self._begin_task(
+            project=project,
+            conversation_id=conversation.id,
+            chat_id=chat_id,
+            title_hint=text.strip()[:120] or "Задача",
+        )
+
+    async def queue_text(self, chat_id: int) -> str:
+        project = await self._current_project(chat_id)
+        if project is None:
+            return "Нет проектов."
+        statuses = [
+            TaskStatus.PLANNING.value,
+            TaskStatus.QUEUED.value,
+            TaskStatus.RUNNING.value,
+            TaskStatus.VALIDATING.value,
+            TaskStatus.REVIEWING.value,
+            TaskStatus.REWORK.value,
+            TaskStatus.WAITING_APPROVAL.value,
+            TaskStatus.WAITING_INPUT.value,
+            TaskStatus.RETRY_WAIT.value,
+            TaskStatus.BLOCKED.value,
+            TaskStatus.PAUSED.value,
+        ]
+        tasks = await self.tasks.list(project_id=project.id, statuses=statuses, limit=50)
+        lines = [
+            f"Очередь {project.name}:",
+            f"Свободных слотов исполнителей: {self.scheduler.available_slots}/{self.scheduler.max_workers}",
+        ]
+        if not tasks:
+            lines.append("Активных задач нет.")
+        for task in tasks:
+            lines.append(f"#{task.id:03d} [{task.status.value}] {task.title[:80]}")
+        return "\n".join(lines)
 
     async def tasks_text(self, chat_id: int) -> str:
         project = await self._current_project(chat_id)
@@ -1362,24 +1917,45 @@ class Orchestrator:
                 )
         return "\n".join(lines)
 
-    async def usage_text(self, chat_id: int) -> str:
+    async def usage_text(
+        self, chat_id: int, period: str = "today", task_id: int | None = None
+    ) -> str:
         project = await self._current_project(chat_id)
-        daily = await self.usage.daily_totals()
-        lines = [
-            "Расходы (фактические значения API)",
-            "Сегодня: " + self.usage.format_totals(daily),
-        ]
+        lines = ["Расходы (фактические значения API)"]
+        if task_id is not None:
+            task = await self.tasks.get(task_id)
+            totals = await self.usage.task_totals(task.id)
+            lines.append(f"Задача #{task.id:03d}: {self.usage.format_totals(totals)}")
+            models = await self.usage.by_model(task_id=task.id)
+            for (provider, model), value in models.items():
+                lines.append(f"• {provider}/{model}: {self.usage.format_totals(value)}")
+            return "\n".join(lines)
+        zone = ZoneInfo(self.settings.app.timezone)
+        now = datetime.now(zone)
+        if period == "week":
+            start = datetime.combine(
+                (now - timedelta(days=6)).date(), time.min, tzinfo=zone
+            ).astimezone(UTC)
+            label = "7 дней"
+        elif period == "month":
+            start = datetime.combine(
+                (now - timedelta(days=29)).date(), time.min, tzinfo=zone
+            ).astimezone(UTC)
+            label = "30 дней"
+        else:
+            start = datetime.combine(now.date(), time.min, tzinfo=zone).astimezone(UTC)
+            label = "сегодня"
+        end = start + timedelta(days=7 if period == "week" else 30 if period == "month" else 1)
+        totals = await self.usage.range_totals(start, end)
+        lines.append(f"{label.capitalize()}: {self.usage.format_totals(totals)}")
+        models = await self.usage.by_model(start=start, end=end)
+        for (provider, model), value in models.items():
+            lines.append(f"• {provider}/{model}: {self.usage.format_totals(value)}")
         if project:
-            totals = await self.usage.by_provider(project_id=project.id)
-            lines.append(f"Проект {project.name}:")
-            for provider, value in totals.items():
-                cost = self.usage.estimate_cost(value, provider)
-                suffix = f", оценка ${cost:.4f}" if cost is not None else ""
-                lines.append(f"• {provider}: {self.usage.format_totals(value)}{suffix}")
-            active = await self.tasks.active(project.id)
-            for task in active[-10:]:
-                value = await self.usage.task_totals(task.id)
-                lines.append(f"• задача #{task.id:03d}: {self.usage.format_totals(value)}")
+            provider_totals = await self.usage.by_provider(project_id=project.id)
+            lines.append(f"Проект {project.name} (все время):")
+            for provider, value in provider_totals.items():
+                lines.append(f"• {provider}: {self.usage.format_totals(value)}")
         if not self.settings.usage.configured:
             lines.append("Цены не заданы в config.toml, стоимость не рассчитывается.")
         lines.append(
@@ -1402,6 +1978,61 @@ class Orchestrator:
         for item in items[:15]:
             confirmed = "" if item.user_confirmed else " (неподтверждено)"
             lines.append(f"#{item.id} [{item.scope}{confirmed}] {item.content[:300]}")
+        return "\n".join(lines)
+
+    async def doctor_text(self, chat_id: int) -> str:
+        import importlib.metadata
+        import shutil
+
+        project = await self._current_project(chat_id)
+        lines = ["AI Supervisor doctor"]
+        try:
+            sdk = importlib.metadata.version("deepseek-harness-sdk")
+        except Exception:
+            sdk = "unknown"
+        lines.append(f"Python: {__import__('sys').version.split()[0]}")
+        lines.append(f"DSH SDK: {sdk}")
+        lines.append(f"bubblewrap: {shutil.which('bwrap') or 'MISSING'}")
+        lines.append(f"Git: {shutil.which('git') or 'MISSING'}")
+        lines.append(
+            f"DB: {self.settings.db_path}; FTS5={getattr(self.usage.db, 'fts_available', '?')}"
+        )
+        try:
+            check = await self.usage.db.fetchone("PRAGMA quick_check")
+            lines.append(f"DB quick_check: {check[0] if check else 'no result'}")
+        except Exception as exc:
+            lines.append(f"DB quick_check: error {type(exc).__name__}")
+        unfinished = await self.tasks.list(
+            statuses=[
+                TaskStatus.PLANNING.value,
+                TaskStatus.QUEUED.value,
+                TaskStatus.RUNNING.value,
+                TaskStatus.VALIDATING.value,
+                TaskStatus.REVIEWING.value,
+                TaskStatus.REWORK.value,
+                TaskStatus.WAITING_APPROVAL.value,
+                TaskStatus.WAITING_INPUT.value,
+                TaskStatus.RETRY_WAIT.value,
+                TaskStatus.BLOCKED.value,
+                TaskStatus.PAUSED.value,
+                TaskStatus.INTERRUPTED.value,
+            ],
+            limit=100,
+        )
+        lines.append(f"Unfinished tasks: {len(unfinished)}")
+        lines.append(f"Worker slots: {self.scheduler.available_slots}/{self.scheduler.max_workers}")
+        lines.append(
+            f"Kimi: {self.settings.kimi.model} (key configured: {bool(self.settings.kimi_key)})"
+        )
+        lines.append(
+            f"DeepSeek: {self.settings.deepseek_model} (key configured: {bool(self.settings.deepseek_key)})"
+        )
+        lines.append(f"Telegram owner: {self.settings.owner_id}")
+        lines.append(f"GitHub API: {'configured' if self.github is not None else 'not configured'}")
+        lines.append(f"Project: {project.name if project else 'none'}")
+        lines.append(
+            "CLI `ai-supervisor doctor` additionally checks Kimi /models, Telegram getMe and bwrap."
+        )
         return "\n".join(lines)
 
     async def settings_text(self, chat_id: int) -> str:

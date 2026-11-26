@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ai_supervisor.config import Settings
 from ai_supervisor.memory.database import Database, iso_now
@@ -23,6 +24,10 @@ class UsageTotals:
     cache_write_tokens: int = 0
     reasoning_tokens: int = 0
     requests: int = 0
+    duration_ms: int = 0
+    errors: int = 0
+    cost: float = 0.0
+    currency: str = ""
 
     @property
     def total_tokens(self) -> int:
@@ -42,14 +47,18 @@ class UsageService:
         usage: TokenUsage,
         task_id: int | None = None,
         project_id: int | None = None,
+        duration_ms: int = 0,
+        error_category: str | None = None,
     ) -> None:
         if usage.requests == 0 and usage.total_tokens == 0:
             return
+        cost, currency = self.estimate_cost_amount(usage, provider, model)
         await self.db.execute(
             """
             INSERT INTO usage_events(task_id, project_id, provider, model, input_tokens,
-                output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, requests, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, requests,
+                duration_ms, error_category, cost, currency, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -62,6 +71,10 @@ class UsageService:
                 usage.cache_write_tokens,
                 usage.reasoning_tokens,
                 usage.requests,
+                max(0, duration_ms or usage.duration_ms),
+                error_category,
+                cost,
+                currency,
                 iso_now(),
             ),
         )
@@ -74,7 +87,11 @@ class UsageService:
                    COALESCE(SUM(cached_tokens),0) AS cached_tokens,
                    COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens,
                    COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens,
-                   COALESCE(SUM(requests),0) AS requests
+                   COALESCE(SUM(requests),0) AS requests,
+                   COALESCE(SUM(duration_ms),0) AS duration_ms,
+                   COALESCE(SUM(CASE WHEN error_category IS NOT NULL THEN 1 ELSE 0 END),0) AS errors,
+                   COALESCE(SUM(cost),0) AS cost,
+                   COALESCE(MAX(currency), '') AS currency
             FROM usage_events {where}
             """,
             params,
@@ -88,6 +105,10 @@ class UsageService:
             cache_write_tokens=int(row["cache_write_tokens"]),
             reasoning_tokens=int(row["reasoning_tokens"]),
             requests=int(row["requests"]),
+            duration_ms=int(row["duration_ms"]),
+            errors=int(row["errors"]),
+            cost=float(row["cost"] or 0.0),
+            currency=str(row["currency"] or ""),
         )
 
     async def task_totals(self, task_id: int) -> UsageTotals:
@@ -97,13 +118,38 @@ class UsageService:
         return await self._totals("WHERE project_id = ?", (project_id,))
 
     async def daily_totals(self, day: datetime | None = None) -> UsageTotals:
-        target = (day or datetime.now(UTC)).astimezone(UTC).date()
-        start = datetime(target.year, target.month, target.day, tzinfo=UTC)
-        end = start + timedelta(days=1)
+        if day is None:
+            return await self.today_totals()
+        zone = ZoneInfo(self.settings.app.timezone)
+        local = day.astimezone(zone)
+        start = datetime.combine(local.date(), time.min, tzinfo=zone).astimezone(UTC)
+        return await self.range_totals(start, start + timedelta(days=1))
+
+    def _local_day_start(self, *, days_ago: int = 0) -> datetime:
+        zone = ZoneInfo(self.settings.app.timezone)
+        local_now = datetime.now(zone)
+        local_start = datetime.combine(
+            local_now.date() - timedelta(days=days_ago), time.min, tzinfo=zone
+        )
+        return local_start.astimezone(UTC)
+
+    async def range_totals(self, start: datetime, end: datetime) -> UsageTotals:
         return await self._totals(
             "WHERE created_at >= ? AND created_at < ?",
             (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")),
         )
+
+    async def today_totals(self) -> UsageTotals:
+        start = self._local_day_start()
+        return await self.range_totals(start, start + timedelta(days=1))
+
+    async def week_totals(self) -> UsageTotals:
+        start = self._local_day_start(days_ago=6)
+        return await self.range_totals(start, start + timedelta(days=7))
+
+    async def month_totals(self) -> UsageTotals:
+        start = self._local_day_start(days_ago=29)
+        return await self.range_totals(start, start + timedelta(days=30))
 
     async def task_provider_requests(self, task_id: int, provider: str) -> int:
         value = await self.db.scalar(
@@ -132,7 +178,11 @@ class UsageService:
                    COALESCE(SUM(cached_tokens),0) AS cached_tokens,
                    COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens,
                    COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens,
-                   COALESCE(SUM(requests),0) AS requests
+                   COALESCE(SUM(requests),0) AS requests,
+                   COALESCE(SUM(duration_ms),0) AS duration_ms,
+                   COALESCE(SUM(CASE WHEN error_category IS NOT NULL THEN 1 ELSE 0 END),0) AS errors,
+                   COALESCE(SUM(cost),0) AS cost,
+                   COALESCE(MAX(currency), '') AS currency
             FROM usage_events {where} GROUP BY provider
             """,
             params,
@@ -146,6 +196,66 @@ class UsageService:
                 cache_write_tokens=int(row["cache_write_tokens"]),
                 reasoning_tokens=int(row["reasoning_tokens"]),
                 requests=int(row["requests"]),
+                duration_ms=int(row["duration_ms"]),
+                errors=int(row["errors"]),
+                cost=float(row["cost"] or 0.0),
+                currency=str(row["currency"] or ""),
+            )
+        return result
+
+    async def by_model(
+        self,
+        *,
+        task_id: int | None = None,
+        project_id: int | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> dict[tuple[str, str], UsageTotals]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if start is not None:
+            clauses.append("created_at >= ?")
+            params.append(start.isoformat(timespec="seconds"))
+        if end is not None:
+            clauses.append("created_at < ?")
+            params.append(end.isoformat(timespec="seconds"))
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = await self.db.fetchall(
+            f"""
+            SELECT provider, model,
+                   COALESCE(SUM(input_tokens),0) AS input_tokens,
+                   COALESCE(SUM(output_tokens),0) AS output_tokens,
+                   COALESCE(SUM(cached_tokens),0) AS cached_tokens,
+                   COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens,
+                   COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens,
+                   COALESCE(SUM(requests),0) AS requests,
+                   COALESCE(SUM(duration_ms),0) AS duration_ms,
+                   COALESCE(SUM(CASE WHEN error_category IS NOT NULL THEN 1 ELSE 0 END),0) AS errors,
+                   COALESCE(SUM(cost),0) AS cost,
+                   COALESCE(MAX(currency), '') AS currency
+            FROM usage_events {where} GROUP BY provider, model
+            """,
+            params,
+        )
+        result: dict[tuple[str, str], UsageTotals] = {}
+        for row in rows:
+            result[(str(row["provider"]), str(row["model"]))] = UsageTotals(
+                input_tokens=int(row["input_tokens"]),
+                output_tokens=int(row["output_tokens"]),
+                cached_tokens=int(row["cached_tokens"]),
+                cache_write_tokens=int(row["cache_write_tokens"]),
+                reasoning_tokens=int(row["reasoning_tokens"]),
+                requests=int(row["requests"]),
+                duration_ms=int(row["duration_ms"]),
+                errors=int(row["errors"]),
+                cost=float(row["cost"] or 0.0),
+                currency=str(row["currency"] or ""),
             )
         return result
 
@@ -193,23 +303,37 @@ class UsageService:
             )
         return None
 
-    def estimate_cost(self, totals: UsageTotals, provider: str) -> float | None:
-        usage = self.settings.usage
-        if not usage.configured:
+    def estimate_cost(
+        self, totals: UsageTotals, provider: str, model: str | None = None
+    ) -> tuple[float, str] | None:
+        price = self.settings.usage.price_for(provider, model or "")
+        if price is None or not price.configured:
             return None
-        if provider == "kimi":
-            input_price = usage.kimi_input
-            output_price = usage.kimi_output
-        elif provider == "deepseek":
-            input_price = usage.deepseek_input
-            output_price = usage.deepseek_output
-        else:
-            return None
-        if input_price <= 0 and output_price <= 0:
-            return None
-        return (totals.input_tokens / 1_000_000) * input_price + (
-            totals.output_tokens / 1_000_000
-        ) * output_price
+        cache_read = totals.cached_tokens
+        cache_write = totals.cache_write_tokens
+        uncached = max(0, totals.input_tokens - cache_read - cache_write)
+        input_rate = price.input_per_mtok or price.cache_read_per_mtok
+        cost = (
+            uncached / 1_000_000 * input_rate
+            + cache_read / 1_000_000 * (price.cache_read_per_mtok or input_rate)
+            + cache_write / 1_000_000 * (price.cache_write_per_mtok or input_rate)
+            + totals.output_tokens / 1_000_000 * price.output_per_mtok
+        )
+        return cost, price.currency
+
+    def estimate_cost_amount(
+        self, usage: TokenUsage, provider: str, model: str
+    ) -> tuple[float, str]:
+        totals = UsageTotals(
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cached_tokens=usage.cached_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            requests=usage.requests,
+        )
+        estimate = self.estimate_cost(totals, provider, model)
+        return estimate if estimate is not None else (0.0, "")
 
     @staticmethod
     def format_totals(totals: UsageTotals) -> str:
@@ -217,4 +341,8 @@ class UsageService:
             f"вход {totals.input_tokens:,}, выход {totals.output_tokens:,}, "
             f"кэш-чтение {totals.cached_tokens:,}, кэш-запись {totals.cache_write_tokens:,}, "
             f"reasoning {totals.reasoning_tokens:,}, запросов {totals.requests:,}"
-        ).replace(",", " ")
+        ).replace(",", " ") + (
+            f", стоимость {totals.cost:.4f} {totals.currency}"
+            if totals.cost > 0 and totals.currency
+            else ""
+        )
