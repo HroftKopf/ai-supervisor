@@ -72,7 +72,7 @@ persistence. Migration backup is
 
 ## Verification
 
-- **164 passed, 4 skipped**, synthetic credentials only.
+- **170 passed, 4 skipped**, synthetic credentials only.
 - Offline benchmark after the change (single samples, current host): memory search 0.88–1.04 ms,
   context build 0.43–0.54 ms, state transitions median 3.5–3.6 ms, 20 scheduler jobs 0.28–0.30 ms,
   recovery 0.53–0.57 ms, peak context 25,693 B. These are slower than the Phase 2.9 sample
@@ -96,7 +96,8 @@ inflate the result.
 | Provider identity before call | PARTIAL | identity carried on ProviderResponse/usage; not every stage/request link persisted |
 | Canonical roles | VERIFIED offline | canonical_role + tests |
 | Quota isolation | VERIFIED offline | provider-scoped gate + test |
-| Persisted quota state | PARTIAL | `provider_states` + hydrate test; no paid generation recovery probe |
+| Persisted quota state | PARTIAL | `provider_states`, hydrate, `/provider recover` mock tests; paid probe not run |
+| Owner-approved generation recovery | IMPLEMENTED_NOT_VERIFIED | minimal no-tool probe + approval binding + single-flight; offline mock only |
 | Immutable original request | PARTIAL | source_request immutable; amendment flow not implemented |
 | Telegram dedup | PARTIAL | existing middleware; no SQLite task unique key |
 | Evidence manifest | PARTIAL | `EvidenceManifest` + HEAD/dirty invalidation tests; untracked metadata fingerprint is stat-based |

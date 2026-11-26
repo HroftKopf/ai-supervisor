@@ -187,6 +187,7 @@ class KimiClient:
         prompt_cache_key: str | None = None,
         purpose: str = "chat",
         reasoning_effort: str | None = None,
+        no_retries: bool = False,
     ) -> KimiResponse:
         if isinstance(tool_choice, Mapping):
             raise KimiConfigurationError(
@@ -216,7 +217,7 @@ class KimiClient:
         if prompt_cache_key:
             kwargs["extra_body"] = {"prompt_cache_key": prompt_cache_key}
 
-        attempts = self.config.max_retries + 1
+        attempts = 1 if no_retries else self.config.max_retries + 1
         last_error: Exception | None = None
         started = time.monotonic()
         for attempt in range(1, attempts + 1):

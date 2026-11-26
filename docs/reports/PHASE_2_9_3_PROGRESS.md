@@ -19,6 +19,8 @@ Current state after this work: see final commit/report.
 - Explicit `/chat`, `/task`, `/auto`; `/usage` menu/callback HTML fixed.
 - Memory retrieval filters scope before limit and uses query relevance.
 - Health/generation readiness separated; model listing does not clear quota.
+- Owner-approved `/provider recover` with minimal generation probe, single-flight lock,
+  provider/model-bound approval, usage identity registration and persisted AVAILABLE state.
 - No hidden structured-output token escalation.
 - Tests increased from 160 to 163; coverage remains ~68% statements / 51% branches.
 
@@ -26,9 +28,8 @@ Current state after this work: see final commit/report.
 
 - Budget Engine 2.0: no reservation table/lifecycle, no preflight reservation before dispatch, no
   atomic concurrent reservation, no unknown-usage reconciliation.
-- Provider recovery: no owner-approved minimal generation probe; no `/provider recover`.
-  Persisted quota can only be cleared by an explicit code/config action or provider-state cleanup;
-  models.list deliberately does not clear it.
+- Provider recovery is implemented offline with a mock provider: `/provider recover`, single-flight,
+  approval binding and persisted clear. Live paid generation probe was not executed.
 - Context Engine 2.0: typed fragments, per-role fragment budgets, mandatory retention,
   deduplication pipeline and diagnostics are not implemented. Only memory retrieval and reviewer
   worktree freshness are partial.
@@ -41,6 +42,24 @@ Current state after this work: see final commit/report.
   not complete.
 - Learning chapters 12–18 and architecture docs CONTROL_PLANE/PROVIDER_LIFECYCLE/TASK_RECOVERY/
   CONTEXT_ENGINE/BUDGET_ENGINE are not complete.
+
+## Provider recovery test matrix
+
+| Test | Result |
+|---|---|
+| models.list does not clear quota | PASS |
+| successful probe clears persisted block | PASS |
+| restart after successful recovery keeps AVAILABLE | PASS |
+| failed probe keeps block | PASS |
+| network error does not confirm recovery | PASS (direct probe failure/block retained) |
+| probe without approval | PASS (no provider call before approval) |
+| repeated approval cannot generate twice | PASS |
+| concurrent probes are single-flight | PASS |
+| usage belongs to fake provider | PASS |
+| changed provider config invalidates approval | PASS |
+| independent provider quota isolation | PASS |
+
+Live generation probe: NOT RUN (no paid API authorization).
 
 ## Exact next step
 

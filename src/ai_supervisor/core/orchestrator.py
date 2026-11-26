@@ -5,6 +5,7 @@ import functools
 import hashlib
 import json
 import logging
+import uuid
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
@@ -84,6 +85,7 @@ from ai_supervisor.presentation.renderer import (
     error_card,
 )
 from ai_supervisor.providers.base import (
+    ProviderCallIdentity,
     ProviderError,
     ProviderQuotaError,
     ProviderRateLimitError,
@@ -94,6 +96,7 @@ from ai_supervisor.providers.kimi import (
     KimiQuotaError,
     KimiRateLimitError,
 )
+from ai_supervisor.providers.registry import ProviderRecoveryBusy
 
 logger = logging.getLogger(__name__)
 
@@ -2839,6 +2842,124 @@ class Orchestrator:
             ],
         )
 
+    async def request_provider_recovery(self, target: str, user_id: int, chat_id: int) -> None:
+        self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
+        if self.providers is None:
+            await self.notifier.send_text(chat_id, "Провайдеры не инициализированы.")
+            return
+        try:
+            provider_name, provider = self.providers.resolve_target(target)
+        except ProviderError as exc:
+            await self.notifier.send_text(chat_id, f"Провайдер не найден: {exc}")
+            return
+        states = await self.providers.state_snapshot()
+        state = states.get(provider_name, {})
+        if state.get("state") != "QUOTA_EXHAUSTED":
+            await self.notifier.send_text(
+                chat_id,
+                f"{provider_name}: состояние {state.get('state', 'UNKNOWN')}. "
+                "Восстановление требуется только для QUOTA_EXHAUSTED.",
+            )
+            return
+        approval_id = await self.approvals.request(
+            action=Action.PROVIDER_RECOVERY,
+            payload={
+                "kind": "provider_recovery",
+                "provider_id": provider_name,
+                "model_id": provider.model,
+                "account_scope_id": "default",
+            },
+            created_by=user_id,
+            ttl_seconds=600,
+        )
+        await self.notifier.send_text(
+            chat_id,
+            f"Восстановление {provider_name}\n\n"
+            f"Состояние: QUOTA_EXHAUSTED\n"
+            f"Причина: {state.get('reason') or 'квота исчерпана'}\n"
+            f"Последняя проверка: {state.get('last_checked_at') or '—'}\n\n"
+            "Будет выполнен минимальный платный generation probe без инструментов, истории, "
+            "памяти и project context. Подтвердите.",
+            [
+                [
+                    Button("Подтвердить probe", f"apv:{approval_id}"),
+                    Button("Отмена", f"rej:{approval_id}"),
+                ]
+            ],
+        )
+
+    async def _execute_provider_recovery(
+        self, payload: dict[str, Any], user_id: int, chat_id: int
+    ) -> None:
+        if self.providers is None:
+            return
+        provider_name = str(payload.get("provider_id") or "")
+        expected_model = str(payload.get("model_id") or "")
+        provider = self.providers.available().get(provider_name)
+        if provider is None or (expected_model and provider.model != expected_model):
+            await self.notifier.send_text(
+                chat_id,
+                "Конфигурация провайдера изменилась после подтверждения; probe отменён.",
+            )
+            return
+        identity = ProviderCallIdentity(
+            request_id=f"probe-{uuid.uuid4().hex}",
+            logical_call_id=f"probe-{uuid.uuid4().hex}",
+            attempt_id="probe-1",
+            provider_id=provider_name,
+            account_scope_id=str(payload.get("account_scope_id") or "default"),
+            model_id=provider.model,
+            role="provider_recovery",
+            reasoning_profile="minimal",
+        )
+        try:
+            await self.usage.ensure_kimi_budget(0)
+            response = await self.providers.probe_generation(provider_name, identity)
+            await self.usage.record(
+                provider=provider_name,
+                model=provider.model,
+                usage=response.usage,
+                role="provider_recovery",
+                request_id=identity.request_id,
+                logical_call_id=identity.logical_call_id,
+                attempt_id=identity.attempt_id,
+                provider_id=provider_name,
+                account_scope_id=identity.account_scope_id,
+                reasoning_profile=identity.reasoning_profile,
+            )
+            await self.providers.clear_provider_quota(provider_name)
+        except ProviderRecoveryBusy:
+            await self.notifier.send_text(
+                chat_id, "Probe для этой конфигурации уже выполняется; повторный не запущен."
+            )
+            return
+        except (ProviderError, KimiError) as exc:
+            category = type(exc).__name__
+            await self.providers.persist_state(
+                provider_name,
+                "QUOTA_EXHAUSTED",
+                category=category,
+                reason=self.redactor.redact(str(exc))[:500],
+            )
+            await self.notifier.send_text(
+                chat_id,
+                f"Восстановление {provider_name} не подтверждено.\n"
+                f"Причина: {category}. Блокировка сохранена.\n"
+                "Точное время восстановления квоты провайдером не сообщено.",
+            )
+            return
+        await self.notifier.send_text(
+            chat_id,
+            f"Провайдер {provider_name} восстановлен: минимальная генерация успешна.\n"
+            "Блокировка снята. Ожидающие задачи не запускаются автоматически; "
+            "продолжите нужные через /resume.",
+        )
+        active = await self.tasks.active(None)
+        if active:
+            ids = ", ".join(f"#{task.id:03d}" for task in active[:20])
+            await self.notifier.send_text(chat_id, f"Ожидают продолжения: {ids}.")
+
     async def approve_action(self, approval_id: int, user_id: int, chat_id: int) -> None:
         self._assert_owner(user_id)
         self._assert_owner_chat(chat_id)
@@ -2849,6 +2970,9 @@ class Orchestrator:
             await self.notifier.send_text(chat_id, f"Подтверждение отклонено: {exc}")
             return
         action = Action(approval["action"])
+        if action is Action.PROVIDER_RECOVERY:
+            await self._execute_provider_recovery(payload, user_id, chat_id)
+            return
         if payload.get("stage_id"):
             await self._handle_stage_approval(
                 int(payload["task_id"]),

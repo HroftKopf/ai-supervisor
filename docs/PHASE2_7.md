@@ -105,7 +105,7 @@ Baseline 2.6.0 и active 2.7.0 сохранены.
 
 ## Фактические результаты
 
-- `pytest`: **164 passed, 4 skipped**.
+- `pytest`: **170 passed, 4 skipped**.
 - `ruff check .`: без ошибок.
 - DSH/bwrap/egress: **2 integration tests passed**.
 - Задача #004: `completed`, 5/5, commit/remote SHA `42d92f2e999f`; remote проверен.

@@ -49,6 +49,7 @@ class Action(StrEnum):
     GITHUB_REPOSITORY_CREATE = "github_repository_create"
     CONFIG_IMPORT = "config_import"
     STAGE_APPROVAL = "stage_approval"
+    PROVIDER_RECOVERY = "provider_recovery"
     BYPASS_PERMISSIONS = "bypass_permissions"
     EXPAND_OWN_PERMISSIONS = "expand_own_permissions"
     READ_OTHER_SECRETS = "read_other_secrets"
@@ -79,6 +80,7 @@ RISK_LEVELS: dict[Action, RiskLevel] = {
     Action.GITHUB_REPOSITORY_CREATE: RiskLevel.HIGH,
     Action.CONFIG_IMPORT: RiskLevel.HIGH,
     Action.STAGE_APPROVAL: RiskLevel.HIGH,
+    Action.PROVIDER_RECOVERY: RiskLevel.HIGH,
     Action.DELETE_IMPORTANT_DATA: RiskLevel.HIGH,
     Action.SEND_SECRET_EXTERNALLY: RiskLevel.HIGH,
     Action.DESTRUCTIVE_COMMAND: RiskLevel.HIGH,
@@ -117,6 +119,7 @@ LEVELS: dict[Action, PermissionLevel] = {
     Action.GITHUB_REPOSITORY_CREATE: PermissionLevel.APPROVAL_REQUIRED,
     Action.CONFIG_IMPORT: PermissionLevel.APPROVAL_REQUIRED,
     Action.STAGE_APPROVAL: PermissionLevel.APPROVAL_REQUIRED,
+    Action.PROVIDER_RECOVERY: PermissionLevel.APPROVAL_REQUIRED,
     Action.BYPASS_PERMISSIONS: PermissionLevel.DENIED,
     Action.EXPAND_OWN_PERMISSIONS: PermissionLevel.DENIED,
     Action.READ_OTHER_SECRETS: PermissionLevel.DENIED,

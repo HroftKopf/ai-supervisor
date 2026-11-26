@@ -295,7 +295,10 @@ Startup fails with a clear `ConfigError` for:
 - each role’s provider/model availability without printing keys.
 
 `/models`, `/provider info`, `/provider test [role]` expose the same model diagnostics in Telegram;
-credentials are never shown.
+credentials are never shown. A persisted `QUOTA_EXHAUSTED` state can be cleared only by the
+owner-approved `/provider recover <provider-or-role>` generation probe; `/provider test` never
+clears it on a model-list result. The probe is minimal, tool/history/memory-free and is not run
+automatically.
 
 
 ## Safe diagnostics

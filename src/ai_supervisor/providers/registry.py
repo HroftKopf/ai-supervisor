@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from typing import Any
 
@@ -14,6 +15,7 @@ from ai_supervisor.providers.adapters import (
 from ai_supervisor.providers.base import (
     AgentRole,
     LLMProvider,
+    ProviderCallIdentity,
     ProviderCapabilities,
     ProviderConfigurationError,
     ProviderQuotaError,
@@ -23,6 +25,14 @@ from ai_supervisor.providers.kimi import KimiClient, KimiClientConfig
 from ai_supervisor.providers.state import ProviderStateStore
 
 ROLES = tuple(role.value for role in AgentRole)
+
+
+class ProviderRecoveryError(ProviderQuotaError):
+    pass
+
+
+class ProviderRecoveryBusy(ProviderRecoveryError):
+    pass
 
 
 class ProviderRegistry:
@@ -36,6 +46,7 @@ class ProviderRegistry:
         self.state_store = ProviderStateStore(db) if db is not None else None
         self._providers: dict[str, LLMProvider] = {}
         self._quota_blocked: set[str] = set()
+        self._recovery_locks: dict[str, asyncio.Lock] = {}
         self._roles: dict[str, str] = {
             role: settings.llm.roles.get(role, settings.llm.default_provider) for role in ROLES
         }
@@ -104,10 +115,45 @@ class ProviderRegistry:
             )
         if name in self._quota_blocked:
             raise ProviderQuotaError(
-                f"provider {name} is paused after quota exhaustion; "
-                "run /provider test to check availability"
+                f"provider {name} is paused after quota exhaustion; run /provider recover {{name}}"
             )
         return provider
+
+    def resolve_target(self, target: str) -> tuple[str, LLMProvider]:
+        canonical = canonical_role(target)
+        if canonical in ROLES:
+            name = self._roles[canonical]
+            provider = self._providers.get(name)
+            if provider is None:
+                raise ProviderConfigurationError(
+                    f"role {canonical} is configured for unavailable provider {name}"
+                )
+            return name, provider
+        provider = self._providers.get(target)
+        if provider is None:
+            raise ProviderConfigurationError(f"provider {target!r} is not available/configured")
+        return target, provider
+
+    async def probe_generation(self, provider_name: str, identity: ProviderCallIdentity) -> Any:
+        """Single-flight, no-tool, no-history minimal generation probe.
+
+        Deliberately bypasses the quota gate; it is reachable only through the
+        owner-approved recovery path.
+        """
+        provider = self._providers.get(provider_name)
+        if provider is None:
+            raise ProviderConfigurationError(f"provider {provider_name!r} is not configured")
+        lock = self._recovery_locks.setdefault(provider_name, asyncio.Lock())
+        if lock.locked():
+            raise ProviderRecoveryBusy(f"recovery probe for {provider_name} is already running")
+        async with lock:
+            response = await provider.probe(max_output_tokens=8)
+            return response.model_copy(update={"identity": identity})
+
+    async def clear_provider_quota(self, provider_name: str) -> None:
+        self.clear_quota(provider_name)
+        if self.state_store is not None:
+            await self.state_store.set_available(provider_name)
 
     def mark_quota_exhausted(self, role: str) -> None:
         role = canonical_role(role)

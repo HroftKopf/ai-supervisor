@@ -112,7 +112,7 @@ refactor, permissions, contradictions, already_done, unsupported, injection). Ha
 
 ## Фактические результаты
 
-- `pytest`: **164 passed, 4 skipped**.
+- `pytest`: **170 passed, 4 skipped**.
 - `ruff check .`: без ошибок.
 - DSH/bwrap/egress: **2 integration tests passed**.
 - `ai-supervisor doctor`: GitHub auth и egress OK.

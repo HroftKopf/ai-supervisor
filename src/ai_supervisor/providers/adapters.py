@@ -111,6 +111,17 @@ class KimiProvider:
         except Exception as exc:
             raise normalize_error(exc, self.name) from exc
 
+    async def probe(self, *, max_output_tokens: int = 8) -> ProviderResponse:
+        response = await self.client.complete(
+            [{"role": "user", "content": "Reply with OK."}],
+            max_completion_tokens=max_output_tokens,
+            tool_choice=None,
+            purpose="provider_recovery",
+            reasoning_effort="low" if self.capabilities.reasoning else None,
+            no_retries=True,
+        )
+        return _convert(response, self.name)
+
     async def health(self) -> ProviderHealth:
         try:
             models = await self.client.validate_model()
@@ -177,6 +188,17 @@ class OpenAICompatibleProvider:
             return converted.model_copy(update={"identity": identity})
         except Exception as exc:
             raise normalize_error(exc, self.name) from exc
+
+    async def probe(self, *, max_output_tokens: int = 8) -> ProviderResponse:
+        response = await self._client.complete(
+            [{"role": "user", "content": "Reply with OK."}],
+            max_completion_tokens=max_output_tokens,
+            tool_choice=None,
+            purpose="provider_recovery",
+            reasoning_effort="low" if self.capabilities.reasoning else None,
+            no_retries=True,
+        )
+        return _convert(response, self.name)
 
     async def health(self) -> ProviderHealth:
         try:
@@ -470,6 +492,17 @@ class OpenAIProvider:
         error = klass(f"openai: {name}: {str(exc)[:500]}")
         error.provider = self.name
         return error
+
+    async def probe(self, *, max_output_tokens: int = 8) -> ProviderResponse:
+        return await self.complete(
+            [{"role": "user", "content": "Reply with OK."}],
+            max_completion_tokens=max_output_tokens,
+            tools=None,
+            tool_choice=None,
+            prompt_cache_key=None,
+            purpose="provider_recovery",
+            reasoning_effort="low" if self.capabilities.reasoning else None,
+        )
 
     async def health(self) -> ProviderHealth:
         try:

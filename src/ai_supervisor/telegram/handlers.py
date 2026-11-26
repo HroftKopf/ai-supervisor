@@ -53,7 +53,7 @@ HELP_TEXT = """AI Supervisor — команды
 /usage [today|week|month|task <id>] — расход токенов
 /memory [query] — память; /memory add <текст>, /memory edit <id> <текст>, /memory stale <id> on|off, /memory delete <id>
 /models — управляющие модели по ролям
-/provider [info|test [role]|select <role> <provider>] — провайдеры без секретов
+/provider [info|test [role]|recover <provider-or-role>|select <role> <provider>] — провайдеры без секретов
 /settings — настройки без секретов
 /doctor — быстрая диагностика
 /github info <owner/repo> — информация о репозитории
@@ -712,8 +712,22 @@ class Handlers:
                         f"(category={state.get('failure_category') or '—'}, "
                         f"checked={state.get('last_checked_at') or '—'})"
                     )
+                    if state.get("state") == "QUOTA_EXHAUSTED":
+                        lines.append(f"  восстановление: /provider recover {name}")
             lines += ["", "Ключи не отображаются."]
             await self.notifier.send_text(message.chat.id, "\n".join(lines))
+            return
+        if arg == "recover":
+            if len(parts) != 3:
+                await self.notifier.send_text(
+                    message.chat.id, "Использование: /provider recover <provider-or-role>"
+                )
+                return
+            await self.orchestrator.request_provider_recovery(
+                parts[2],
+                message.from_user.id,
+                message.chat.id,  # type: ignore[union-attr]
+            )
             return
         if arg == "test":
             role = parts[2] if len(parts) > 2 else "chat"
