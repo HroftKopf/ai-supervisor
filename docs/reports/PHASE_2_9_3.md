@@ -27,7 +27,7 @@ Baseline: `a8fcb07`. No paid API calls, no production credentials used, no produ
 - `core/request_gateway.py` builds a `RequestEnvelope` with request/correlation IDs, owner/chat/
   conversation/project IDs, source message ID, normalized redacted text, attachment refs,
   timestamp, mode, source revision and policy ID.
-- SQLite schema v7 adds `tasks.request_id`, `source_request`, `request_revision`,
+- SQLite schema v8 adds `tasks.request_id`, `source_request`, `request_revision`,
   `intent_source`.
 - New tasks store the original request at creation. Planner uses `task.source_request`; new
   conversation messages cannot replace it.
@@ -66,12 +66,13 @@ evidence is preserved and the task is blocked for an owner decision rather than 
 
 ### Schema
 
-SQLite schema v7 adds request provenance fields. Migration backup is
-`pre-migration-v7-*.db`; additive columns preserve existing data.
+SQLite schema v8 adds request provenance fields, usage identity columns and provider state
+persistence. Migration backup is
+`pre-migration-v8-*.db`; additive columns preserve existing data.
 
 ## Verification
 
-- **160 passed, 4 skipped**, synthetic credentials only.
+- **163 passed, 4 skipped**, synthetic credentials only.
 - Offline benchmark after the change (single samples, current host): memory search 0.88–1.04 ms,
   context build 0.43–0.54 ms, state transitions median 3.5–3.6 ms, 20 scheduler jobs 0.28–0.30 ms,
   recovery 0.53–0.57 ms, peak context 25,693 B. These are slower than the Phase 2.9 sample
@@ -84,15 +85,35 @@ SQLite schema v7 adds request provenance fields. Migration backup is
 
 ## Coverage
 
-Coverage is not at the Phase 2.9.3 target. The current measured result is approximately **68%
-statements / 51% branches (64% combined)**. Telegram handlers, WorkerManager edge branches,
+Coverage is not at the Phase 2.9.3 target. The current measured result is approximately **68% statements / 51% branches (64% combined)**. Telegram handlers, WorkerManager edge branches,
 sandbox mount failures and a full fault matrix remain uncovered. No exclusions were used to
 inflate the result.
+
+## Requirement status (continuation)
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| Provider identity before call | PARTIAL | identity carried on ProviderResponse/usage; not every stage/request link persisted |
+| Canonical roles | VERIFIED offline | canonical_role + tests |
+| Quota isolation | VERIFIED offline | provider-scoped gate + test |
+| Persisted quota state | PARTIAL | `provider_states` + hydrate test; no paid generation recovery probe |
+| Immutable original request | PARTIAL | source_request immutable; amendment flow not implemented |
+| Telegram dedup | PARTIAL | existing middleware; no SQLite task unique key |
+| Evidence manifest | PARTIAL | `EvidenceManifest` + HEAD/dirty invalidation tests; untracked metadata fingerprint is stat-based |
+| Review checkpoint | PARTIAL | approved resume works; non-approved checkpoint blocks instead of full parity |
+| Budget Engine 2.0 | NOT_IMPLEMENTED | no reservation lifecycle/preflight |
+| Context Engine 2.0 | PARTIAL | relevance memory + fresh reviewer worktree; no fragment budgets |
+| Orchestrator decomposition | NOT_IMPLEMENTED | unchanged monolith |
+| Explicit modes | VERIFIED offline | /chat /task /auto tests |
+| Documentation 12–18 | PARTIAL | chapters + architecture notes added; detailed diagrams/verification incomplete |
 
 ## Remaining limitations
 
 - Full Context Engine typed fragments and per-role token budgets are not implemented; only
   relevance retrieval and refreshed reviewer context.
+- Provider state persistence exists in `provider_states`; a safe owner-approved generation probe
+  and `/provider recover` remain unimplemented, so a persisted quota block has no paid recovery
+  path.
 - Usage reservation (`reserve → dispatch → reconcile`) is not implemented; preflight is still
   conservative token/request checks. No concurrency-safe financial hard cap is claimed.
 - Provider `account_scope_id`, endpoint/model-scoped quota and multi-account support are not
@@ -107,6 +128,6 @@ inflate the result.
 
 ## Update / rollback
 
-Update normally; schema v7 is additive with backup. Rollback the commit; existing tasks retain
+Update normally; schema v8 is additive with backup. Rollback the commit; existing tasks retain
 request provenance columns and legacy tasks remain readable. Do not delete logs or backups without
 owner approval.
