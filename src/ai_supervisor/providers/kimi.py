@@ -184,6 +184,7 @@ class KimiClient:
         tool_choice: Literal["auto", "none", "required"] | None = None,
         prompt_cache_key: str | None = None,
         purpose: str = "chat",
+        reasoning_effort: str | None = None,
     ) -> KimiResponse:
         if isinstance(tool_choice, Mapping):
             raise KimiConfigurationError(
@@ -204,7 +205,7 @@ class KimiClient:
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_completion_tokens": max_completion_tokens or self.config.max_completion_tokens,
-            "reasoning_effort": self.config.reasoning_effort,
+            "reasoning_effort": reasoning_effort or self.config.reasoning_effort,
         }
         if tools:
             kwargs["tools"] = list(tools)

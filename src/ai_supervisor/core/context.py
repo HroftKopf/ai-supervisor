@@ -62,7 +62,14 @@ class ProjectContextBuilder:
         self.settings = settings
         self.redactor = redactor
 
-    async def build(self, project: ProjectRecord, *, include_files: bool = True) -> str:
+    async def build(
+        self,
+        project: ProjectRecord,
+        *,
+        include_files: bool = True,
+        goal: str = "",
+        role: str = "planner",
+    ) -> str:
         root = Path(project.path).resolve()
         if not root.is_dir():
             raise ContextError(f"каталог проекта недоступен: {root}")
@@ -103,7 +110,7 @@ class ProjectContextBuilder:
             "Файлы (ограниченный список):\n" + "\n".join(f"- {item}" for item in visible[:250])
         )
         if include_files:
-            selected = _select_important(visible)
+            selected = _select_important(visible, goal=goal)
             budget = max(
                 2000, self.settings.security.max_project_context_chars - len("\n".join(parts))
             )
@@ -166,13 +173,20 @@ def _skip_path(path: Path) -> bool:
     return any(part in SKIP_DIRS for part in path.parts)
 
 
-def _select_important(files: list[str]) -> list[str]:
+def _select_important(files: list[str], *, goal: str = "") -> list[str]:
     selected: list[str] = []
-    for name in IMPORTANT_NAMES:
+    terms = [term for term in goal.lower().replace("/", " ").split() if len(term) >= 3][:8]
+    for term in terms:
         for file in files:
-            if Path(file).name == name and file not in selected:
+            if term in file.lower() and file not in selected:
                 selected.append(file)
                 break
+    if len(selected) < 6:
+        for name in IMPORTANT_NAMES:
+            for file in files:
+                if Path(file).name == name and file not in selected:
+                    selected.append(file)
+                    break
     if len(selected) < 6:
         for file in files:
             if file not in selected and not file.startswith("."):

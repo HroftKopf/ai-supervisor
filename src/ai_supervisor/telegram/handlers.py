@@ -12,10 +12,11 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
 
 from ai_supervisor.config import Settings
-from ai_supervisor.core.interfaces import Attachment, IncomingMessage
+from ai_supervisor.core.interfaces import Attachment, Button, IncomingMessage
 from ai_supervisor.core.orchestrator import Orchestrator
 from ai_supervisor.memory.projects import ProjectError, ProjectService
 from ai_supervisor.models import ProjectPolicy, TaskRecord
+from ai_supervisor.presentation.renderer import main_menu, settings_card
 from ai_supervisor.telegram.auth import OwnerMiddleware
 from ai_supervisor.telegram.notifications import BotNotifier
 
@@ -124,12 +125,22 @@ class Handlers:
     # ------------------------------------------------------------------
 
     async def cmd_start(self, message: Message) -> None:
+        project = await self.orchestrator.current_project(message.chat.id)
+        active = await self.orchestrator.tasks.active(project.id if project else None)
+        mode = await self.orchestrator.conversations.get_ui_mode(message.chat.id)
         await self.notifier.send_text(
             message.chat.id,
-            "AI Supervisor запущен.\n\n"
-            + await self.orchestrator.status_text(message.chat.id)
-            + "\n\n"
-            + HELP_TEXT,
+            main_menu(
+                project_name=project.name if project else None,
+                active=len(active),
+                mode=mode,
+            ),
+            [
+                [Button("Проекты", "menu:projects"), Button("Задачи", "menu:tasks")],
+                [Button("История", "menu:history"), Button("API", "menu:usage")],
+                [Button("Состояние", "menu:status"), Button("Настройки", "menu:settings")],
+            ],
+            parse_mode="HTML",
         )
 
     async def cmd_help(self, message: Message) -> None:
@@ -402,7 +413,7 @@ class Handlers:
     async def cmd_task_info(self, message: Message) -> None:
         task = await self._task_from_message(message)
         if task:
-            await self.notifier.send_text(message.chat.id, self._task_details(task))
+            await self.orchestrator.send_details(task.id, message.chat.id)
 
     async def cmd_queue(self, message: Message) -> None:
         await self.notifier.send_text(
@@ -598,8 +609,18 @@ class Handlers:
         )
 
     async def cmd_settings(self, message: Message) -> None:
+        mode = await self.orchestrator.conversations.get_ui_mode(message.chat.id)
         await self.notifier.send_text(
-            message.chat.id, await self.orchestrator.settings_text(message.chat.id)
+            message.chat.id,
+            settings_card(
+                mode=mode,
+                lines=(await self.orchestrator.settings_text(message.chat.id)).splitlines()[:30],
+            ),
+            [
+                [Button("compact", "ui:mode:compact"), Button("detailed", "ui:mode:detailed")],
+                [Button("debug", "ui:mode:debug")],
+            ],
+            parse_mode="HTML",
         )
 
     async def cmd_unknown(self, message: Message) -> None:
@@ -725,7 +746,53 @@ class Handlers:
         await callback.answer("Принято")
         task_id = int(arg) if arg.isdigit() else None
         try:
-            if action == "acc" and task_id is not None:
+            if action == "ui" and data.startswith("ui:mode:"):
+                mode = data.split(":", 2)[2]
+                try:
+                    await self.orchestrator.conversations.set_ui_mode(chat_id, mode)
+                except ValueError:
+                    await callback.answer("Неизвестный режим", show_alert=True)
+                    return
+                await self.notifier.send_text(chat_id, f"Режим интерфейса: {mode}.")
+                await self.orchestrator.progress.update(
+                    task_id or 0, force=True, chat_id=chat_id
+                ) if task_id else None
+                return
+            if action == "menu":
+                if arg == "projects":
+                    await self.cmd_projects(await self._synthetic_message(callback))
+                elif arg == "tasks":
+                    await self.notifier.send_text(
+                        chat_id, await self.orchestrator.tasks_text(chat_id)
+                    )
+                elif arg == "history":
+                    await self.notifier.send_text(
+                        chat_id, await self.orchestrator.tasks_text(chat_id)
+                    )
+                elif arg == "usage":
+                    await self.notifier.send_text(
+                        chat_id, await self.orchestrator.usage_text(chat_id)
+                    )
+                elif arg == "status":
+                    await self.notifier.send_text(
+                        chat_id, await self.orchestrator.status_text(chat_id)
+                    )
+                elif arg == "settings":
+                    await self.notifier.send_text(
+                        chat_id, "Откройте /settings для режима интерфейса."
+                    )
+                return
+            if action == "det" and task_id is not None:
+                await self.orchestrator.send_details(task_id, chat_id)
+            elif action == "compact" and task_id is not None:
+                await self.orchestrator.send_compact(task_id, chat_id)
+            elif action == "use" and task_id is not None:
+                await self.notifier.send_text(
+                    chat_id, await self.orchestrator.usage_text(chat_id, task_id=task_id)
+                )
+            elif action == "rep" and task_id is not None:
+                await self.orchestrator.send_report(task_id, chat_id)
+            elif action == "acc" and task_id is not None:
                 await self.orchestrator.accept_task(task_id, user_id, chat_id)
             elif action == "rew" and task_id is not None:
                 await self.orchestrator.rework_task(task_id, user_id, chat_id)
@@ -810,6 +877,10 @@ class Handlers:
         if task.error:
             lines.append(f"Ошибка: {task.error[:800]}")
         return self.orchestrator.redactor.redact("\n".join(lines))
+
+    async def _synthetic_message(self, callback: CallbackQuery) -> Message:
+        # Only used for menu callbacks that share command handlers.
+        return callback.message  # type: ignore[return-value]
 
 
 def _command_tail(text: str) -> str:

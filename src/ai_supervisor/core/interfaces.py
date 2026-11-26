@@ -8,7 +8,8 @@ from typing import Protocol
 @dataclass(slots=True, frozen=True)
 class Button:
     text: str
-    callback_data: str
+    callback_data: str = ""
+    url: str | None = None
 
 
 @dataclass(slots=True)
@@ -39,6 +40,8 @@ class Notifier(Protocol):
         chat_id: int,
         text: str,
         buttons: list[list[Button]] | None = None,
+        *,
+        parse_mode: str | None = None,
     ) -> int | None: ...
 
     async def send_document(
@@ -54,3 +57,13 @@ class Notifier(Protocol):
         message_id: int,
         buttons: list[list[Button]] | None,
     ) -> None: ...
+
+    async def edit_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        buttons: list[list[Button]] | None = None,
+        *,
+        parse_mode: str | None = None,
+    ) -> bool: ...

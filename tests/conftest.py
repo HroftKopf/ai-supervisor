@@ -39,6 +39,9 @@ OWNER_ID = 424242
 
 
 class FakeSupervisor:
+    def prompt_metadata(self) -> dict[str, str]:
+        return {"version": "test", "supervisor": "test", "planner": "test"}
+
     def __init__(self) -> None:
         self.intent = IntentKind.TASK
         self.review_verdict = ReviewVerdict.ACCEPT
@@ -161,13 +164,34 @@ class FakeWorkers:
 class FakeNotifier:
     def __init__(self) -> None:
         self.messages: list[tuple[int, str, list[list[Button]] | None]] = []
+        self.edits: list[tuple[int, int, str, list[list[Button]] | None]] = []
+        self.fail_edits = False
         self.documents: list[tuple[int, Path]] = []
 
     async def send_text(
-        self, chat_id: int, text: str, buttons: list[list[Button]] | None = None
+        self,
+        chat_id: int,
+        text: str,
+        buttons: list[list[Button]] | None = None,
+        *,
+        parse_mode: str | None = None,
     ) -> int:
         self.messages.append((chat_id, text, buttons))
         return len(self.messages)
+
+    async def edit_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        buttons: list[list[Button]] | None = None,
+        *,
+        parse_mode: str | None = None,
+    ) -> bool:
+        if self.fail_edits:
+            return False
+        self.edits.append((chat_id, message_id, text, buttons))
+        return True
 
     async def send_document(self, chat_id: int, path: Path, caption: str = "") -> None:
         self.documents.append((chat_id, path))

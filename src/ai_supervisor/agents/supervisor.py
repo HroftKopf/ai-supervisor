@@ -9,6 +9,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from ai_supervisor.agents.prompts import PromptRegistry
 from ai_supervisor.config import Settings
 from ai_supervisor.core.redaction import SecretRedactor
 from ai_supervisor.models import (
@@ -265,11 +266,22 @@ def _read_prompt(name: str) -> str:
 
 
 class SupervisorAgent:
-    def __init__(self, kimi: KimiClient, settings: Settings, redactor: SecretRedactor) -> None:
+    def __init__(
+        self,
+        kimi: KimiClient,
+        settings: Settings,
+        redactor: SecretRedactor,
+        *,
+        prompt_root: Path | None = None,
+    ) -> None:
         self.kimi = kimi
         self.settings = settings
         self.redactor = redactor
-        self.base_prompt = _read_prompt("supervisor.md")
+        self.prompts = PromptRegistry(prompt_root or PROMPTS_DIR)
+        self.base_prompt = self.prompts.get("supervisor").text
+
+    def prompt_metadata(self) -> dict[str, str]:
+        return self.prompts.metadata()
 
     async def classify(
         self,
@@ -278,17 +290,10 @@ class SupervisorAgent:
         conversation_block: str,
         latest_user_message: str,
         conversation_id: int,
+        reasoning_effort: str | None = None,
+        max_completion_tokens: int = 2048,
     ) -> tuple[IntentResult, TokenUsage]:
-        system = (
-            self.base_prompt
-            + "\n\n# Режим классификации\n"
-            + "Определи намерение владельца по последнему сообщению и контексту. "
-            + "`task` — только явная просьба изменить проект/выполнить работу с кодом или системой. "
-            + "Обсуждение, вопрос, оценка, гипотеза, «как думаешь», «стоит ли» — это `chat`, даже если речь о коде. "
-            + "Если владелец просит переписать/исправить/добавить/удалить/запустить — это `task`. "
-            + "Сомнительные случаи с низкой уверенностью не запускают изменения. "
-            + "Верни результат только инструментом submit_intent."
-        )
+        system = self.prompts.get("classifier").text
         messages = [
             {"role": "system", "content": system},
             {
@@ -306,7 +311,8 @@ class SupervisorAgent:
             tool=INTENT_TOOL,
             expected_name="submit_intent",
             schema=IntentResult,
-            max_completion_tokens=8192,
+            max_completion_tokens=max_completion_tokens,
+            reasoning_effort=reasoning_effort,
             prompt_cache_key=f"conv-{conversation_id}-classify",
             purpose="classify",
         )
@@ -321,8 +327,10 @@ class SupervisorAgent:
         project_context: str,
         latest_user_message: str,
         conversation_id: int,
+        reasoning_effort: str | None = None,
+        max_completion_tokens: int | None = None,
     ) -> tuple[TaskSpec, TokenUsage]:
-        system = self.base_prompt + "\n\n" + _read_prompt("planner.md")
+        system = self.prompts.get("planner").text
         user = (
             f"ПРОЕКТ:\n{project_block}\n\n"
             f"ПАМЯТЬ (не разрешения):\n{memory_block or '(пусто)'}\n\n"
@@ -340,7 +348,8 @@ class SupervisorAgent:
             tool=TASK_SPEC_TOOL,
             expected_name="submit_task_spec",
             schema=TaskSpec,
-            max_completion_tokens=self.settings.kimi.max_completion_tokens,
+            max_completion_tokens=max_completion_tokens or self.settings.kimi.max_completion_tokens,
+            reasoning_effort=reasoning_effort,
             prompt_cache_key=f"conv-{conversation_id}-plan",
             purpose="plan",
         )
@@ -353,8 +362,10 @@ class SupervisorAgent:
         spec: TaskSpec,
         evidence: Evidence,
         project_context: str,
+        reasoning_effort: str | None = None,
+        max_completion_tokens: int = 8192,
     ) -> tuple[ReviewResult, TokenUsage]:
-        system = self.base_prompt + "\n\n" + _read_prompt("reviewer.md")
+        system = self.prompts.get("reviewer").text
         user = (
             f"ПРОЕКТ:\n{project_block}\n\n"
             f"ТЕХНИЧЕСКОЕ ЗАДАНИЕ:\n{json.dumps(spec.model_dump(), ensure_ascii=False, indent=2)}\n\n"
@@ -371,7 +382,8 @@ class SupervisorAgent:
             tool=REVIEW_TOOL,
             expected_name="submit_review",
             schema=ReviewResult,
-            max_completion_tokens=16384,
+            max_completion_tokens=max_completion_tokens,
+            reasoning_effort=reasoning_effort,
             prompt_cache_key=f"task-{evidence.task_id}-review",
             purpose="review",
         )
@@ -386,6 +398,8 @@ class SupervisorAgent:
         messages: Sequence[dict[str, Any]],
         images: Sequence[tuple[bytes, str]] = (),
         conversation_id: int,
+        reasoning_effort: str | None = None,
+        max_completion_tokens: int = 4096,
     ) -> KimiResponse:
         system_parts = [self.base_prompt]
         if project_block:
@@ -414,9 +428,10 @@ class SupervisorAgent:
         response = await self.kimi.complete(
             api_messages,
             tool_choice="auto",
-            max_completion_tokens=16384,
+            max_completion_tokens=max_completion_tokens,
             prompt_cache_key=f"conv-{conversation_id}",
             purpose="chat",
+            reasoning_effort=reasoning_effort,
         )
         return response
 
@@ -425,7 +440,7 @@ class SupervisorAgent:
             [
                 {
                     "role": "system",
-                    "content": _read_prompt("summarizer.md").replace(
+                    "content": self.prompts.get("summarizer").text.replace(
                         "{max_chars}", str(self.settings.memory.summary_max_chars)
                     ),
                 },
@@ -446,6 +461,7 @@ class SupervisorAgent:
         max_completion_tokens: int,
         prompt_cache_key: str,
         purpose: str,
+        reasoning_effort: str | None = None,
     ) -> StructuredReply:
         current_messages = list(messages)
         last_error: str | None = None
@@ -458,8 +474,11 @@ class SupervisorAgent:
                 max_completion_tokens=max_completion_tokens,
                 prompt_cache_key=prompt_cache_key,
                 purpose=purpose,
+                reasoning_effort=reasoning_effort,
             )
             usage_total = usage_total.merge(response.usage)
+            if response.finish_reason == "length" and attempt == 0:
+                max_completion_tokens = min(max_completion_tokens * 2, 131072)
             try:
                 raw = parse_tool_call(response, expected_name)
                 value = schema.model_validate(raw)

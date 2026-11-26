@@ -36,3 +36,14 @@ async def test_per_model_pricing_and_period_totals(database, settings) -> None:
     assert today.cost == pytest.approx(value.cost)
     assert await service.week_totals()
     assert await service.month_totals()
+    await service.record(
+        provider="kimi",
+        model="k3.1-pro",
+        usage=TokenUsage(input_tokens=10, output_tokens=2, requests=1),
+        role="planning",
+        prompt_version="2.6.0",
+        routing_level=2,
+        context_chars=123,
+    )
+    by_role = await service.by_role()
+    assert by_role["planning"].total_tokens == 12

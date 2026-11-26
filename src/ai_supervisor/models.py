@@ -380,6 +380,7 @@ class TaskSpec(BaseModel):
     token_budget: int = Field(default=0, ge=0)
     max_attempts: int = Field(default=0, ge=0, le=100)
     max_minutes: int = Field(default=0, ge=0, le=10080)
+    routing_level: int = Field(default=0, ge=0, le=3)
 
     @field_validator("acceptance_criteria", "steps", "constraints", "risks")
     @classmethod
@@ -659,6 +660,10 @@ class TaskRecord(BaseModel):
     diff_path: str | None = None
     logs_path: str | None = None
     cancel_requested: bool = False
+    ui_chat_id: int | None = None
+    ui_message_id: int | None = None
+    ui_hash: str | None = None
+    ui_updated_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
     started_at: datetime | None = None
@@ -817,6 +822,7 @@ class ConversationRecord(BaseModel):
     summary: str | None = None
     summary_upto_id: int | None = None
     is_active: bool = True
+    ui_mode: str = "compact"
     created_at: datetime
     updated_at: datetime
 

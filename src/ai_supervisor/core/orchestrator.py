@@ -42,6 +42,7 @@ from ai_supervisor.core.permissions import (
 )
 from ai_supervisor.core.redaction import SecretRedactor
 from ai_supervisor.core.reviewer import ReviewGate, build_report
+from ai_supervisor.core.routing import RoutingLevel, RoutingPolicy
 from ai_supervisor.core.usage import LimitExceeded, UsageService
 from ai_supervisor.core.validation import TaskValidator
 from ai_supervisor.core.worker_manager import WorkerError, WorkerManager, WorkerScheduler
@@ -67,6 +68,12 @@ from ai_supervisor.models import (
     TransitionError,
     WorkerResult,
     ensure_transition,
+)
+from ai_supervisor.presentation.progress import ProgressManager
+from ai_supervisor.presentation.renderer import (
+    completion_card,
+    details_view,
+    error_card,
 )
 from ai_supervisor.providers.kimi import (
     KimiError,
@@ -166,6 +173,15 @@ class Orchestrator:
         self.conversations = conversations
         self.tasks = tasks
         self.stages = TaskStageService(tasks.db)
+        self.progress = ProgressManager(
+            settings=settings,
+            tasks=tasks,
+            projects=projects,
+            conversations=conversations,
+            stages=self.stages,
+            notifier=notifier,
+            redactor=redactor,
+        )
         self.usage = usage
         self.approvals = approvals
         self.supervisor = supervisor
@@ -176,6 +192,16 @@ class Orchestrator:
         self.redactor = redactor
         self.notifier = notifier
         self.permissions = PermissionManager()
+        self.routing = RoutingPolicy(
+            level1_effort=settings.routing.level1_effort,
+            level1_max_tokens=settings.routing.level1_max_tokens,
+            level2_effort=settings.routing.level2_effort,
+            level2_max_tokens=settings.routing.level2_max_tokens,
+            level3_effort=settings.routing.level3_effort,
+            level3_max_tokens=settings.routing.level3_max_tokens,
+            classifier_effort=settings.routing.classifier_effort,
+            classifier_max_tokens=settings.routing.classifier_max_tokens,
+        )
         self._jobs: dict[int, asyncio.Task[Any]] = {}
         self._project_locks: dict[int, asyncio.Lock] = {}
         self._creation_lock = asyncio.Lock()
@@ -225,6 +251,7 @@ class Orchestrator:
                         self._spawn_job(task.id, plan_if_needed=False, manual_instruction=None)
         if self.settings.app.auto_resume_git_auth_blocked:
             await self._auto_resume_git_auth_blocked()
+        await self.progress.restore_active(self.settings.owner_id)
 
     async def _auto_resume_git_auth_blocked(self) -> None:
         if not self.settings.github_token:
@@ -314,6 +341,7 @@ class Orchestrator:
         if self.github is not None:
             await self.github.close()
         self.git_auth.close()
+        await self.progress.close()
 
     # ------------------------------------------------------------------
     # incoming conversation
@@ -363,13 +391,22 @@ class Orchestrator:
         intent_result = None
         try:
             await self.usage.ensure_kimi_budget(0)
+            classifier = self.routing.classifier_profile
             intent_result, classify_usage = await self.supervisor.classify(
                 project_block=project_block,
                 conversation_block=conversation_block,
                 latest_user_message=text or "(изображение)",
                 conversation_id=conversation.id,
+                reasoning_effort=classifier.effort,
+                max_completion_tokens=classifier.max_tokens,
             )
-            await self._record_kimi_usage(classify_usage, task_id=None, project_id=project.id)
+            await self._record_kimi_usage(
+                classify_usage,
+                task_id=None,
+                project_id=project.id,
+                role="classification",
+                context_chars=len(project_block) + len(conversation_block),
+            )
         except KimiQuotaError as exc:
             await self._notify_quota(message.chat_id, exc)
             return
@@ -410,8 +447,17 @@ class Orchestrator:
             project_id=project.id, conversation_id=conversation.id
         )
         api_messages = self.conversations.messages_for_api(context_messages)
+        latest_text = next(
+            (
+                str(message.get("content") or "")
+                for message in reversed(api_messages)
+                if message.get("role") == "user"
+            ),
+            "",
+        )
         try:
             await self.usage.ensure_kimi_budget(0)
+            chat_profile = self.routing.reasoning(self.routing.for_request(latest_text))
             response = await self.supervisor.chat(
                 project_block=self._project_block(project),
                 memory_block=memory_block,
@@ -419,8 +465,19 @@ class Orchestrator:
                 messages=api_messages,
                 images=images,
                 conversation_id=conversation.id,
+                reasoning_effort=chat_profile.effort,
+                max_completion_tokens=chat_profile.max_tokens,
             )
-            await self._record_kimi_usage(response.usage, task_id=None, project_id=project.id)
+            await self._record_kimi_usage(
+                response.usage,
+                task_id=None,
+                project_id=project.id,
+                role="chat",
+                context_chars=sum(
+                    len(str(message.get("content") or "")) for message in api_messages
+                ),
+                routing_level=int(self.routing.for_request(latest_text)),
+            )
         except KimiQuotaError as exc:
             await self._notify_quota(chat_id, exc)
             return
@@ -575,11 +632,7 @@ class Orchestrator:
             max_rework=self.settings.limits.max_rework,
         )
         await self.tasks.add_event(task.id, "accepted", "Задача принята от владельца")
-        await self.notifier.send_text(
-            chat_id,
-            f"Задача #{task.id:03d} принята. Формирую техническое задание.",
-            [[Button("Остановить", f"stop:{task.id}")]],
-        )
+        await self.progress.update(task.id, force=True, chat_id=chat_id)
         self._spawn_job(task.id, plan_if_needed=True, manual_instruction=None)
 
     def _spawn_job(
@@ -696,7 +749,9 @@ class Orchestrator:
         memory_block = await self.conversations.memory_context(
             project_id=project.id, conversation_id=conversation.id
         )
-        project_context = await self.context_builder.build(project)
+        project_context = await self.context_builder.build(project, goal=latest_user)
+        requested_level = self.routing.for_request(latest_user)
+        plan_profile = self.routing.reasoning(requested_level)
         await self.usage.ensure_kimi_budget(task.id)
         spec, plan_usage = await self.supervisor.plan(
             project_block=self._project_block(project),
@@ -705,14 +760,31 @@ class Orchestrator:
             project_context=project_context,
             latest_user_message=latest_user,
             conversation_id=conversation.id,
+            reasoning_effort=plan_profile.effort,
+            max_completion_tokens=plan_profile.max_tokens,
         )
-        await self._record_kimi_usage(plan_usage, task_id=task.id, project_id=project.id)
+        final_level = max(int(requested_level), int(self.routing.for_spec(spec)))
+        spec = spec.model_copy(update={"routing_level": final_level})
+        await self._record_kimi_usage(
+            plan_usage,
+            task_id=task.id,
+            project_id=project.id,
+            role="planning",
+            prompt_version=self.supervisor.prompt_metadata().get("version"),
+            routing_level=final_level,
+            context_chars=len(project_context) + len(memory_block) + len(latest_user),
+        )
         task = await self.tasks.save_spec(task.id, spec)
         await self.tasks.add_event(
             task.id,
             "plan",
             f"ТЗ сформировано: {spec.title}",
-            {"acceptance_criteria": spec.acceptance_criteria, "steps": spec.steps},
+            {
+                "acceptance_criteria": spec.acceptance_criteria,
+                "steps": spec.steps,
+                "prompt_versions": self.supervisor.prompt_metadata(),
+                "routing_level": spec.routing_level,
+            },
         )
         if task.status is not TaskStatus.QUEUED:
             task = await self.tasks.transition(task.id, TaskStatus.QUEUED)
@@ -720,12 +792,7 @@ class Orchestrator:
         if preflight.status is not TaskStatus.QUEUED:
             return preflight
         task = preflight
-        criteria = "\n".join(f"• {item}" for item in spec.acceptance_criteria[:5])
-        await self.notifier.send_text(
-            self._chat_for_task(task),
-            f"Задача #{task.id:03d}: план сформирован.\n\n{spec.title}\n{criteria}",
-            [[Button("Остановить", f"stop:{task.id}")]],
-        )
+        await self.progress.update(task.id, force=True, chat_id=self._chat_for_task(task))
         return task
 
     async def _preflight_contract(
@@ -791,16 +858,25 @@ class Orchestrator:
         await self.tasks.add_event(
             task.id, "approval-requested", reason[:2000], agent="orchestrator"
         )
+        from ai_supervisor.presentation.renderer import approval_card
+
         await self.notifier.send_text(
             self._chat_for_task(task),
-            f"Задача #{task.id:03d}: требуется подтверждение владельца.\n{reason[:1500]}",
+            approval_card(
+                title="Требуется подтверждение",
+                why=reason[:1000],
+                target=f"задача #{task.id:03d}",
+                consequences="Операция будет выполнена один раз; отказ безопасно остановит задачу.",
+                details="Подтверждение привязано к текущей задаче и параметрам операции.",
+            ),
             [
                 [
-                    Button("Разрешить один раз", f"apv:{approval_id}"),
+                    Button("Разрешить", f"apv:{approval_id}"),
                     Button("Отклонить", f"rej:{approval_id}"),
                 ],
-                [Button("Показать diff", f"dif:{task.id}"), Button("Отменить", f"stop:{task.id}")],
+                [Button("Подробности", f"det:{task.id}"), Button("Отменить", f"stop:{task.id}")],
             ],
+            parse_mode="HTML",
         )
         return approval_id
 
@@ -838,12 +914,7 @@ class Orchestrator:
             base_commit=prepared["base_commit"],
             dsh_home=str(dsh_home),
         )
-        await self.notifier.send_text(
-            self._chat_for_task(task),
-            f"Задача #{task.id:03d}: исполнитель начал работу в изолированном worktree.\n"
-            f"Ветка: {task.branch}",
-            [[Button("Остановить", f"stop:{task.id}")]],
-        )
+        await self.progress.update(task.id, force=True, chat_id=self._chat_for_task(task))
         attempt = 0
         resume = bool(task.session_id)
         while True:
@@ -942,22 +1013,30 @@ class Orchestrator:
                     "checks": [check.model_dump() for check in evidence.checks],
                 },
             )
-            await self.notifier.send_text(
-                self._chat_for_task(task),
-                f"Задача #{task.id:03d}: исполнитель завершил работу. Провожу проверку diff и результатов.",
-            )
+            await self.progress.update(task.id, chat_id=self._chat_for_task(task))
             spec = self._spec_for(task)
             precheck = ReviewGate.precheck(evidence, spec, worktree=Path(task.worktree_path or ""))
             if precheck is None:
                 await self._try_transition(task.id, TaskStatus.REVIEWING)
                 await self.usage.ensure_kimi_budget(task.id)
+                review_level = RoutingLevel(spec.routing_level or int(self.routing.for_spec(spec)))
+                review_profile = self.routing.reasoning(review_level)
                 review, review_usage = await self.supervisor.review(
                     project_block=self._project_block(project),
                     spec=spec,
                     evidence=evidence,
                     project_context=project_context,
+                    reasoning_effort=review_profile.effort,
+                    max_completion_tokens=review_profile.max_tokens,
                 )
-                await self._record_kimi_usage(review_usage, task_id=task.id, project_id=project.id)
+                await self._record_kimi_usage(
+                    review_usage,
+                    task_id=task.id,
+                    project_id=project.id,
+                    role="review",
+                    prompt_version=self.supervisor.prompt_metadata().get("version"),
+                    routing_level=int(review_level),
+                )
             else:
                 review = precheck
             review = ReviewGate.enforce(
@@ -1096,11 +1175,7 @@ class Orchestrator:
             task = await self.tasks.update_fields(
                 task.id, head_commit=(await git_output(worktree, "rev-parse", "HEAD")).strip()
             )
-        await self.notifier.send_text(
-            self._chat_for_task(task),
-            f"Задача #{task.id:03d}: выполняю составной план из {len(spec.stages)} этапов.",
-            [[Button("Остановить", f"stop:{task.id}")]],
-        )
+        await self.progress.update(task.id, force=True, chat_id=self._chat_for_task(task))
 
         while True:
             task = await self.tasks.get(task.id)
@@ -1168,10 +1243,7 @@ class Orchestrator:
                 agent=stage.executor.value,
                 stage_id=stage.id,
             )
-            await self.notifier.send_text(
-                self._chat_for_task(task),
-                f"Задача #{task.id:03d}: этап {stage.stage_key} ({stage.operation.value}) начат.",
-            )
+            await self.progress.update(task.id, chat_id=self._chat_for_task(task))
             try:
                 task = await self.tasks.get(task.id)
                 result = await self._dispatch_stage(
@@ -1216,10 +1288,7 @@ class Orchestrator:
                 agent=stage.executor.value,
                 stage_id=stage.id,
             )
-            await self.notifier.send_text(
-                self._chat_for_task(task),
-                f"Задача #{task.id:03d}: этап {stage.stage_key} завершён.",
-            )
+            await self.progress.update(task.id, force=True, chat_id=self._chat_for_task(task))
 
     async def _composite_budget_error(
         self, task: TaskRecord, project: ProjectRecord, spec: TaskSpec
@@ -1704,6 +1773,10 @@ class Orchestrator:
         instruction = stage.instruction or stage.goal
         if manual_instruction:
             instruction += f"\n\nДополнительное указание владельца: {manual_instruction}"
+        task_spec = self._spec_for(task)
+        profile = self.routing.reasoning(
+            RoutingLevel(task_spec.routing_level or int(self.routing.for_spec(task_spec)))
+        )
         response = await self.supervisor.chat(
             project_block=self._project_block(project),
             memory_block="",
@@ -1718,8 +1791,17 @@ class Orchestrator:
                 }
             ],
             conversation_id=task.conversation_id,
+            reasoning_effort=profile.effort,
+            max_completion_tokens=profile.max_tokens,
         )
-        await self._record_kimi_usage(response.usage, task_id=task.id, project_id=project.id)
+        await self._record_kimi_usage(
+            response.usage,
+            task_id=task.id,
+            project_id=project.id,
+            role="analysis",
+            routing_level=self._spec_for(task).routing_level,
+            context_chars=len(project_context),
+        )
         state_dir = self.settings.task_logs_dir / f"task-{task.id:04d}" / f"stage-{stage.stage_key}"
         state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = state_dir / "analysis.md"
@@ -1823,6 +1905,8 @@ class Orchestrator:
             evidence_json=evidence.model_dump_json(),
             review_json=review.model_dump_json(),
             head_commit=evidence.head_commit,
+            error=None,
+            blocked_reason=None,
         )
         if not await self._try_transition(task.id, TaskStatus.COMPLETED):
             await self._block_task(task.id, "Не удалось завершить составную задачу.")
@@ -1832,7 +1916,7 @@ class Orchestrator:
         report = build_report(
             task=task,
             project_name=project.name,
-            spec=validation_spec,
+            spec=spec,
             evidence=evidence,
             review=review,
             usage_service=self.usage,
@@ -1849,7 +1933,33 @@ class Orchestrator:
             agent="orchestrator",
         )
         await self._maybe_usage_warning(task.id)
-        await self._send_long(self._chat_for_task(task), report)
+        mode = await self.conversations.get_ui_mode(self._chat_for_task(task))
+        usage_totals = await self.usage.by_provider(task_id=task.id)
+        model_requests = sum(
+            int(getattr(totals, "requests", 0)) for totals in usage_totals.values()
+        )
+        await self.progress.update(task.id, force=True, chat_id=self._chat_for_task(task))
+        await self.notifier.send_text(
+            self._chat_for_task(task),
+            completion_card(
+                task,
+                project,
+                evidence=evidence,
+                review=review,
+                stages=stages,
+                model_requests=model_requests,
+                mode=mode,
+                repo_url=project.remote_url,
+            ),
+            [
+                [
+                    Button("Подробности", f"det:{task.id}"),
+                    Button("Расход токенов", f"use:{task.id}"),
+                ],
+                [Button("Журнал", f"log:{task.id}")],
+            ],
+            parse_mode="HTML",
+        )
         await self.conversations.add_message(
             task.conversation_id,
             "assistant",
@@ -1927,13 +2037,19 @@ class Orchestrator:
             agent="orchestrator",
             stage_id=stage.id,
         )
+        await self.progress.update(task.id, force=True, chat_id=self._chat_for_task(task))
         await self.notifier.send_text(
             self._chat_for_task(task),
-            f"Задача #{task.id:03d}: этап {stage.stage_key} ожидает Git-аутентификацию.\n"
-            f"{safe[:1200]}\n"
-            "Настройте GITHUB_TOKEN (или SSH-ключ для SSH remote), затем нажмите «Повторить». "
-            "Импорт, коммит и проверка уже сохранены.",
-            [[Button("Повторить", f"res:{task.id}"), Button("Отменить", f"stop:{task.id}")]],
+            error_card(
+                task,
+                await self.projects.get(task.project_id),
+                reason="GITHUB_TOKEN не настроен или отклонён: " + safe,
+            ),
+            [
+                [Button("Повторить", f"res:{task.id}"), Button("Диагностика", f"det:{task.id}")],
+                [Button("Подробности", f"det:{task.id}"), Button("Отменить", f"stop:{task.id}")],
+            ],
+            parse_mode="HTML",
         )
 
     async def _block_task(
@@ -1956,13 +2072,18 @@ class Orchestrator:
         await self.tasks.add_event(task.id, "blocked", safe_reason, agent="orchestrator")
         report = await self._final_report(task, None, TaskStatus.BLOCKED)
         await self.tasks.update_fields(task.id, report=report)
+        stages = await self.stages.list(task.id)
+        project = await self.projects.get(task.project_id)
+        mode = await self.conversations.get_ui_mode(self._chat_for_task(task))
+        await self.progress.update(task.id, force=True, chat_id=self._chat_for_task(task))
         await self.notifier.send_text(
             self._chat_for_task(task),
-            report,
+            error_card(task, project, reason=safe_reason, mode=mode, stages=stages),
             [
-                [Button("Продолжить", f"res:{task.id}"), Button("Показать diff", f"dif:{task.id}")],
-                [Button("Логи", f"log:{task.id}"), Button("Откатить", f"rb:{task.id}")],
+                [Button("Повторить", f"res:{task.id}"), Button("Диагностика", f"det:{task.id}")],
+                [Button("Подробности", f"det:{task.id}"), Button("Отменить", f"stop:{task.id}")],
             ],
+            parse_mode="HTML",
         )
 
     async def _await_required_approval(self, task_id: int, review: ReviewResult) -> None:
@@ -1996,7 +2117,26 @@ class Orchestrator:
         await self.tasks.update_fields(task.id, report=report)
         await self.tasks.add_event(task.id, "waiting_approval", "Ожидает решения владельца")
         await self._maybe_usage_warning(task_id)
-        await self._send_report_with_buttons(task, report)
+        mode = await self.conversations.get_ui_mode(self._chat_for_task(task))
+        stages = await self.stages.list(task.id)
+        await self.progress.update(task.id, force=True, chat_id=self._chat_for_task(task))
+        await self.notifier.send_text(
+            self._chat_for_task(task),
+            completion_card(
+                task,
+                project,
+                evidence=spec_evidence,
+                review=review,
+                stages=stages,
+                mode=mode,
+            ),
+            [
+                [Button("Принять", f"acc:{task.id}"), Button("На доработку", f"rew:{task.id}")],
+                [Button("Подробности", f"det:{task.id}"), Button("Diff", f"dif:{task.id}")],
+                [Button("Журнал", f"log:{task.id}"), Button("Откатить", f"rb:{task.id}")],
+            ],
+            parse_mode="HTML",
+        )
         await self.conversations.add_message(
             task.conversation_id,
             "assistant",
@@ -2245,15 +2385,24 @@ class Orchestrator:
             created_by=user_id,
             ttl_seconds=600,
         )
+        from ai_supervisor.presentation.renderer import approval_card
+
         await self.notifier.send_text(
             chat_id,
-            f"Создание GitHub-репозитория {name}.\n"
-            f"Видимость: {'private' if private else 'public'}\n"
-            "Репозиторий будет создан от имени владельца токена. Подтвердите.",
+            approval_card(
+                title="Создание GitHub-репозитория",
+                why=f"Создать репозиторий {name}",
+                target="GitHub API",
+                consequences="Репозиторий будет создан от имени владельца токена.",
+                details=f"Видимость: {'private' if private else 'public'}",
+            ),
             [
-                [Button("Разрешить один раз", f"apv:{approval_id}")],
-                [Button("Отклонить", f"rej:{approval_id}")],
+                [
+                    Button("Разрешить", f"apv:{approval_id}"),
+                    Button("Отклонить", f"rej:{approval_id}"),
+                ],
             ],
+            parse_mode="HTML",
         )
 
     async def request_config_import(
@@ -2283,19 +2432,25 @@ class Orchestrator:
             created_by=user_id,
             ttl_seconds=900,
         )
+        from ai_supervisor.presentation.renderer import approval_card
+
         await self.notifier.send_text(
             chat_id,
-            f"Импорт конфигурации в проект {project.name}.\n"
-            f"Источник: {plan.source}\n"
-            f"Назначение: {relative_destination}\n"
-            f"Файлов: {plan.file_count}, байт: {plan.total_bytes}\n"
-            f"Перезапись: {'да' if plan.overwrite else 'нет'}\n"
-            "Секреты в текстовых файлах не найдены. Изменения будут записаны в рабочее дерево, "
-            "но не закоммичены. Подтвердите.",
+            approval_card(
+                title="Импорт конфигурации",
+                why=f"Импортировать {plan.source}",
+                target=f"проект {project.name} → {relative_destination}",
+                consequences="Файлы будут записаны в рабочее дерево; коммит не создаётся автоматически.",
+                volume=f"{plan.file_count} файлов, {plan.total_bytes} байт; overwrite={plan.overwrite}",
+                details="Текстовые файлы проверены на секреты; они не найдены.",
+            ),
             [
-                [Button("Разрешить один раз", f"apv:{approval_id}")],
-                [Button("Отклонить", f"rej:{approval_id}")],
+                [
+                    Button("Разрешить", f"apv:{approval_id}"),
+                    Button("Отклонить", f"rej:{approval_id}"),
+                ],
             ],
+            parse_mode="HTML",
         )
 
     @_locked_action
@@ -2345,20 +2500,25 @@ class Orchestrator:
             task_id=task.id,
             ttl_seconds=600,
         )
+        from ai_supervisor.presentation.renderer import approval_card
+
         await self.notifier.send_text(
             chat_id,
-            f"Задача #{task.id:03d}: публикация в Git.\n"
-            f"Проект: {project.name}\n"
-            f"Операция: git push origin {project.base_branch}\n"
-            f"Remote: {project.remote_url}\n"
-            "Force-push не используется. Подтвердите операцию.",
+            approval_card(
+                title="Публикация в Git",
+                why=f"Опубликовать {project.base_branch} задачи #{task.id:03d}",
+                target=f"{project.remote_url} · origin/{project.base_branch}",
+                consequences="Ветка будет отправлена без force; удалённый коммит будет проверен.",
+                details="Force-push не используется.",
+            ),
             [
                 [
-                    Button("Разрешить один раз", f"apv:{approval_id}"),
+                    Button("Разрешить", f"apv:{approval_id}"),
                     Button("Отклонить", f"rej:{approval_id}"),
                 ],
-                [Button("Показать diff", f"dif:{task.id}"), Button("Отмена", f"rej:{approval_id}")],
+                [Button("Подробности", f"det:{task.id}"), Button("Отмена", f"rej:{approval_id}")],
             ],
+            parse_mode="HTML",
         )
 
     @_locked_action
@@ -2888,7 +3048,15 @@ class Orchestrator:
             await self.notifier.send_text(self._chat_for_task(task), "⚠️ " + warning)
 
     async def _record_kimi_usage(
-        self, usage: Any, *, task_id: int | None, project_id: int | None
+        self,
+        usage: Any,
+        *,
+        task_id: int | None,
+        project_id: int | None,
+        role: str | None = None,
+        prompt_version: str | None = None,
+        routing_level: int | None = None,
+        context_chars: int | None = None,
     ) -> None:
         await self.usage.record(
             provider="kimi",
@@ -2896,6 +3064,15 @@ class Orchestrator:
             usage=usage,
             task_id=task_id,
             project_id=project_id,
+            role=role,
+            prompt_version=prompt_version
+            or (
+                self.supervisor.prompt_metadata().get("version")
+                if hasattr(self.supervisor, "prompt_metadata")
+                else None
+            ),
+            routing_level=routing_level,
+            context_chars=context_chars,
         )
 
     async def _notify_quota(self, chat_id: int, exc: Exception) -> None:
@@ -3207,6 +3384,9 @@ class Orchestrator:
                 chat_id, Path(task.diff_path), f"Diff задачи #{task.id:03d}"
             )
 
+    async def send_compact(self, task_id: int, chat_id: int) -> None:
+        await self.progress.update(task_id, force=True, chat_id=chat_id)
+
     async def send_logs(self, task_id: int, chat_id: int) -> None:
         task = await self.tasks.get(task_id)
         events = await self.tasks.events(task_id, limit=80)
@@ -3231,10 +3411,58 @@ class Orchestrator:
 
     async def send_report(self, task_id: int, chat_id: int) -> None:
         task = await self.tasks.get(task_id)
-        if task.report:
-            await self._send_long(chat_id, task.report)
-        else:
+        if not task.report:
             await self.notifier.send_text(chat_id, "Отчёт ещё не сформирован.")
+            return
+        mode = await self.conversations.get_ui_mode(chat_id)
+        if mode == "compact":
+            project = await self.projects.get(task.project_id)
+            stages = await self.stages.list(task.id)
+            evidence = self._load_evidence(task)
+            usage_totals = await self.usage.by_provider(task_id=task.id)
+            model_requests = sum(
+                int(getattr(totals, "requests", 0)) for totals in usage_totals.values()
+            )
+            await self.notifier.send_text(
+                chat_id,
+                completion_card(
+                    task,
+                    project,
+                    evidence=evidence,
+                    review=task.review,
+                    stages=stages,
+                    model_requests=model_requests,
+                    mode=mode,
+                    repo_url=project.remote_url if project else None,
+                ),
+                [[Button("Подробности", f"det:{task.id}")]],
+                parse_mode="HTML",
+            )
+            return
+        await self._send_long(chat_id, task.report)
+
+    async def send_details(self, task_id: int, chat_id: int) -> None:
+        task = await self.tasks.get(task_id)
+        project = await self.projects.get(task.project_id)
+        stages = await self.stages.list(task.id)
+        mode = await self.conversations.get_ui_mode(chat_id)
+        text = details_view(
+            task,
+            project,
+            self._spec_for(task),
+            stages,
+            self._load_evidence(task),
+            mode=mode,
+        )
+        await self.notifier.send_text(
+            chat_id,
+            text,
+            [
+                [Button("Коротко", f"compact:{task.id}"), Button("Отчёт", f"rep:{task.id}")],
+                [Button("Журнал", f"log:{task.id}")],
+            ],
+            parse_mode="HTML",
+        )
 
     async def send_detailed_report(self, task_id: int, chat_id: int) -> None:
         task = await self.tasks.get(task_id)

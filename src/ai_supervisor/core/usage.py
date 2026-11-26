@@ -49,6 +49,10 @@ class UsageService:
         project_id: int | None = None,
         duration_ms: int = 0,
         error_category: str | None = None,
+        role: str | None = None,
+        prompt_version: str | None = None,
+        routing_level: int | None = None,
+        context_chars: int | None = None,
     ) -> None:
         if usage.requests == 0 and usage.total_tokens == 0:
             return
@@ -57,8 +61,9 @@ class UsageService:
             """
             INSERT INTO usage_events(task_id, project_id, provider, model, input_tokens,
                 output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, requests,
-                duration_ms, error_category, cost, currency, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                duration_ms, error_category, cost, currency, prompt_version, role,
+                routing_level, context_chars, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -75,6 +80,10 @@ class UsageService:
                 error_category,
                 cost,
                 currency,
+                prompt_version,
+                role,
+                routing_level,
+                context_chars,
                 iso_now(),
             ),
         )
@@ -199,6 +208,36 @@ class UsageService:
                 duration_ms=int(row["duration_ms"]),
                 errors=int(row["errors"]),
                 cost=float(row["cost"] or 0.0),
+                currency=str(row["currency"] or ""),
+            )
+        return result
+
+    async def by_role(self, *, task_id: int | None = None) -> dict[str, UsageTotals]:
+        where = "WHERE task_id = ?" if task_id is not None else ""
+        params: tuple[Any, ...] = (task_id,) if task_id is not None else ()
+        rows = await self.db.fetchall(
+            f"SELECT COALESCE(role, 'unknown') AS role, COUNT(*) AS events, "
+            f"COALESCE(SUM(input_tokens),0) AS input_tokens, "
+            f"COALESCE(SUM(output_tokens),0) AS output_tokens, "
+            f"COALESCE(SUM(cached_tokens),0) AS cached_tokens, "
+            f"COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens, "
+            f"COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens, "
+            f"COALESCE(SUM(requests),0) AS requests, COALESCE(SUM(duration_ms),0) AS duration_ms, "
+            f"COALESCE(SUM(cost),0) AS cost, COALESCE(MAX(currency),'') AS currency "
+            f"FROM usage_events {where} GROUP BY role",
+            params,
+        )
+        result: dict[str, UsageTotals] = {}
+        for row in rows:
+            result[str(row["role"])] = UsageTotals(
+                input_tokens=int(row["input_tokens"]),
+                output_tokens=int(row["output_tokens"]),
+                cached_tokens=int(row["cached_tokens"]),
+                cache_write_tokens=int(row["cache_write_tokens"]),
+                reasoning_tokens=int(row["reasoning_tokens"]),
+                requests=int(row["requests"]),
+                duration_ms=int(row["duration_ms"]),
+                cost=float(row["cost"] or 0),
                 currency=str(row["currency"] or ""),
             )
         return result

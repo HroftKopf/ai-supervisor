@@ -154,6 +154,18 @@ class SandboxSection(BaseModel):
     max_processes: int = Field(default=1024, ge=32, le=65536)
 
 
+class RoutingSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    level1_effort: Literal["low", "high", "max"] = "low"
+    level1_max_tokens: int = Field(default=2048, ge=512, le=32768)
+    level2_effort: Literal["low", "high", "max"] = "high"
+    level2_max_tokens: int = Field(default=8192, ge=1024, le=65536)
+    level3_effort: Literal["low", "high", "max"] = "max"
+    level3_max_tokens: int = Field(default=16384, ge=2048, le=131072)
+    classifier_effort: Literal["low", "high", "max"] = "low"
+    classifier_max_tokens: int = Field(default=2048, ge=512, le=16384)
+
+
 class EgressSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = True
@@ -294,6 +306,7 @@ class Settings(BaseModel):
     security: SecuritySection
     github: GitHubSection
     egress: EgressSection
+    routing: RoutingSection
     limits: LimitsSection
     deepseek: DeepSeekSection
     sandbox: SandboxSection
@@ -581,6 +594,7 @@ def load_settings(
         "git",
         "github",
         "egress",
+        "routing",
         "memory",
         "usage",
     }
@@ -601,6 +615,7 @@ def load_settings(
             security=SecuritySection.model_validate(raw.get("security", {})),
             github=GitHubSection.model_validate(raw.get("github", {})),
             egress=EgressSection.model_validate(raw.get("egress", {})),
+            routing=RoutingSection.model_validate(raw.get("routing", {})),
             limits=LimitsSection.model_validate(raw.get("limits", {})),
             deepseek=DeepSeekSection.model_validate(deepseek),
             sandbox=SandboxSection.model_validate(raw.get("sandbox", {})),

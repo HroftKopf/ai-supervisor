@@ -212,6 +212,10 @@ class TaskService:
             "diff_path",
             "logs_path",
             "cancel_requested",
+            "ui_chat_id",
+            "ui_message_id",
+            "ui_hash",
+            "ui_updated_at",
         }
         unexpected = set(fields) - allowed
         if unexpected:

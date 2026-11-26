@@ -34,6 +34,23 @@ class ConversationService:
             int(row["active_project_id"]) if row and row["active_project_id"] is not None else None
         )
 
+    async def get_ui_mode(self, chat_id: int) -> str:
+        row = await self.db.fetchone("SELECT ui_mode FROM chat_state WHERE chat_id = ?", (chat_id,))
+        value = str(row["ui_mode"]) if row and row["ui_mode"] else "compact"
+        return value if value in {"compact", "detailed", "debug"} else "compact"
+
+    async def set_ui_mode(self, chat_id: int, mode: str) -> str:
+        if mode not in {"compact", "detailed", "debug"}:
+            raise ValueError("ui_mode must be compact, detailed or debug")
+        now = iso_now()
+        await self.db.execute(
+            "INSERT INTO chat_state(chat_id, ui_mode, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET ui_mode = excluded.ui_mode, "
+            "updated_at = excluded.updated_at",
+            (chat_id, mode, now),
+        )
+        return mode
+
     async def get_state(self, chat_id: int) -> dict[str, Any]:
         row = await self.db.fetchone("SELECT * FROM chat_state WHERE chat_id = ?", (chat_id,))
         return row_to_dict(row) or {}

@@ -1,0 +1,12 @@
+{
+  "version": "2.5.1",
+  "baseline": "2.5.1",
+  "profiles": {
+    "supervisor": {"file": "supervisor.md"},
+    "classifier": {"file": "supervisor.md"},
+    "planner": {"file": "planner.md"},
+    "reviewer": {"file": "reviewer.md"},
+    "summarizer": {"file": "summarizer.md"},
+    "worker": {"file": "worker.md"}
+  }
+}

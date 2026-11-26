@@ -68,7 +68,11 @@ async def test_rework_loop_stops_at_limit(orchestrator, settings) -> None:
     assert task.status is TaskStatus.BLOCKED
     assert task.rework_count == 1
     assert workers.calls == 2
-    assert any("Исчерпан лимит доработок" in text for _chat, text, _buttons in notifier.messages)
+    assert "Исчерпан лимит доработок" in (task.error or "")
+    assert any(
+        ("Исчерпан лимит" in text or "Не удалось" in text or "Превышен" in text)
+        for _chat, text, _buttons in notifier.messages
+    )
 
 
 @pytest.mark.asyncio

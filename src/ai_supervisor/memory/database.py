@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def iso_now() -> str:
@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS chat_state (
     chat_id INTEGER PRIMARY KEY,
     active_project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
     active_conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+    ui_mode TEXT NOT NULL DEFAULT 'compact',
     updated_at TEXT NOT NULL
 );
 
@@ -118,6 +119,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     diff_path TEXT,
     logs_path TEXT,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
+    ui_chat_id INTEGER,
+    ui_message_id INTEGER,
+    ui_hash TEXT,
+    ui_updated_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     started_at TEXT,
@@ -238,6 +243,10 @@ CREATE TABLE IF NOT EXISTS usage_events (
     error_category TEXT,
     cost REAL,
     currency TEXT,
+    prompt_version TEXT,
+    role TEXT,
+    routing_level INTEGER,
+    context_chars INTEGER,
     created_at TEXT NOT NULL
 );
 
@@ -355,7 +364,14 @@ class Database:
                 "max_rework": "INTEGER NOT NULL DEFAULT 3",
                 "policy_json": "TEXT NOT NULL DEFAULT '{}'",
             },
+            "chat_state": {
+                "ui_mode": "TEXT NOT NULL DEFAULT 'compact'",
+            },
             "tasks": {
+                "ui_chat_id": "INTEGER",
+                "ui_message_id": "INTEGER",
+                "ui_hash": "TEXT",
+                "ui_updated_at": "TEXT",
                 "task_type": "TEXT NOT NULL DEFAULT 'modify'",
                 "parent_task_id": "INTEGER",
                 "attempts": "INTEGER NOT NULL DEFAULT 0",
@@ -370,6 +386,10 @@ class Database:
                 "error_category": "TEXT",
             },
             "usage_events": {
+                "prompt_version": "TEXT",
+                "role": "TEXT",
+                "routing_level": "INTEGER",
+                "context_chars": "INTEGER",
                 "duration_ms": "INTEGER NOT NULL DEFAULT 0",
                 "error_category": "TEXT",
                 "cost": "REAL",

@@ -4,10 +4,10 @@
 **Kimi K3.1 Pro** — технический руководитель и ревьюер, **DeepSeek Harness** — исполнитель,
 **Python-оркестратор** — управляющая инфраструктура.
 
-> Статус: **Phase 2.5.1**. Добавлены исполняемые COMPOSITE-этапы с DAG, детерминированная
-> маршрутизация операций, сохраняемое состояние этапов, автоматическое продолжение после
-> approvals, идемпотентные импорт/GitHub/push, централизованная Git-аутентификация с
-> host allowlist и сетевая изоляция worker через allowlist-proxy.
+> Статус: **Phase 2.6**. Добавлены централизованный Presentation Layer, компактные
+> редактируемые карточки прогресса, режимы compact/detailed/debug, меню /start, разделение
+> и версионирование промптов, адаптивная маршрутизация Level 0–3 и профили reasoning.
+> Сохранены COMPOSITE, GitAuthManager, approvals, sandbox, egress, auto-resume и миграции.
 > Живые сценарии Kimi API и реальный DSH в bwrap проверены; Telegram Bot API и реальная
 > публикация пользовательских файлов на GitHub не проверялись. Ограничения явно перечислены
 > в [«Известных ограничениях»](#известные-ограничения-phase-2-5).
@@ -68,6 +68,17 @@
   (`app.auto_resume_git_auth_blocked`) и просит подтверждение публикации.
 - Отчёты COMPOSITE показывают Python Orchestrator, статус и длительность каждого этапа,
   hash коммита, результат secret-scan, checks, remote SHA и полное время с планированием.
+- Presentation Layer: TaskCard/ProgressCard/CompletionCard/ErrorCard/ApprovalCard/
+  ProjectCard/UsageCard/StatusCard/SettingsCard/DetailsView; HTML-escape и лимиты Telegram.
+- Живой прогресс: одна карточка на задачу, `message_id` в SQLite, throttling, fallback при
+  удалённом сообщении/ошибке edit, восстановление после restart.
+- Режимы compact/detailed/debug через `/settings`; compact — по умолчанию.
+- Главное меню `/start` на inline-кнопках; свободный текст остаётся основным способом задачи.
+- Промпты разделены по профилям (`supervisor`, `classifier`, `planner`, `reviewer`,
+  `summarizer`, `worker`), версионируются через `prompts/manifest.json`; baseline сохранён.
+- Адаптивная маршрутизация Level 0–3 и per-level reasoning/token limits; routing level и
+  prompt version сохраняются в usage/task events.
+- Prompt Evaluation Framework: 24 сценария и детерминированный harness.
 - FTS5-поиск, резюме, stop/rollback/pause/retry, systemd, doctor, redaction.
 
 Phase 1 намеренно **не** реализует SSH, браузер, Docker/Podman, MCP и распределённый VPS.
@@ -327,7 +338,7 @@ memory_mb = 4096
 
 Выполнено:
 
-- `pytest`: **86 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
+- `pytest`: **97 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
   Проверены запуск runtime, проброс `DEEPSEEK_BASE_URL`, запись результата, usage (input 42,
@@ -391,10 +402,12 @@ ai-supervisor run
 - При несовместимости сохранённой DSH-сессии `/resume` может потребовать нового запуска; система
   не подменяет сессию молча.
 
-### Что ещё не реализовано в Phase 2.5.1
+### Что ещё не реализовано в Phase 2.6
 
 - Параллельное исполнение независимых этапов (сейчас этапы выполняются последовательно в
   топологическом порядке; DAG проверяется).
+- Полное A/B-сравнение токенов baseline/optimized не выполнено: Kimi вернул 5-часовой quota
+  429; платные прогоны требуют отдельного разрешения владельца. Снижение не заявляется.
 - Полная маршрутизация Level 0–3 между моделями вне операций этапов; простые операции уже
   детерминированы.
 - Продвинутые GitHub PR/checks и настройки организаций; repo create/info, remote и push реализованы.
@@ -403,7 +416,7 @@ ai-supervisor run
 - Реальная публикация пользовательских файлов не входит в автоматические тесты; используется
   mock GitHub API и временный bare remote.
 
-Полный список: [docs/PHASE2_5.md](docs/PHASE2_5.md).
+Полный список: [docs/PHASE2_6.md](docs/PHASE2_6.md).
 
 ---
 
@@ -437,15 +450,17 @@ src/ai_supervisor/
 config/dsh/          privacy patch for DSH session-log upload
 systemd/             user service
 tests/               unit + optional real DSH integration
-docs/                API notes, install, security, testing, phase 1/2/2.5
+evaluation/          prompt scenarios and baseline/active comparison tooling
+docs/                API notes, install, security, testing, phase 1/2/2.5/2.6
 ```
 
 ---
 
 ## Следующий этап
 
-1. **Phase 3:** параллельный DAG этапов, маршрутизация Level 0–3, расширенный GitHub
-   PR/checks, привилегированный system/external executor, retention/structured logs.
+1. **Phase 3:** параллельный DAG этапов, A/B-метрики на согласованном бюджете, библиотека
+   планов, автоматическое накопление подтверждённого опыта, расширенный GitHub PR/checks,
+   привилегированный system/external executor, retention/structured logs.
 2. **Phase 4:** несколько исполнителей, интеграционная ветка и разрешение конфликтов,
    параллельные worktree, SSH/Podman/браузер/MCP, системный мониторинг.
 3. **Phase 5:** production systemd/backup, затем Controller + Worker Node с mTLS.

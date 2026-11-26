@@ -79,7 +79,7 @@ GITHUB_TOKEN=
 ## 4.1. Обновление с Phase 1
 
 При первом запуске новой версии `Database` сделает backup
-`var/backups/pre-migration-v3-*.db` и обновит схему v1/v2→v3. Старые задачи сохраняются.
+`var/backups/pre-migration-v4-*.db` и обновит схему v1/v2/v3→v4. Старые задачи сохраняются.
 Перед обновлением можно дополнительно выполнить `scripts/backup.sh`.
 
 ## 4.2. Egress worker
