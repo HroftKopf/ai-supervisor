@@ -48,6 +48,7 @@ class SecretRedactor:
                 settings.openai_compatible_key,
                 settings.deepseek_key,
                 settings.telegram_token,
+                settings.github_token,
             )
         )
 
@@ -102,6 +103,8 @@ class RedactionFilter(logging.Filter):
                 }
             else:
                 record.args = tuple(self.redactor.redact(str(value)) for value in record.args)
+        if record.stack_info:
+            record.stack_info = self.redactor.redact(str(record.stack_info))
         if record.exc_info:
             # Tracebacks can contain request bodies; keep the type but redact text.
             exc = record.exc_info[1]

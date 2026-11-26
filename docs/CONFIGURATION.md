@@ -296,3 +296,26 @@ Startup fails with a clear `ConfigError` for:
 
 `/models`, `/provider info`, `/provider test [role]` expose the same model diagnostics in Telegram;
 credentials are never shown.
+
+
+## Safe diagnostics
+
+Never print `.env` or pass it through `cat`/`grep`. Use:
+
+```bash
+ai-supervisor config-audit
+```
+
+The command reads only variable names/status, config structure, file modes and provider roles.
+It prints no secret values or lengths. `ai-supervisor doctor` uses the same safe metadata and
+never prints credentials.
+
+The application also masks provider/Telegram/GitHub secrets in log messages, expression
+arguments, stack traces and model context. For a local working-tree scan that reports only
+file paths/key names, use:
+
+```bash
+python scripts/audit_secrets.py
+```
+
+If a credential is accidentally exposed, rotate it; do not rely on local log deletion alone.

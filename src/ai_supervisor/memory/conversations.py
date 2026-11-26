@@ -137,6 +137,8 @@ class ConversationService:
         if role not in {"user", "assistant", "system", "tool"}:
             raise ConversationError(f"invalid role: {role}")
         now = iso_now()
+        safe_content = self.redactor.redact(content)
+        safe_meta = self.redactor.redact_mapping(meta or {})
         cursor = await self.db.execute(
             """
             INSERT INTO messages(conversation_id, role, content, telegram_message_id,
@@ -146,10 +148,10 @@ class ConversationService:
             (
                 conversation_id,
                 role,
-                content,
+                safe_content,
                 telegram_message_id,
                 reply_to_message_id,
-                json_dumps(meta or {}),
+                json_dumps(safe_meta),
                 now,
             ),
         )
@@ -208,7 +210,9 @@ class ConversationService:
             summary = (
                 "Краткое содержание более раннего диалога (сгенерировано моделью; "
                 "не является подтверждённым фактом или разрешением):\n"
-                + conversation.summary[: self.settings.memory.summary_max_chars]
+                + self.redactor.redact(conversation.summary)[
+                    : self.settings.memory.summary_max_chars
+                ]
             )
         return summary, kept
 
@@ -247,9 +251,14 @@ class ConversationService:
             return None
         old_messages = [MessageRecord.model_validate(row_to_dict(row)) for row in rows]
         transcript = "\n\n".join(
-            f"{message.role.upper()}: {message.content}" for message in old_messages
+            f"{message.role.upper()}: {self.redactor.redact(message.content)}"
+            for message in old_messages
         )
-        previous = f"Предыдущее резюме:\n{conversation.summary}\n\n" if conversation.summary else ""
+        previous = (
+            f"Предыдущее резюме:\n{self.redactor.redact(conversation.summary)}\n\n"
+            if conversation.summary
+            else ""
+        )
         prompt = (
             "Сожми следующий фрагмент диалога для долговременного контекста. "
             "Сохрани решения, требования, ограничения, открытые вопросы и названия проектов. "
@@ -261,7 +270,7 @@ class ConversationService:
         summary = (await summarizer(prompt)).strip()
         if not summary:
             return None
-        summary = summary[: self.settings.memory.summary_max_chars]
+        summary = self.redactor.redact(summary)[: self.settings.memory.summary_max_chars]
         await self.db.execute(
             "UPDATE conversations SET summary = ?, summary_upto_id = ?, updated_at = ? WHERE id = ?",
             (summary, old_messages[-1].id, iso_now(), conversation_id),
@@ -523,7 +532,9 @@ class ConversationService:
                 marker = " (неподтверждённое предположение)"
             if item.stale:
                 marker += " (устарело)"
-            lines.append(f"- [{item.scope}/{item.category}{marker}] {item.content}")
+            lines.append(
+                f"- [{item.scope}/{item.category}{marker}] {self.redactor.redact(item.content)}"
+            )
         return "\n".join(lines)
 
     async def search_memories(self, query: str, limit: int = 20) -> list[MemoryRecord]:
@@ -555,16 +566,18 @@ class ConversationService:
 
     # ---------------------------- helpers ----------------------------
 
-    @staticmethod
-    def messages_for_api(messages: Sequence[MessageRecord]) -> list[dict[str, Any]]:
+    def messages_for_api(self, messages: Sequence[MessageRecord]) -> list[dict[str, Any]]:
         api_messages: list[dict[str, Any]] = []
         for message in messages:
-            payload: dict[str, Any] = {"role": message.role, "content": message.content}
+            payload: dict[str, Any] = {
+                "role": message.role,
+                "content": self.redactor.redact(message.content),
+            }
             if message.role == "assistant":
                 reasoning = ConversationService.meta(message).get("reasoning_content")
                 if isinstance(reasoning, str) and reasoning:
                     # K3.1 Pro Preserved Thinking: send the complete assistant message back.
-                    payload["reasoning_content"] = reasoning
+                    payload["reasoning_content"] = self.redactor.redact(reasoning)
             api_messages.append(payload)
         return api_messages
 

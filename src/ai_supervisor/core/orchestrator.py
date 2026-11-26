@@ -408,7 +408,7 @@ class Orchestrator:
             intent_result, classify_usage = await self.supervisor.classify(
                 project_block=project_block,
                 conversation_block=conversation_block,
-                latest_user_message=text or "(изображение)",
+                latest_user_message=self.redactor.redact(text) or "(изображение)",
                 conversation_id=conversation.id,
                 reasoning_effort=classifier.effort,
                 max_completion_tokens=classifier.max_tokens,
@@ -576,7 +576,7 @@ class Orchestrator:
 
     def _project_block(self, project: ProjectRecord) -> str:
         instructions = project.instructions[:4000] if project.instructions else "(нет)"
-        return (
+        return self.redactor.redact(
             f"name: {project.name}\n"
             f"path: {project.path}\n"
             f"description: {project.description or '(нет)'}\n"
@@ -586,11 +586,10 @@ class Orchestrator:
             f"extra_read_paths: {project.extra_read_paths_json}"
         )
 
-    @staticmethod
-    def _conversation_block(messages: list[Any]) -> str:
+    def _conversation_block(self, messages: list[Any]) -> str:
         lines: list[str] = []
         for message in messages[-12:]:
-            content = message.content.strip()
+            content = self.redactor.redact(message.content.strip())
             if not content:
                 continue
             lines.append(f"{message.role.upper()}: {content[:3500]}")
@@ -3144,7 +3143,7 @@ class Orchestrator:
             )
         if manual_instruction:
             previous += f"\n## Дополнительное указание владельца\n{manual_instruction}\n"
-        return (
+        return self.redactor.redact(
             f"# Задача #{task.id:03d}: {spec.title}\n\n"
             f"Проект: {project.name}\n"
             f"Рабочий каталог: /workspace (изолированный git worktree, ветка {task.branch})\n"
@@ -3456,7 +3455,7 @@ class Orchestrator:
             return "\n".join(
                 f"#{item.id} [{html.escape(item.scope)}/{html.escape(item.category)}"
                 f"{' · устарело' if item.stale else ''}] "
-                f"{html.escape(item.content[:500], quote=True)}"
+                f"{html.escape(self.redactor.redact(item.content[:500]), quote=True)}"
                 for item in memories
             )
         items = await self.conversations.get_memories(project_id=project.id if project else None)
@@ -3469,7 +3468,7 @@ class Orchestrator:
             lines += [
                 f"<b>#{item.id} · {item.scope}/{item.category}</b>{confirmed}{stale}",
                 "",
-                __import__("html").escape(item.content[:500], quote=True),
+                __import__("html").escape(self.redactor.redact(item.content[:500]), quote=True),
                 "",
             ]
         return "\n".join(lines).rstrip()

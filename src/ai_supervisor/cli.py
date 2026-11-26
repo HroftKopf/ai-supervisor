@@ -15,6 +15,11 @@ from pathlib import Path
 
 from ai_supervisor.config import ConfigError, Settings, load_settings
 from ai_supervisor.core.redaction import SecretRedactor
+from ai_supervisor.core.secret_safety import (
+    NON_SECRET_ENV_KEYS,
+    PERSONAL_ENV_KEYS,
+    env_presence,
+)
 from ai_supervisor.logging_setup import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -123,6 +128,7 @@ async def run_bot(settings: Settings, *, skip_checks: bool = False) -> None:
 class Doctor:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.redactor = SecretRedactor.from_settings(settings)
         self.errors: list[str] = []
         self.warnings: list[str] = []
         self.rows: list[tuple[str, str, str]] = []
@@ -334,13 +340,55 @@ class Doctor:
     def _print(self) -> None:
         for status, name, detail in self.rows:
             marker = {"OK": "✅", "WARN": "⚠️", "FAIL": "❌"}[status]
-            print(f"{marker} {name}: {detail}")
+            print(f"{marker} {name}: {self.redactor.redact(detail)}")
         if self.errors:
             print(f"\n{len(self.errors)} error(s), {len(self.warnings)} warning(s)")
         elif self.warnings:
             print(f"\nOK with {len(self.warnings)} warning(s)")
         else:
             print("\nAll checks passed.")
+
+
+def run_config_audit(settings: Settings) -> int:
+    """Print configuration structure and secret PRESENCE only; never values."""
+    from ai_supervisor.core.secret_safety import is_sensitive_name
+
+    print(f"config: {settings.config_path}")
+    print(f"env: {settings.env_path}")
+    print(f"config_mode: {oct(settings.config_path.stat().st_mode & 0o777)}")
+    print(
+        f"env_mode: {oct(settings.env_path.stat().st_mode & 0o777) if settings.env_path.exists() else 'missing'}"
+    )
+    print(f"backup_dir: {settings.backup_dir} (keep={settings.backups.keep})")
+    print("env_keys:")
+    presence = env_presence(settings.env_path)
+    for key, status in presence.items():
+        print(f"  {key}: {status}")
+    stale = sorted(set(presence) & NON_SECRET_ENV_KEYS)
+    if stale:
+        print("warning: non-secret settings in .env: " + ", ".join(stale))
+    unknown = sorted(
+        key
+        for key in presence
+        if not is_sensitive_name(key)
+        and key not in NON_SECRET_ENV_KEYS
+        and key not in PERSONAL_ENV_KEYS
+    )
+    if unknown:
+        print("warning: non-sensitive .env keys: " + ", ".join(unknown))
+    print("providers:")
+    if settings.llm.roles:
+        for role, provider in sorted(settings.llm.roles.items()):
+            print(f"  {role}: {provider}")
+    else:
+        print(f"  default: {settings.llm.default_provider}")
+    try:
+        settings.require_credentials()
+        print("credentials: required credentials present")
+    except ConfigError as exc:
+        print(f"credentials: {exc}")
+    print("configuration audit complete; no secret values were printed")
+    return 0 if not stale and not unknown else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -350,6 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="run the Telegram bot")
     run.add_argument("--skip-checks", action="store_true", help="skip startup network/model checks")
     sub.add_parser("doctor", help="check the local installation and credentials")
+    sub.add_parser("config-audit", help="show configuration/secret presence without values")
     return parser
 
 
@@ -361,6 +410,13 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
+    if args.command == "config-audit":
+        try:
+            settings = load_settings(check_env_permissions=False)
+        except ConfigError as exc:
+            print(f"configuration error: {exc}", file=sys.stderr)
+            return 2
+        return run_config_audit(settings)
     if args.command == "doctor":
         return asyncio.run(Doctor(settings).run())
     try:

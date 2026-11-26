@@ -354,6 +354,7 @@ class SupervisorAgent:
                 ),
             },
         ]
+        messages = self._safe_messages(messages)
         result = await self._structured_call(
             messages,
             tool=INTENT_TOOL,
@@ -394,10 +395,12 @@ class SupervisorAgent:
             "Сформируй ТЗ и вызови submit_task_spec."
         )
         result = await self._structured_call(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            self._safe_messages(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ]
+            ),
             tool=TASK_SPEC_TOOL,
             expected_name="submit_task_spec",
             schema=TaskSpec,
@@ -429,10 +432,12 @@ class SupervisorAgent:
             "Проверь работу по фактам и вызови submit_review."
         )
         result = await self._structured_call(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            self._safe_messages(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ]
+            ),
             tool=REVIEW_TOOL,
             expected_name="submit_review",
             schema=ReviewResult,
@@ -507,6 +512,15 @@ class SupervisorAgent:
         )
         return response.content.strip(), response.usage
 
+    def _safe_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        safe: list[dict[str, Any]] = []
+        for message in messages:
+            item = dict(message)
+            if isinstance(item.get("content"), str):
+                item["content"] = self.redactor.redact(item["content"])
+            safe.append(item)
+        return safe
+
     async def _structured_call(
         self,
         messages: list[dict[str, Any]],
@@ -556,7 +570,7 @@ class SupervisorAgent:
                 # Keep the full assistant message, including reasoning_content, then
                 # answer every tool call so Kimi can continue the same reasoning turn.
                 if response.content or response.reasoning_content or response.tool_calls:
-                    current_messages.append(response.assistant_message())
+                    current_messages.append(self._safe_messages([response.assistant_message()])[0])
                 self._append_tool_error_results(
                     current_messages,
                     response,
