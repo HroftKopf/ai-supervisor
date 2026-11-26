@@ -26,7 +26,7 @@ HELP_TEXT = """AI Supervisor — команды
 /start — начать и показать состояние
 /help — эта справка
 /projects — список проектов
-/project — текущий проект; /project list|select|add|create|remove|info|permissions|test|build|instructions
+/project — текущий проект; /project list|select|add|create|remove|info|permissions|test|build|instructions|import-config
 /new — начать новый диалог
 /tasks — последние задачи
 /task <текст> — создать задачу без классификатора
@@ -169,6 +169,8 @@ class Handlers:
             await self._project_create(message.chat.id, rest)
         elif sub == "remove":
             await self._project_remove(message.chat.id, rest)
+        elif sub == "import-config":
+            await self._project_import_config(message.chat.id, message.from_user.id, rest)
         elif sub in {
             "test",
             "build",
@@ -189,6 +191,26 @@ class Handlers:
                 message.chat.id,
                 "Использование: /project [use|add|create|remove|test|build|instructions|check]",
             )
+
+    async def _project_import_config(self, chat_id: int, user_id: int, rest: str) -> None:
+        import shlex
+
+        try:
+            parts = shlex.split(rest)
+        except ValueError as exc:
+            await self.notifier.send_text(chat_id, f"Некорректные аргументы: {exc}")
+            return
+        overwrite = "--overwrite" in parts
+        parts = [part for part in parts if part != "--overwrite"]
+        if len(parts) != 2:
+            await self.notifier.send_text(
+                chat_id,
+                "Использование: /project import-config <source> <relative-destination> [--overwrite]",
+            )
+            return
+        await self.orchestrator.request_config_import(
+            chat_id, user_id, parts[0], parts[1], overwrite
+        )
 
     async def _project_info(self, chat_id: int) -> None:
         project = await self.orchestrator.current_project(chat_id)

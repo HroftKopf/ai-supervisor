@@ -40,10 +40,14 @@
   миграции SQLite v1→v2 с backup.
 - Preflight-контракт: неизвестные tools, CRITICAL-полномочия и нереализованные privileged-типы
   блокируются до worker; HIGH требует подтверждения.
-- Git push с обязательным подтверждением, без force, с проверкой remote SHA.
+- Git push с обязательным подтверждением, без force, с проверкой remote SHA; `/github info|create`
+  через GitHub API при заданном `GITHUB_TOKEN`.
+- `/project import-config <source> <dest> [--overwrite]`: импорт только из extra read paths,
+  secret-scan, hash источника, backup при overwrite и отдельный approval.
 - Per-model usage/pricing, кэш/reasoning, duration; команды `/usage today|week|month|task N`.
 - Новые Telegram-команды: `/task`, `/task_info`, `/queue`, `/cancel`, `/pause`, `/retry`, `/doctor`,
-  `/push`; проектные `/project list|select|permissions|remote|budget|extra-read|permission`.
+  `/push`, `/github`, `/report full`; проектные `/project list|select|permissions|remote|budget|
+  extra-read|permission|import-config`.
 - FTS5-поиск, резюме, stop/rollback/pause/retry, systemd, doctor, redaction.
 
 Phase 1 намеренно **не** реализует SSH, браузер, Docker/Podman, MCP и распределённый VPS.
@@ -196,7 +200,7 @@ SDK запускает собственный bundled runtime; системны�
 других пользователей отклоняются. Long polling означает отсутствие публичного IP и вебхуков.
 
 Команды: `/start`, `/help`, `/projects`, `/project` (`list|select|info|add|create|remove|
-permissions|remote|budget|max-rework|extra-read|permission|test|build|instructions`),
+permissions|remote|budget|max-rework|extra-read|permission|import-config|test|build|instructions`),
 `/new`, `/task`, `/task_info`, `/tasks`, `/queue`, `/status`, `/agents`, `/logs`, `/diff`,
 `/report [id] [full]`, `/approve`, `/reject`, `/stop`, `/cancel`, `/pause`, `/resume`, `/retry`,
 `/rollback`, `/rework`, `/push`, `/github info|create`, `/usage` (`today|week|month|task N`),
@@ -303,7 +307,7 @@ memory_mb = 4096
 
 Выполнено:
 
-- `pytest`: **59 passed, 3 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
+- `pytest`: **65 passed, 3 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
   Проверены запуск runtime, проброс `DEEPSEEK_BASE_URL`, запись результата, usage (input 42,
@@ -366,8 +370,6 @@ ai-supervisor run
 - Продвинутые GitHub PR/checks и настройки организаций; базовые repo info/create и Git push реализованы.
 - Полноценный привилегированный исполнитель для `SYSTEM_OPERATION`/`EXTERNAL_OPERATION`;
   сейчас эти типы блокируются до отдельного этапа.
-- Config import как отдельный approval-tool; вместо него worker получает только явно разрешённые
-  read-only paths и может скопировать конфиг в worktree с secret-сканом diff.
 - JSON-корреляция логов и ретенция строк `task_events`; файловые task-логи очищаются
   автоматически по `app.task_log_retention_days`, но JSON-формат журнала ещё не включён.
 

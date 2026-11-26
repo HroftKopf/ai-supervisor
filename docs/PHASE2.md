@@ -77,6 +77,9 @@ Kimi возвращает `approved` / `rework_required` / `approval_required` /
 - Project settings: remote, token budget, max rework, per-project policy, extra read-only paths.
 - Telegram: `/project list|select|permissions|remote|budget|max-rework|extra-read|permission`.
 - Extra read paths монтируются в bwrap read-only; worker может скопировать конфиг в worktree.
+- `/project import-config <source> <dest> [--overwrite]` — отдельный approval-tool:
+  source только из extra read paths, запрет symlink/секретов/traversal, лимиты 200 файлов/10 MiB,
+  hash источника проверяется после approval, overwrite делает backup в `var/backups/config-import`.
 - Diff с секретами блокируется до коммита/ревью/merge.
 
 ### Usage
@@ -98,12 +101,15 @@ Kimi возвращает `approved` / `rework_required` / `approval_required` /
 
 ## Что проверено
 
-- `pytest`: 59 passed, 3 skipped.
+- `pytest`: 65 passed, 3 skipped.
 - `ruff check`: без ошибок.
 - Реальный DSH runtime в bwrap: 2 integration tests passed (включая bash tool call).
 - Живой Kimi API: chat/classify/plan v2/review — passed.
 - Миграция копии рабочей БД v1→v2 с backup — passed, 2 historical tasks сохранены.
 - Merge idempotence и approved Git push в локальный bare remote — tests.
+- Config import: file/dir, backup при overwrite, secret scan, traversal/symlink rejection,
+  source hash после approval — tests.
+- Startup recovery: RUNNING→INTERRUPTED, PAUSED сохраняется, worker → interrupted — test.
 - GitHub REST client (exists/info/create/auth errors) — tests с локальным mock API.
 - Telegram-команды и project settings проверены unit-тестами/фикстурами; live Telegram не запускался.
 
@@ -111,7 +117,7 @@ Kimi возвращает `approved` / `rework_required` / `approval_required` /
 
 См. раздел README «Что ещё не реализовано в Phase 2»:
 COMPOSITE/DAG, routing, продвинутые GitHub PR/checks, system/external executor,
-config-import approval-tool, JSON-correlated logs/event retention. Базовые `/github info|create`
+JSON-correlated logs/event retention. Базовые `/github info|create`
 и Git push реализованы. Worker network остаётся общей (egress allowlist — следующий этап).
 
 ## Перезапуск после обновления

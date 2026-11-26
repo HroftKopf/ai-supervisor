@@ -332,3 +332,28 @@ async def test_github_repository_create_requires_approval(orchestrator) -> None:
     assert approval_id is not None
     await orch.approve_action(approval_id, 424242, 424242)
     assert fake.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_config_import_requires_owner_approval(orchestrator, project, tmp_path: Path) -> None:
+    orch, _supervisor, _workers, notifier, projects, _tasks = orchestrator
+    source = tmp_path / "niri.conf"
+    source.write_text("layout = 'dwindle'\n", encoding="utf-8")
+    await projects.update_instructions(project.id, extra_read_paths=[str(tmp_path)])
+    await orch.request_config_import(424242, 424242, str(source), "configs/niri.conf")
+    destination = Path(project.path) / "configs/niri.conf"
+    assert not destination.exists()
+    approval_id = None
+    for _chat, _text, buttons in reversed(notifier.messages):
+        if not buttons:
+            continue
+        for row in buttons:
+            for button in row:
+                if button.callback_data.startswith("apv:"):
+                    approval_id = int(button.callback_data.split(":", 1)[1])
+                    break
+        if approval_id is not None:
+            break
+    assert approval_id is not None
+    await orch.approve_action(approval_id, 424242, 424242)
+    assert destination.read_text() == "layout = 'dwindle'\n"

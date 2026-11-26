@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from ai_supervisor.agents.supervisor import SupervisorAgent, SupervisorError
 from ai_supervisor.config import Settings
+from ai_supervisor.core.config_import import ConfigImportError, ConfigImportService
 from ai_supervisor.core.context import ContextError, ProjectContextBuilder
 from ai_supervisor.core.git_ops import GitOpsError, push_branch, remote_url, verify_remote_branch
 from ai_supervisor.core.github import GitHubClient, GitHubError
@@ -161,6 +162,7 @@ class Orchestrator:
             if settings.github_token
             else None
         )
+        self.config_import = ConfigImportService(settings)
         self._summaries: dict[int, asyncio.Task[Any]] = {}
 
     # ------------------------------------------------------------------
@@ -1311,6 +1313,48 @@ class Orchestrator:
             ],
         )
 
+    async def request_config_import(
+        self, chat_id: int, user_id: int, source: str, destination: str, overwrite: bool = False
+    ) -> None:
+        self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
+        project = await self._current_project(chat_id)
+        if project is None:
+            await self.notifier.send_text(chat_id, "Проект не выбран.")
+            return
+        try:
+            plan = await self.config_import.plan(project, source, destination, overwrite=overwrite)
+        except ConfigImportError as exc:
+            await self.notifier.send_text(chat_id, f"Импорт отклонён: {exc}")
+            return
+        relative_destination = str(plan.destination.relative_to(Path(project.path).resolve()))
+        approval_id = await self.approvals.request(
+            action=Action.CONFIG_IMPORT,
+            payload={
+                "project_id": project.id,
+                "source": str(plan.source),
+                "destination": relative_destination,
+                "overwrite": plan.overwrite,
+                "source_hash": plan.source_hash,
+            },
+            created_by=user_id,
+            ttl_seconds=900,
+        )
+        await self.notifier.send_text(
+            chat_id,
+            f"Импорт конфигурации в проект {project.name}.\n"
+            f"Источник: {plan.source}\n"
+            f"Назначение: {relative_destination}\n"
+            f"Файлов: {plan.file_count}, байт: {plan.total_bytes}\n"
+            f"Перезапись: {'да' if plan.overwrite else 'нет'}\n"
+            "Секреты в текстовых файлах не найдены. Изменения будут записаны в рабочее дерево, "
+            "но не закоммичены. Подтвердите.",
+            [
+                [Button("Разрешить один раз", f"apv:{approval_id}")],
+                [Button("Отклонить", f"rej:{approval_id}")],
+            ],
+        )
+
     @_locked_action
     async def request_push(self, task_id: int, user_id: int, chat_id: int) -> None:
         self._assert_owner(user_id)
@@ -1441,6 +1485,40 @@ class Orchestrator:
             await self.notifier.send_text(
                 chat_id,
                 f"Задача #{task.id:03d} откатана. Патч сохранён: {patch_path}",
+            )
+        elif action is Action.CONFIG_IMPORT:
+            project = await self.projects.get(int(payload["project_id"]))
+            if project is None:
+                await self.notifier.send_text(chat_id, "Проект импорта не найден.")
+                return
+            try:
+                plan = await self.config_import.plan(
+                    project,
+                    str(payload["source"]),
+                    str(payload["destination"]),
+                    overwrite=bool(payload.get("overwrite", False)),
+                )
+                if plan.source_hash != payload.get("source_hash"):
+                    raise ConfigImportError(
+                        "источник изменился после запроса; запросите импорт заново"
+                    )
+                result = await self.config_import.execute(plan)
+            except ConfigImportError as exc:
+                await self.notifier.send_text(chat_id, f"Импорт не выполнен: {exc}")
+                return
+            logger.info(
+                "config import project=%s files=%s bytes=%s destination=%s",
+                project.id,
+                result.files,
+                result.total_bytes,
+                result.destination,
+            )
+            await self.notifier.send_text(
+                chat_id,
+                f"Конфигурация импортирована: {result.destination}\n"
+                f"Файлов: {result.files}, байт: {result.total_bytes}\n"
+                + (f"Резервная копия: {result.backup}\n" if result.backup else "")
+                + "Изменения записаны в рабочее дерево и не закоммичены; проверьте git status.",
             )
         elif action is Action.GITHUB_REPOSITORY_CREATE:
             if self.github is None:
