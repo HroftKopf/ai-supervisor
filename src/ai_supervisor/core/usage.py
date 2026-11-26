@@ -378,14 +378,21 @@ class UsageService:
         estimate = self.estimate_cost(totals, provider, model)
         return estimate if estimate is not None else (0.0, "")
 
-    @staticmethod
-    def format_totals(totals: UsageTotals) -> str:
-        return (
+    def format_totals(self, totals: UsageTotals) -> str:
+        text = (
             f"вход {totals.input_tokens:,}, выход {totals.output_tokens:,}, "
             f"кэш-чтение {totals.cached_tokens:,}, кэш-запись {totals.cache_write_tokens:,}, "
             f"reasoning {totals.reasoning_tokens:,}, запросов {totals.requests:,}"
-        ).replace(",", " ") + (
-            f", стоимость {totals.cost:.4f} {totals.currency}"
-            if totals.cost > 0 and totals.currency
-            else ""
-        )
+        ).replace(",", " ")
+        if totals.cost > 0 and totals.currency:
+            text += f", факт. стоимость {totals.cost:.4f} {totals.currency}"
+            display = self.settings.usage.display_currency
+            rate = (
+                self.settings.usage.fx_rates.get(totals.currency)
+                or self.settings.usage.fx_rates.get(f"{totals.currency}/{display}")
+                if display
+                else None
+            )
+            if display and rate:
+                text += f" (≈ {totals.cost * rate:.2f} {display}, локальная оценка)"
+        return text

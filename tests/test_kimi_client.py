@@ -257,3 +257,37 @@ def test_parse_tool_call_rejects_multiple_calls() -> None:
     )
     with pytest.raises(KimiProtocolError, match="несколько"):
         parse_tool_call(response, "submit_intent")
+
+
+@pytest.mark.asyncio
+async def test_quota_error_code_and_retry_after_are_classified() -> None:
+    from ai_supervisor.providers.kimi import (
+        KimiConnectionError,
+        KimiQuotaError,
+        KimiRateLimitError,
+    )
+
+    client = _client()
+    quota = SimpleNamespace(
+        status_code=429,
+        body={"error": {"code": "exceeded_current_quota_error", "message": "quota"}},
+        response=SimpleNamespace(headers={}),
+    )
+    assert isinstance(client._map_status_error(quota), KimiQuotaError)
+
+    limited = SimpleNamespace(
+        status_code=429,
+        body={"error": {"code": "rate_limit_exceeded", "message": "slow down"}},
+        response=SimpleNamespace(headers={"retry-after": "7"}),
+    )
+    error = client._map_status_error(limited)
+    assert isinstance(error, KimiRateLimitError)
+    assert error.retry_after == 7
+
+    unavailable = SimpleNamespace(
+        status_code=503,
+        body={"error": {"message": "overloaded"}},
+        response=SimpleNamespace(headers={}),
+    )
+    assert isinstance(client._map_status_error(unavailable), KimiConnectionError)
+    await client.close()

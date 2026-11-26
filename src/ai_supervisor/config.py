@@ -283,6 +283,17 @@ class UsageSection(BaseModel):
     deepseek_output: float = Field(default=0.0, ge=0)
     currency: str = "USD"
     prices: dict[str, ModelPrice] = Field(default_factory=dict)
+    # Optional display-only conversion. No rate is invented; empty means disabled.
+    display_currency: str = ""
+    fx_rates: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("fx_rates")
+    @classmethod
+    def _positive_fx(cls, value: dict[str, float]) -> dict[str, float]:
+        for key, rate in value.items():
+            if rate <= 0:
+                raise ValueError(f"usage.fx_rates[{key}] must be positive")
+        return value
 
     @property
     def configured(self) -> bool:

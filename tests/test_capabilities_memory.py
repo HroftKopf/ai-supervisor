@@ -89,3 +89,44 @@ async def test_deterministic_experience_extraction(database, settings, project) 
     memories = await service.get_memories(project_id=project.id)
     assert any(item.category == "successful_strategy" for item in memories)
     assert any(item.category == "verified_fact" for item in memories)
+
+
+@pytest.mark.asyncio
+async def test_memory_isolation_stale_and_unverified_labels(database, settings, project) -> None:
+    from ai_supervisor.memory.conversations import ConversationService
+
+    service = ConversationService(database, settings)
+    other = await service.get_memories(project_id=project.id)
+    assert other == []
+    active = await service.add_memory(
+        "project",
+        "release branch is main",
+        project_id=project.id,
+        key="release",
+        category="verified_fact",
+        verified=True,
+    )
+    await service.add_memory(
+        "project",
+        "maybe the cache is slow",
+        project_id=project.id,
+        key="hypothesis",
+        category="hypothesis",
+        verified=False,
+    )
+    stale = await service.add_memory(
+        "project",
+        "old branch was develop",
+        project_id=project.id,
+        key="old",
+        category="verified_fact",
+        verified=True,
+    )
+    await service.update_memory(stale.id, stale=True)
+    context = await service.memory_context(project_id=project.id, conversation_id=None)
+    assert "main" in context
+    assert "cache" in context and "неподтверждённое" in context
+    assert "develop" not in context
+    listed = await service.get_memories(project_id=project.id)
+    assert active.id in {item.id for item in listed}
+    assert stale.id not in {item.id for item in listed}

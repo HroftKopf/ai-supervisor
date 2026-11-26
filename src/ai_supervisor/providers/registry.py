@@ -14,6 +14,7 @@ from ai_supervisor.providers.base import (
     LLMProvider,
     ProviderCapabilities,
     ProviderConfigurationError,
+    ProviderQuotaError,
 )
 from ai_supervisor.providers.kimi import KimiClient, KimiClientConfig
 
@@ -27,6 +28,7 @@ class ProviderRegistry:
         self.settings = settings
         self.redactor = redactor
         self._providers: dict[str, LLMProvider] = {}
+        self._quota_blocked: set[str] = set()
         self._roles: dict[str, str] = {
             role: settings.llm.roles.get(role, settings.llm.default_provider) for role in ROLES
         }
@@ -92,7 +94,23 @@ class ProviderRegistry:
                 f"role {role} is configured for provider {name}, but its credentials are missing; "
                 "no fallback to another paid API is performed"
             )
+        if name in self._quota_blocked:
+            raise ProviderQuotaError(
+                f"provider {name} is paused after quota exhaustion; "
+                "run /provider test to check availability"
+            )
         return provider
+
+    def mark_quota_exhausted(self, role: str) -> None:
+        name = self._roles.get(role)
+        if name:
+            self._quota_blocked.add(name)
+
+    def clear_quota(self, provider_name: str) -> None:
+        self._quota_blocked.discard(provider_name)
+
+    def quota_blocked(self) -> set[str]:
+        return set(self._quota_blocked)
 
     def model_for(self, role: str) -> str:
         return self.provider_for(role).model
@@ -116,6 +134,7 @@ class ProviderRegistry:
                 }
                 for role in ROLES
             },
+            "quota_blocked": sorted(self._quota_blocked),
             "providers": {
                 name: {
                     "model": provider.model,
@@ -137,16 +156,27 @@ class ProviderRegistry:
     async def health(self, role_or_provider: str = "") -> dict[str, Any]:
         target = role_or_provider
         if target in ROLES:
-            provider = self.provider_for(target)
+            name = self._roles[target]
+            provider = self._providers.get(name)
+            if provider is None:
+                raise ProviderConfigurationError(
+                    f"role {target} is configured for unavailable provider {name}"
+                )
             result = await provider.health()
+            if result.available:
+                self.clear_quota(provider.name)
             return {target: result.model_dump()}
         if target:
             providers = {target: self._providers[target]} if target in self._providers else {}
         else:
             providers = self._providers
-        return {
-            name: (await provider.health()).model_dump() for name, provider in providers.items()
-        }
+        results: dict[str, Any] = {}
+        for name, provider in providers.items():
+            result = await provider.health()
+            if result.available:
+                self.clear_quota(name)
+            results[name] = result.model_dump()
+        return results
 
     async def close(self) -> None:
         for provider in self._providers.values():

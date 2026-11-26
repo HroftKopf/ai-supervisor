@@ -159,6 +159,10 @@ push_hosts = ["github.com"]
 timeout_seconds = 30
 
 [usage]
+# Optional display-only conversion for approximate local estimates (never provider fact).
+# display_currency = "RUB"
+#[usage.fx_rates]
+#USD = 0.0
 # Optional prices per million tokens. Zero means "not calculated" (never invented).
 # Costs use the actual provider/model and explicit currency.
 #[usage.pricing."kimi/k3.1-pro"]

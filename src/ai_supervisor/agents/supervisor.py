@@ -270,14 +270,6 @@ class StructuredReply(BaseModel):
     raw_usage: dict[str, Any] = Field(default_factory=dict)
 
 
-def _read_prompt(name: str) -> str:
-    path = PROMPTS_DIR / name
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise SupervisorError(f"prompt file is missing: {path}") from exc
-
-
 class SupervisorAgent:
     def __init__(
         self,

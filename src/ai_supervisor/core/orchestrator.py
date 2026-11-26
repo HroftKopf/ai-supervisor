@@ -421,6 +421,8 @@ class Orchestrator:
                 context_chars=len(project_block) + len(conversation_block),
             )
         except (KimiQuotaError, ProviderQuotaError) as exc:
+            if self.providers is not None:
+                self.providers.mark_quota_exhausted("classifier")
             await self._notify_quota(message.chat_id, exc)
             return
         except (KimiError, ProviderError, LimitExceeded) as exc:
@@ -502,6 +504,8 @@ class Orchestrator:
                 routing_level=int(self.routing.for_request(latest_text)),
             )
         except (KimiQuotaError, ProviderQuotaError) as exc:
+            if self.providers is not None:
+                self.providers.mark_quota_exhausted("chat")
             await self._notify_quota(chat_id, exc)
             return
         except (KimiError, ProviderError, LimitExceeded) as exc:
@@ -726,9 +730,16 @@ class Orchestrator:
         except LimitExceeded as exc:
             await self._pause_task(task_id, str(exc))
         except (KimiQuotaError, ProviderQuotaError) as exc:
-            await self._pause_task(task_id, str(exc))
-        except (KimiRateLimitError, ProviderRateLimitError) as exc:
-            await self._retry_wait(task_id, str(exc))
+            if self.providers is not None:
+                for role in self.providers.roles:
+                    self.providers.mark_quota_exhausted(role)
+            await self._pause_task(task_id, self._quota_message_for(exc))
+        except (KimiRateLimitError, ProviderRateLimitError):
+            await self._retry_wait(
+                task_id,
+                "Провайдер временно ограничил запросы. "
+                "Повтор будет выполнен после безопасной паузы; прогресс сохранён.",
+            )
         except (
             KimiError,
             ProviderError,
@@ -3212,12 +3223,22 @@ class Orchestrator:
             raw_usage=getattr(self.supervisor, "last_raw_usage", None),
         )
 
-    async def _notify_quota(self, chat_id: int, exc: Exception) -> None:
-        await self.notifier.send_text(
-            chat_id,
-            "Лимит/квота провайдера исчерпаны. Новые запросы приостановлены; проверьте лимиты аккаунта.\n"
-            + self.redactor.redact(str(exc))[:1000],
+    @staticmethod
+    def _quota_message() -> str:
+        return (
+            "Квота провайдера исчерпана\n\n"
+            "Задача приостановлена. Прогресс сохранён.\n\n"
+            "Причина: достигнут лимит текущего окна провайдера.\n"
+            "Точное время восстановления неизвестно.\n\n"
+            "Локальные команды остаются доступны."
         )
+
+    def _quota_message_for(self, exc: Exception) -> str:
+        # Keep the user-facing text stable; never include raw provider JSON.
+        return self._quota_message()
+
+    async def _notify_quota(self, chat_id: int, exc: Exception) -> None:
+        await self.notifier.send_text(chat_id, self._quota_message_for(exc))
 
     def _friendly_error(self, exc: Exception) -> str:
         text = self.redactor.redact(str(exc))[:1500]

@@ -366,7 +366,10 @@ class KimiClient:
         if status == 404:
             return KimiModelError(f"Kimi не нашёл endpoint или модель (404): {message[:500]}")
         if status == 429:
-            if any(marker in lowered for marker in QUOTA_MARKERS):
+            error_code = _error_code(exc).lower()
+            if any(marker in lowered for marker in QUOTA_MARKERS) or any(
+                marker in error_code for marker in QUOTA_MARKERS
+            ):
                 return KimiQuotaError(
                     "Квота Kimi исчерпана (429). Запросы приостановлены; проверьте лимиты аккаунта. "
                     f"Ответ: {message[:500]}"
@@ -423,6 +426,18 @@ def _parse_usage(value: Any) -> TokenUsage:
         reasoning_tokens=int(_get(completion_details, "reasoning_tokens") or 0),
         requests=1,
     )
+
+
+def _error_code(exc: openai.APIStatusError) -> str:
+    body = getattr(exc, "body", None)
+    if isinstance(body, Mapping):
+        error = body.get("error")
+        if isinstance(error, Mapping):
+            for key in ("code", "type"):
+                value = error.get(key)
+                if value:
+                    return str(value)
+    return ""
 
 
 def _error_message(exc: openai.APIStatusError) -> str:

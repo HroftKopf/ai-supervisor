@@ -47,3 +47,23 @@ async def test_per_model_pricing_and_period_totals(database, settings) -> None:
     )
     by_role = await service.by_role()
     assert by_role["planning"].total_tokens == 12
+
+
+@pytest.mark.asyncio
+async def test_display_currency_is_explicit_estimate(database, settings) -> None:
+    settings.usage.prices = {
+        "kimi/k3.1-pro": ModelPrice(input_per_mtok=10, output_per_mtok=30, currency="USD")
+    }
+    settings.usage.display_currency = "RUB"
+    settings.usage.fx_rates = {"USD": 90.0}
+    service = UsageService(database, settings)
+    await service.record(
+        provider="kimi",
+        model="k3.1-pro",
+        usage=TokenUsage(input_tokens=1_000_000, output_tokens=0, requests=1),
+    )
+    totals = (await service.by_model())[("kimi", "k3.1-pro")]
+    rendered = service.format_totals(totals)
+    assert "факт. стоимость 10.0000 USD" in rendered
+    assert "≈ 900.00 RUB" in rendered
+    assert "локальная оценка" in rendered

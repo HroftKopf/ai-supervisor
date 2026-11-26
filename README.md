@@ -90,6 +90,9 @@
 - `/models`, `/provider info|test|select`; ключи только в env, worker их не получает.
 - Единая типографика Telegram: карточки, Markdown Kimi → HTML, сохранение кода/абзацев.
 - FTS5-поиск, резюме, stop/rollback/pause/retry, systemd, doctor, redaction.
+- Phase 2.9 audit: [docs/PHASE2_9.md](docs/PHASE2_9.md), learning path:
+  [docs/learning/README.md](docs/learning/README.md), offline benchmarks: `benchmarks/run_offline.py`,
+  Phase 3 proposal: [docs/PHASE3_ARCHITECTURE.md](docs/PHASE3_ARCHITECTURE.md).
 
 Phase 1 намеренно **не** реализует SSH, браузер, Docker/Podman, MCP и распределённый VPS.
 Это следующие этапы, а не скрытые заглушки.
@@ -365,7 +368,7 @@ sandbox_network = true
 
 Выполнено:
 
-- `pytest`: **125 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
+- `pytest`: **134 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
   Проверены запуск runtime, проброс endpoint, запись результата, usage (input 42,

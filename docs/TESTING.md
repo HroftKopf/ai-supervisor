@@ -20,9 +20,14 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 | Проверка | Результат |
 |---|---|
 | `ruff check .` | все проверки пройдены |
-| `pytest -q` | **125 passed, 4 skipped** |
+| `pytest -q` | **134 passed, 4 skipped** |
 | `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py` | **2 passed** |
-| `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py` | **2 passed** |
+| `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py
+
+# Coverage (branch) and offline infrastructure benchmark:
+coverage run --branch --source=src/ai_supervisor -m pytest -q
+coverage report -m
+python benchmarks/run_offline.py` | **2 passed** |
 | bwrap probe | OK (user namespaces, read-only `/usr`) |
 | DSH runtime `sdk-minimal` init | OK |
 | Реальный DSH turn через mock Messages API | `completed`, usage input=42 output=7 cached=3 requests=1 |
@@ -86,7 +91,12 @@ ai-supervisor run
 Живой Kimi smoke можно повторить отдельно:
 
 ```bash
-AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py -s
+AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py
+
+# Coverage (branch) and offline infrastructure benchmark:
+coverage run --branch --source=src/ai_supervisor -m pytest -q
+coverage report -m
+python benchmarks/run_offline.py -s
 ```
 Затем создайте тестовую задачу на небольшом проекте и проверьте отчёт, `/diff`, `/logs`,
 кнопки «Принять»/«На доработку»/«Откатить».
