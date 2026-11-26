@@ -28,7 +28,7 @@ Baseline: `a8fcb07`. No paid API calls, no production credentials used, no produ
   conversation/project IDs, source message ID, normalized redacted text, attachment refs,
   timestamp, mode, source revision and policy ID.
 - SQLite schema v8 adds `tasks.request_id`, `source_request`, `request_revision`,
-  `intent_source`.
+  `intent_source`; schema v9 adds provider state generation.
 - New tasks store the original request at creation. Planner uses `task.source_request`; new
   conversation messages cannot replace it.
 - Legacy tasks default to `legacy-inferred` when no original request exists.
@@ -66,13 +66,13 @@ evidence is preserved and the task is blocked for an owner decision rather than 
 
 ### Schema
 
-SQLite schema v8 adds request provenance fields, usage identity columns and provider state
-persistence. Migration backup is
-`pre-migration-v8-*.db`; additive columns preserve existing data.
+SQLite schema v8 added request provenance and usage identity; schema v9 adds provider state
+generation. Migration backup is
+`pre-migration-v9-*.db`; additive columns preserve existing data.
 
 ## Verification
 
-- **170 passed, 4 skipped**, synthetic credentials only.
+- **174 passed, 4 skipped**, synthetic credentials only.
 - Offline benchmark after the change (single samples, current host): memory search 0.88–1.04 ms,
   context build 0.43–0.54 ms, state transitions median 3.5–3.6 ms, 20 scheduler jobs 0.28–0.30 ms,
   recovery 0.53–0.57 ms, peak context 25,693 B. These are slower than the Phase 2.9 sample
@@ -96,7 +96,7 @@ inflate the result.
 | Provider identity before call | PARTIAL | identity carried on ProviderResponse/usage; not every stage/request link persisted |
 | Canonical roles | VERIFIED offline | canonical_role + tests |
 | Quota isolation | VERIFIED offline | provider-scoped gate + test |
-| Persisted quota state | PARTIAL | `provider_states`, hydrate, `/provider recover` mock tests; paid probe not run |
+| Persisted quota state | IMPLEMENTED_NOT_VERIFIED | `provider_states.generation`, atomic recovery, hydrate; live paid probe not run |
 | Owner-approved generation recovery | IMPLEMENTED_NOT_VERIFIED | minimal no-tool probe + approval binding + single-flight; offline mock only |
 | Immutable original request | PARTIAL | source_request immutable; amendment flow not implemented |
 | Telegram dedup | PARTIAL | existing middleware; no SQLite task unique key |
@@ -129,6 +129,6 @@ inflate the result.
 
 ## Update / rollback
 
-Update normally; schema v8 is additive with backup. Rollback the commit; existing tasks retain
+Update normally; schema v9 is additive with backup. Rollback the commit; existing tasks retain
 request provenance columns and legacy tasks remain readable. Do not delete logs or backups without
 owner approval.

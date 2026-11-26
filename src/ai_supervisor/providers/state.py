@@ -36,8 +36,8 @@ class ProviderStateStore:
             """
             INSERT INTO provider_states(provider_id, account_scope_id, state,
                 failure_category, detected_at, last_checked_at, retry_not_before,
-                consecutive_failures, reason, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                consecutive_failures, generation, reason, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
             ON CONFLICT(provider_id) DO UPDATE SET
                 account_scope_id=excluded.account_scope_id,
                 state=excluded.state,
@@ -46,6 +46,7 @@ class ProviderStateStore:
                 last_checked_at=excluded.last_checked_at,
                 retry_not_before=excluded.retry_not_before,
                 consecutive_failures=provider_states.consecutive_failures + 1,
+                generation=provider_states.generation + 1,
                 reason=excluded.reason,
                 updated_at=excluded.updated_at
             """,
@@ -66,12 +67,14 @@ class ProviderStateStore:
         await self.db.execute(
             """
             INSERT INTO provider_states(provider_id, account_scope_id, state,
-                detected_at, last_checked_at, consecutive_failures, reason, updated_at)
-            VALUES (?, 'default', 'AVAILABLE', ?, ?, 0, '', ?)
+                detected_at, last_checked_at, consecutive_failures, generation,
+                reason, updated_at)
+            VALUES (?, 'default', 'AVAILABLE', ?, ?, 0, 1, '', ?)
             ON CONFLICT(provider_id) DO UPDATE SET
                 state='AVAILABLE', failure_category=NULL, detected_at=NULL,
                 last_checked_at=excluded.last_checked_at, retry_not_before=NULL,
-                consecutive_failures=0, reason='', updated_at=excluded.updated_at
+                consecutive_failures=0, generation=provider_states.generation + 1,
+                reason='', updated_at=excluded.updated_at
             """,
             (provider_id, iso_now(), iso_now(), iso_now()),
         )

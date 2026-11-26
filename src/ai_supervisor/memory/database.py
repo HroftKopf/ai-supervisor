@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def iso_now() -> str:
@@ -236,6 +236,7 @@ CREATE TABLE IF NOT EXISTS provider_states (
     last_checked_at TEXT,
     retry_not_before TEXT,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 0,
     reason TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
@@ -404,12 +405,16 @@ class Database:
                 last_checked_at TEXT,
                 retry_not_before TEXT,
                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                generation INTEGER NOT NULL DEFAULT 0,
                 reason TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL
             )
             """
         )
         additions = {
+            "provider_states": {
+                "generation": "INTEGER NOT NULL DEFAULT 0",
+            },
             "projects": {
                 "remote_url": "TEXT",
                 "permissions_json": "TEXT NOT NULL DEFAULT '{}'",

@@ -35,6 +35,14 @@ class ProviderRecoveryBusy(ProviderRecoveryError):
     pass
 
 
+class ProviderRecoveryStateError(ProviderRecoveryError):
+    pass
+
+
+class ProviderRecoveryPersistenceError(ProviderRecoveryError):
+    pass
+
+
 class ProviderRegistry:
     """Explicit role -> provider routing. Never falls back to another paid API silently."""
 
@@ -114,9 +122,11 @@ class ProviderRegistry:
                 "no fallback to another paid API is performed"
             )
         if name in self._quota_blocked:
-            raise ProviderQuotaError(
-                f"provider {name} is paused after quota exhaustion; run /provider recover {{name}}"
+            error = ProviderQuotaError(
+                f"provider {name} is paused after quota exhaustion; run /provider recover {name}"
             )
+            error.provider = name
+            raise error
         return provider
 
     def resolve_target(self, target: str) -> tuple[str, LLMProvider]:
@@ -133,6 +143,60 @@ class ProviderRegistry:
         if provider is None:
             raise ProviderConfigurationError(f"provider {target!r} is not available/configured")
         return target, provider
+
+    async def recover_generation(
+        self,
+        provider_name: str,
+        identity: ProviderCallIdentity,
+        *,
+        expected_generation: int,
+    ) -> Any:
+        """Atomically validate, probe and persist recovery under one lock.
+
+        The lock is held across the probe and the SQLite write. The in-memory
+        block is cleared only after the persisted AVAILABLE transition succeeds.
+        """
+        provider = self._providers.get(provider_name)
+        if provider is None:
+            raise ProviderConfigurationError(f"provider {provider_name!r} is not configured")
+        lock = self._recovery_locks.setdefault(provider_name, asyncio.Lock())
+        if lock.locked():
+            error = ProviderRecoveryBusy(f"recovery probe for {provider_name} is already running")
+            error.provider = provider_name
+            raise error
+        async with lock:
+            if self.state_store is not None:
+                current = await self.state_store.get(provider_name)
+                if current is None:
+                    raise ProviderRecoveryStateError("provider state is missing")
+                if str(current.get("state")) != "QUOTA_EXHAUSTED":
+                    raise ProviderRecoveryStateError("provider is already no longer blocked")
+                if int(current.get("generation") or 0) != int(expected_generation):
+                    raise ProviderRecoveryStateError(
+                        "approval belongs to an older quota state generation"
+                    )
+            try:
+                response = await provider.probe(max_output_tokens=8)
+            except Exception as exc:
+                if self.state_store is not None:
+                    await self.state_store.set_state(
+                        provider_name,
+                        "QUOTA_EXHAUSTED",
+                        category=type(exc).__name__,
+                        reason=str(exc)[:500],
+                    )
+                exc.provider = provider_name  # type: ignore[attr-defined]
+                raise
+            if self.state_store is not None:
+                try:
+                    await self.state_store.set_available(provider_name)
+                except Exception as exc:
+                    # Keep both persisted and in-memory block on write failure.
+                    raise ProviderRecoveryPersistenceError(
+                        "failed to persist provider recovery; block retained"
+                    ) from exc
+            self._quota_blocked.discard(provider_name)
+            return response.model_copy(update={"identity": identity})
 
     async def probe_generation(self, provider_name: str, identity: ProviderCallIdentity) -> Any:
         """Single-flight, no-tool, no-history minimal generation probe.
@@ -151,9 +215,9 @@ class ProviderRegistry:
             return response.model_copy(update={"identity": identity})
 
     async def clear_provider_quota(self, provider_name: str) -> None:
-        self.clear_quota(provider_name)
         if self.state_store is not None:
             await self.state_store.set_available(provider_name)
+        self.clear_quota(provider_name)
 
     def mark_quota_exhausted(self, role: str) -> None:
         role = canonical_role(role)

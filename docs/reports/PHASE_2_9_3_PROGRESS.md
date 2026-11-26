@@ -20,7 +20,8 @@ Current state after this work: see final commit/report.
 - Memory retrieval filters scope before limit and uses query relevance.
 - Health/generation readiness separated; model listing does not clear quota.
 - Owner-approved `/provider recover` with minimal generation probe, single-flight lock,
-  provider/model-bound approval, usage identity registration and persisted AVAILABLE state.
+  provider/model/generation-bound approval, usage identity registration and atomic persisted
+  AVAILABLE transition. Persistence is written before the in-memory block is cleared.
 - No hidden structured-output token escalation.
 - Tests increased from 160 to 163; coverage remains ~68% statements / 51% branches.
 
@@ -57,6 +58,11 @@ Current state after this work: see final commit/report.
 | concurrent probes are single-flight | PASS |
 | usage belongs to fake provider | PASS |
 | changed provider config invalidates approval | PASS |
+| two approvals for one block → one probe | PASS |
+| stale approval from prior generation → no probe | PASS |
+| concurrent approvals → one probe | PASS |
+| SQLite persistence failure retains block | PASS |
+| unknown quota identity does not block planner | PASS |
 | independent provider quota isolation | PASS |
 
 Live generation probe: NOT RUN (no paid API authorization).

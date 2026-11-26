@@ -96,7 +96,11 @@ from ai_supervisor.providers.kimi import (
     KimiQuotaError,
     KimiRateLimitError,
 )
-from ai_supervisor.providers.registry import ProviderRecoveryBusy
+from ai_supervisor.providers.registry import (
+    ProviderRecoveryBusy,
+    ProviderRecoveryPersistenceError,
+    ProviderRecoveryStateError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -770,9 +774,13 @@ class Orchestrator:
                         provider_name, "QUOTA_EXHAUSTED", category="quota"
                     )
                 else:
-                    # Conservative fallback only for the execution planner; never
-                    # block unrelated providers because the source is unknown.
-                    self.providers.mark_quota_exhausted("planner")
+                    await self.tasks.add_event(
+                        task_id,
+                        "provider-quota-unknown",
+                        "Quota error without provider identity; no provider was blocked",
+                        {"error_type": type(exc).__name__},
+                        agent="orchestrator",
+                    )
             await self._pause_task(task_id, self._quota_message_for(exc))
         except (KimiRateLimitError, ProviderRateLimitError):
             await self._retry_wait(
@@ -2869,6 +2877,7 @@ class Orchestrator:
                 "provider_id": provider_name,
                 "model_id": provider.model,
                 "account_scope_id": "default",
+                "state_generation": int(state.get("generation") or 0),
             },
             created_by=user_id,
             ttl_seconds=600,
@@ -2896,6 +2905,7 @@ class Orchestrator:
             return
         provider_name = str(payload.get("provider_id") or "")
         expected_model = str(payload.get("model_id") or "")
+        expected_generation = int(payload.get("state_generation") or 0)
         provider = self.providers.available().get(provider_name)
         if provider is None or (expected_model and provider.model != expected_model):
             await self.notifier.send_text(
@@ -2915,7 +2925,9 @@ class Orchestrator:
         )
         try:
             await self.usage.ensure_kimi_budget(0)
-            response = await self.providers.probe_generation(provider_name, identity)
+            response = await self.providers.recover_generation(
+                provider_name, identity, expected_generation=expected_generation
+            )
             await self.usage.record(
                 provider=provider_name,
                 model=provider.model,
@@ -2928,20 +2940,27 @@ class Orchestrator:
                 account_scope_id=identity.account_scope_id,
                 reasoning_profile=identity.reasoning_profile,
             )
-            await self.providers.clear_provider_quota(provider_name)
         except ProviderRecoveryBusy:
             await self.notifier.send_text(
                 chat_id, "Probe для этой конфигурации уже выполняется; повторный не запущен."
             )
             return
+        except ProviderRecoveryStateError as exc:
+            await self.notifier.send_text(
+                chat_id,
+                f"Восстановление {provider_name} не требуется или approval устарел: {exc}. "
+                "Платный probe не выполнялся.",
+            )
+            return
+        except ProviderRecoveryPersistenceError:
+            await self.notifier.send_text(
+                chat_id,
+                "Генерация успешна, но состояние не удалось сохранить в SQLite. "
+                "Блокировка сохранена; восстановление не подтверждено.",
+            )
+            return
         except (ProviderError, KimiError) as exc:
             category = type(exc).__name__
-            await self.providers.persist_state(
-                provider_name,
-                "QUOTA_EXHAUSTED",
-                category=category,
-                reason=self.redactor.redact(str(exc))[:500],
-            )
             await self.notifier.send_text(
                 chat_id,
                 f"Восстановление {provider_name} не подтверждено.\n"

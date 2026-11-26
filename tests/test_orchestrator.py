@@ -506,3 +506,38 @@ async def test_update_fields_rejects_original_request_mutation(orchestrator, pro
     )
     with pytest.raises(TaskError, match="unexpected task fields"):
         await tasks.update_fields(task.id, source_request="mutated")
+
+
+@pytest.mark.asyncio
+async def test_unknown_quota_identity_does_not_block_planner(orchestrator, project) -> None:
+
+    from ai_supervisor.providers.base import ProviderQuotaError
+
+    orch, supervisor, _workers, _notifier, _projects, tasks = orchestrator
+    conversation = await orch.conversations.get_or_create_conversation(424242, project.id)
+    task = await tasks.create(project.id, conversation.id, "unknown-quota", max_rework=1)
+
+    class Registry:
+        def __init__(self) -> None:
+            self.blocked: set[str] = set()
+
+        def mark_provider_quota(self, name: str) -> None:
+            self.blocked.add(name)
+
+        def mark_quota_exhausted(self, role: str) -> None:
+            self.blocked.add(role)
+
+        async def persist_state(self, *args, **kwargs) -> None:
+            return None
+
+    registry = Registry()
+    orch.providers = registry  # type: ignore[assignment]
+
+    async def fail_plan(**kwargs):
+        raise ProviderQuotaError("quota without identity")
+
+    supervisor.plan = fail_plan  # type: ignore[method-assign]
+    await orch._run_task(task.id, plan_if_needed=True, manual_instruction=None)
+    assert registry.blocked == set()
+    task = await tasks.get(task.id)
+    assert task.status.value in {"paused", "blocked", "failed"}

@@ -242,3 +242,111 @@ async def test_changed_provider_config_invalidates_approval(settings, tmp_path) 
     finally:
         await registry.close()
         await db.close()
+
+
+async def _make_orchestrator(settings, registry, db):
+    from conftest import FakeNotifier, FakeSupervisor, FakeWorkers
+
+    from ai_supervisor.core.orchestrator import Orchestrator
+    from ai_supervisor.core.permissions import ApprovalService
+    from ai_supervisor.core.usage import UsageService
+    from ai_supervisor.memory.conversations import ConversationService
+    from ai_supervisor.memory.projects import ProjectService
+    from ai_supervisor.memory.tasks import TaskService
+
+    orchestrator = Orchestrator(
+        settings=settings,
+        projects=ProjectService(db, settings),
+        conversations=ConversationService(db, settings),
+        tasks=TaskService(db),
+        usage=UsageService(db, settings),
+        approvals=ApprovalService(db),
+        supervisor=FakeSupervisor(),
+        workspace=None,  # type: ignore[arg-type]
+        workers=FakeWorkers(),  # type: ignore[arg-type]
+        scheduler=__import__(
+            "ai_supervisor.core.worker_manager", fromlist=["WorkerScheduler"]
+        ).WorkerScheduler(1),
+        context_builder=None,  # type: ignore[arg-type]
+        redactor=SecretRedactor([]),
+        notifier=FakeNotifier(),
+    )
+    orchestrator.providers = registry
+    return orchestrator
+
+
+@pytest.mark.asyncio
+async def test_two_approvals_one_probe_and_old_generation(settings, tmp_path) -> None:
+    db, registry, fake = await _registry(settings, tmp_path)
+    orchestrator = await _make_orchestrator(settings, registry, db)
+    try:
+        registry._quota_blocked.add("fake")
+        await registry.persist_state("fake", "QUOTA_EXHAUSTED", category="quota")
+        await orchestrator.request_provider_recovery("fake", 424242, 424242)
+        await orchestrator.request_provider_recovery("fake", 424242, 424242)
+        rows = await db.fetchall("SELECT id FROM approvals ORDER BY id")
+        assert len(rows) == 2
+        await orchestrator.approve_action(int(rows[0]["id"]), 424242, 424242)
+        assert fake.probe_calls == 1
+        await orchestrator.approve_action(int(rows[1]["id"]), 424242, 424242)
+        assert fake.probe_calls == 1  # already AVAILABLE; no second paid probe
+
+        # A new quota failure invalidates an approval from the previous generation.
+        await registry.persist_state("fake", "QUOTA_EXHAUSTED", category="quota")
+        registry._quota_blocked.add("fake")
+        await orchestrator.request_provider_recovery("fake", 424242, 424242)
+        new_pending = await orchestrator.approvals.latest_pending(user_id=424242)
+        assert new_pending is not None
+        await registry.persist_state("fake", "QUOTA_EXHAUSTED", category="quota")
+        await orchestrator.approve_action(int(new_pending["id"]), 424242, 424242)
+        assert fake.probe_calls == 1
+    finally:
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recovery_approvals_do_not_duplicate_probe_directly(
+    settings, tmp_path
+) -> None:
+    db, registry, fake = await _registry(settings, tmp_path)
+    try:
+        registry._quota_blocked.add("fake")
+        await registry.persist_state("fake", "QUOTA_EXHAUSTED", category="quota")
+        current = await registry.state_store.get("fake")
+        generation = int(current["generation"])
+        fake.delay = 0.1
+        first = asyncio.create_task(
+            registry.recover_generation("fake", _identity(), expected_generation=generation)
+        )
+        await asyncio.sleep(0.02)
+        with pytest.raises(ProviderRecoveryBusy):
+            await registry.recover_generation("fake", _identity(), expected_generation=generation)
+        await first
+        assert fake.probe_calls == 1
+    finally:
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_failure_keeps_block_and_does_not_report_success(settings, tmp_path) -> None:
+    from ai_supervisor.providers.registry import ProviderRecoveryPersistenceError
+
+    db, registry, _fake = await _registry(settings, tmp_path)
+    try:
+        registry._quota_blocked.add("fake")
+        await registry.persist_state("fake", "QUOTA_EXHAUSTED", category="quota")
+        generation = int((await registry.state_store.get("fake"))["generation"])
+
+        async def fail_available(provider_id: str) -> None:
+            raise RuntimeError("sqlite write failed")
+
+        registry.state_store.set_available = fail_available  # type: ignore[method-assign]
+        with pytest.raises(ProviderRecoveryPersistenceError):
+            await registry.recover_generation("fake", _identity(), expected_generation=generation)
+        assert "fake" in registry.quota_blocked()
+        assert (await registry.state_store.get("fake"))["state"] == "QUOTA_EXHAUSTED"
+    finally:
+        await registry.close()
+        await db.close()
