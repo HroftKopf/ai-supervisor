@@ -98,6 +98,8 @@ class Handlers:
         r.message.register(self.cmd_auto, Command("auto"))
         r.message.register(self.cmd_task, Command("task"))
         r.message.register(self.cmd_request, Command("request"))
+        r.message.register(self.cmd_amend, Command("amend"))
+        r.message.register(self.cmd_revisions, Command("revisions"))
         r.message.register(self.cmd_task_info, Command("task_info"))
         r.message.register(self.cmd_queue, Command("queue"))
         r.message.register(self.cmd_status, Command("status"))
@@ -451,6 +453,42 @@ class Handlers:
                 if getattr(message, "message_id", None) is not None
                 else None
             ),
+        )
+
+    async def cmd_amend(self, message: Message) -> None:
+        parts = (message.text or "").split(maxsplit=2)
+        if len(parts) < 3:
+            await self.notifier.send_text(
+                message.chat.id,
+                "Использование: /amend <task_id> <полные новые требования>",
+            )
+            return
+        try:
+            task_id = int(parts[1])
+        except ValueError:
+            await self.notifier.send_text(message.chat.id, "task_id должен быть числом.")
+            return
+        await self.orchestrator.request_amendment(
+            task_id,
+            parts[2],
+            message.from_user.id,
+            message.chat.id,  # type: ignore[union-attr]
+        )
+
+    async def cmd_revisions(self, message: Message) -> None:
+        parts = (message.text or "").split()
+        if len(parts) != 2:
+            await self.notifier.send_text(message.chat.id, "Использование: /revisions <task_id>")
+            return
+        try:
+            task_id = int(parts[1])
+        except ValueError:
+            await self.notifier.send_text(message.chat.id, "task_id должен быть числом.")
+            return
+        await self.orchestrator.show_revisions(
+            task_id,
+            message.from_user.id,
+            message.chat.id,  # type: ignore[union-attr]
         )
 
     async def cmd_request(self, message: Message) -> None:

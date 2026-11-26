@@ -23,7 +23,9 @@ Current state after this work: see final commit/report.
   provider/model/generation-bound approval, usage identity registration and atomic persisted
   AVAILABLE transition. Persistence is written before the in-memory block is cleared.
 - No hidden structured-output token escalation.
-- Tests increased from 160 to 191; coverage remains ~68% statements / 51% branches.
+- Owner amendments/revisions: `/amend`, `/revisions`, revision history, atomic activation,
+  approval binding and artifact invalidation.
+- Tests increased from 160 to 201; coverage remains ~68% statements / 51% branches.
 
 ## Not completed — do not claim Phase 2.9.3 accepted
 
@@ -35,7 +37,6 @@ Current state after this work: see final commit/report.
   deduplication pipeline and diagnostics are not implemented. Only memory retrieval and reviewer
   worktree freshness are partial.
 - Orchestrator decomposition: not started; orchestrator remains monolithic.
-- Owner amendments/revisions and approval invalidation are not implemented.
 - Request ID is persisted on tasks/requests; stage/usage foreign-key linkage is still partial.
 - Full fault-injection matrix, multi-process SQLite, disk-full, and live provider/Telegram tests are
   not complete.
@@ -65,7 +66,30 @@ source id, transactional task/binding rollback, existing task discovery, classif
 lifecycle, cancellation, long-request rejection, redaction, immutable fields, owner authorization,
 v9→v10 migration preserving tasks/memory.
 
-Current full suite: **191 passed, 4 skipped**; coverage **68% statements / 51% branches**.
+Current full suite: **201 passed, 4 skipped**; coverage **68% statements / 51% branches**.
+
+## Owner amendments / request revisions
+
+- `request_revisions` stores revision number, previous revision, effective requirements,
+  owner amendment, author, origin, fingerprint and timestamp.
+- Initial revision is created atomically for new tasks; legacy tasks get a lazy initial revision
+  with `author_id=NULL` and origin `initial` (no invented provenance).
+- `/amend <task_id> <full new requirements>` shows task/current revision/new text/invalidations and
+  requests owner approval. `/amend` is a full replacement, not a model-generated patch.
+- `/revisions <task_id>` reads SQLite only; no LLM call.
+- Atomic activation updates task active revision, clears TaskSpec/review/evidence pointers, revokes
+  pending task approvals, writes an audit event and preserves worktree/commits/logs as historical.
+- Approval is bound to task, expected revision and content fingerprint; stale/concurrent approvals
+  fail.
+- Planner uses active revision and records `TaskSpec.request_revision`; resume invalidates stale
+  specs. Amendment never starts a worker automatically.
+- Allowed amendment states: paused, interrupted, blocked, retry_wait, waiting_input,
+  waiting_approval, failed. Running/reviewing/completed tasks are rejected.
+
+Regression tests: original preserved, revision provenance, planner effective text, running/
+completed rejection, unauthorized owner, old approval rejection, concurrent amendments,
+spec/review/evidence invalidation, old approval revocation, SQLite rollback, restart persistence,
+legacy initial revision, `/revisions` without LLM, no automatic worker.
 
 ## Provider recovery test matrix
 

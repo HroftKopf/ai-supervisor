@@ -50,6 +50,7 @@ class Action(StrEnum):
     CONFIG_IMPORT = "config_import"
     STAGE_APPROVAL = "stage_approval"
     PROVIDER_RECOVERY = "provider_recovery"
+    REQUEST_AMENDMENT = "request_amendment"
     BYPASS_PERMISSIONS = "bypass_permissions"
     EXPAND_OWN_PERMISSIONS = "expand_own_permissions"
     READ_OTHER_SECRETS = "read_other_secrets"
@@ -81,6 +82,7 @@ RISK_LEVELS: dict[Action, RiskLevel] = {
     Action.CONFIG_IMPORT: RiskLevel.HIGH,
     Action.STAGE_APPROVAL: RiskLevel.HIGH,
     Action.PROVIDER_RECOVERY: RiskLevel.HIGH,
+    Action.REQUEST_AMENDMENT: RiskLevel.HIGH,
     Action.DELETE_IMPORTANT_DATA: RiskLevel.HIGH,
     Action.SEND_SECRET_EXTERNALLY: RiskLevel.HIGH,
     Action.DESTRUCTIVE_COMMAND: RiskLevel.HIGH,
@@ -120,6 +122,7 @@ LEVELS: dict[Action, PermissionLevel] = {
     Action.CONFIG_IMPORT: PermissionLevel.APPROVAL_REQUIRED,
     Action.STAGE_APPROVAL: PermissionLevel.APPROVAL_REQUIRED,
     Action.PROVIDER_RECOVERY: PermissionLevel.APPROVAL_REQUIRED,
+    Action.REQUEST_AMENDMENT: PermissionLevel.APPROVAL_REQUIRED,
     Action.BYPASS_PERMISSIONS: PermissionLevel.DENIED,
     Action.EXPAND_OWN_PERMISSIONS: PermissionLevel.DENIED,
     Action.READ_OTHER_SECRETS: PermissionLevel.DENIED,

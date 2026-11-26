@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -57,6 +57,12 @@ from ai_supervisor.memory.conversations import ConversationService
 from ai_supervisor.memory.experience import ExperienceExtractor
 from ai_supervisor.memory.projects import ProjectError, ProjectService, validate_remote_url
 from ai_supervisor.memory.requests import RequestService
+from ai_supervisor.memory.revisions import (
+    RevisionConflict,
+    RevisionError,
+    RevisionService,
+    fingerprint,
+)
 from ai_supervisor.memory.stages import StageError, TaskStageService
 from ai_supervisor.memory.tasks import TaskError, TaskService
 from ai_supervisor.models import (
@@ -197,6 +203,7 @@ class Orchestrator:
         self.stages = TaskStageService(tasks.db)
         self.experience = ExperienceExtractor(conversations)
         self.requests = RequestService(tasks.db)
+        self.revisions = RevisionService(tasks.db)
         self.progress = ProgressManager(
             settings=settings,
             tasks=tasks,
@@ -925,9 +932,12 @@ class Orchestrator:
         conversation = await self.conversations.get(task.conversation_id)
         _summary, context_messages = await self.conversations.build_context(task.conversation_id)
         user_messages = [message for message in context_messages if message.role == "user"]
+        active_revision = await self.revisions.active(task)
+        effective_requirements = str(active_revision.get("effective_requirements") or "")
         original_intent = task.source_request.strip()
         latest_user = (
             request_override
+            or effective_requirements.strip()
             or original_intent
             or (user_messages[-1].content if user_messages else task.title)
         )
@@ -960,11 +970,13 @@ class Orchestrator:
         updates: dict[str, object] = {
             "routing_level": final_level,
             "schema_version": 2,
+            "request_revision": task.request_revision,
         }
         if not spec.scope.strip():
             updates["scope"] = spec.goal[:8000]
-        if not spec.source_request.strip() or original_intent:
-            updates["source_request"] = latest_user[:8000]
+        # TaskSpec is a generated plan; the owner's original request is kept
+        # separately and the active effective revision drives planning.
+        updates["source_request"] = task.source_request[:8000]
         if spec.max_attempts == 0:
             updates["max_attempts"] = self.settings.limits.max_iterations
         if spec.max_minutes == 0:
@@ -1096,6 +1108,8 @@ class Orchestrator:
         if not worktree.is_dir():
             return False
         spec = self._spec_for(task)
+        if spec.request_revision != task.request_revision:
+            return False
         saved_manifest = parse_manifest(task.evidence_manifest_json)
         if saved_manifest is None:
             return False
@@ -2654,6 +2668,15 @@ class Orchestrator:
             return
         if task.status is TaskStatus.FAILED and task.rework_count >= task.max_rework:
             await self.tasks.update_fields(task.id, max_rework=task.rework_count + 1)
+        if task.spec is not None and task.spec.request_revision != task.request_revision:
+            await self.tasks.update_fields(
+                task.id,
+                spec_json="{}",
+                review_json=None,
+                evidence_json=None,
+                evidence_manifest_json=None,
+            )
+            task = await self.tasks.get(task.id)
         await self._try_transition(task.id, TaskStatus.QUEUED)
         await self.tasks.update_fields(task.id, cancel_requested=False)
         await self.tasks.reset_started_at(task.id)
@@ -2942,6 +2965,147 @@ class Orchestrator:
             ],
         )
 
+    AMENDABLE_STATUSES: ClassVar[frozenset[TaskStatus]] = frozenset(
+        {
+            TaskStatus.PAUSED,
+            TaskStatus.INTERRUPTED,
+            TaskStatus.BLOCKED,
+            TaskStatus.RETRY_WAIT,
+            TaskStatus.WAITING_INPUT,
+            TaskStatus.WAITING_APPROVAL,
+            TaskStatus.FAILED,
+        }
+    )
+
+    async def request_amendment(
+        self, task_id: int, requirements: str, user_id: int, chat_id: int
+    ) -> None:
+        self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
+        task = await self.tasks.get(task_id)
+        if task.status not in self.AMENDABLE_STATUSES:
+            if task.status in {
+                TaskStatus.RUNNING,
+                TaskStatus.VALIDATING,
+                TaskStatus.REVIEWING,
+                TaskStatus.REWORK,
+            }:
+                await self.notifier.send_text(
+                    chat_id,
+                    f"Задача #{task.id:03d} сейчас выполняется. Сначала штатно приостановите "
+                    "её, затем повторите /amend.",
+                )
+            elif task.status in {TaskStatus.COMPLETED, TaskStatus.PARTIALLY_COMPLETED}:
+                await self.notifier.send_text(
+                    chat_id,
+                    f"Задача #{task.id:03d} уже завершена/интегрирована. Создайте отдельную задачу.",
+                )
+            else:
+                await self.notifier.send_text(
+                    chat_id, f"Задача #{task.id:03d} в состоянии {task.status.value}."
+                )
+            return
+        clean = self.redactor.redact(requirements.strip())
+        if not clean:
+            await self.notifier.send_text(chat_id, "Новые требования пусты.")
+            return
+        if len(clean) > 8000:
+            await self.notifier.send_text(chat_id, "Требования превышают 8000 символов.")
+            return
+        revision = await self.revisions.active(task)
+        current = int(revision.get("revision_number") or task.request_revision)
+        digest = fingerprint(clean)
+        approval_id = await self.approvals.request(
+            action=Action.REQUEST_AMENDMENT,
+            payload={
+                "kind": "request_amendment",
+                "task_id": task.id,
+                "expected_revision": current,
+                "requirements": clean,
+                "fingerprint": digest,
+                "author_id": user_id,
+            },
+            created_by=user_id,
+            task_id=task.id,
+            ttl_seconds=600,
+        )
+        await self.notifier.send_text(
+            chat_id,
+            f"Изменение требований задачи #{task.id:03d}\n\n"
+            "Семантика: /amend задаёт ПОЛНУЮ новую редакцию требований, а не патч.\n"
+            f"Текущая revision: {current} → {current + 1}\n\n"
+            f"Новые требования:\n{clean}\n\n"
+            "Будут инвалидированы: текущий TaskSpec, review/evidence, незавершённые approvals. "
+            "Worktree, commits, логи и старые артефакты сохраняются как исторические. "
+            "Новые платные операции автоматически не запускаются.",
+            [
+                [
+                    Button("Применить amendment", f"apv:{approval_id}"),
+                    Button("Отмена", f"rej:{approval_id}"),
+                ]
+            ],
+        )
+
+    async def _apply_amendment(self, payload: dict[str, Any], user_id: int, chat_id: int) -> None:
+        task = await self.tasks.get(int(payload["task_id"]))
+        if task.status not in self.AMENDABLE_STATUSES:
+            await self.notifier.send_text(
+                chat_id,
+                f"Задача #{task.id:03d} изменила состояние на {task.status.value}; "
+                "amendment не применён.",
+            )
+            return
+        requirements = str(payload.get("requirements") or "")
+        digest = str(payload.get("fingerprint") or "")
+        expected = int(payload.get("expected_revision") or 0)
+        if fingerprint(requirements) != digest:
+            await self.notifier.send_text(chat_id, "Fingerprint требований не совпадает.")
+            return
+        try:
+            revision = await self.revisions.apply_amendment(
+                task=task,
+                requirements=requirements,
+                author_id=user_id,
+                expected_revision=expected,
+                expected_fingerprint=digest,
+            )
+        except RevisionConflict as exc:
+            await self.notifier.send_text(chat_id, f"Amendment отклонён: {exc}")
+            return
+        except RevisionError as exc:
+            await self.notifier.send_text(chat_id, f"Amendment не применён: {exc}")
+            return
+        await self.notifier.send_text(
+            chat_id,
+            f"Задача #{task.id:03d}: активирована revision {revision['revision_number']}. "
+            "TaskSpec/review/evidence инвалидированы; approvals отозваны. "
+            "Продолжение — только вручную через /resume.",
+        )
+
+    async def revisions_text(self, task_id: int, user_id: int, chat_id: int) -> str:
+        self._assert_owner(user_id)
+        self._assert_owner_chat(chat_id)
+        task = await self.tasks.get(task_id)
+        rows = await self.revisions.history(task)
+        lines = [f"Revisions задачи #{task.id:03d}", ""]
+        for row in rows:
+            active = " ← active" if int(row["revision_number"]) == task.request_revision else ""
+            author = row.get("author_id") if row.get("author_id") is not None else "legacy/unknown"
+            lines.append(
+                f"r{int(row['revision_number'])}{active} origin={row.get('origin')} "
+                f"author={author} fingerprint={str(row.get('content_fingerprint'))[:12]}"
+            )
+            lines.append(f"  {str(row.get('effective_requirements') or '—')[:2000]}")
+        return "\n".join(lines)
+
+    async def show_revisions(self, task_id: int, user_id: int, chat_id: int) -> None:
+        try:
+            text = await self.revisions_text(task_id, user_id, chat_id)
+        except Exception as exc:
+            await self.notifier.send_text(chat_id, f"Не удалось показать revisions: {exc}")
+            return
+        await self.notifier.send_text(chat_id, text)
+
     async def request_provider_recovery(self, target: str, user_id: int, chat_id: int) -> None:
         self._assert_owner(user_id)
         self._assert_owner_chat(chat_id)
@@ -3081,6 +3245,9 @@ class Orchestrator:
             await self.notifier.send_text(chat_id, f"Подтверждение отклонено: {exc}")
             return
         action = Action(approval["action"])
+        if action is Action.REQUEST_AMENDMENT:
+            await self._apply_amendment(payload, user_id, chat_id)
+            return
         if action is Action.PROVIDER_RECOVERY:
             await self._execute_provider_recovery(payload, user_id, chat_id)
             return

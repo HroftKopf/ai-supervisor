@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def iso_now() -> str:
@@ -271,6 +271,24 @@ CREATE TABLE IF NOT EXISTS usage_events (
 
 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_events(created_at);
 
+CREATE TABLE IF NOT EXISTS request_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    request_id TEXT,
+    revision_number INTEGER NOT NULL,
+    previous_revision_id INTEGER REFERENCES request_revisions(id),
+    effective_requirements TEXT NOT NULL,
+    owner_amendment TEXT NOT NULL DEFAULT '',
+    author_id INTEGER,
+    origin TEXT NOT NULL DEFAULT 'initial',
+    content_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, revision_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_request_revisions_task
+    ON request_revisions(task_id, revision_number);
+
 CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id TEXT NOT NULL UNIQUE,
@@ -443,6 +461,24 @@ class Database:
                 status TEXT NOT NULL DEFAULT 'captured',
                 task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
                 created_at TEXT NOT NULL
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS request_revisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                request_id TEXT,
+                revision_number INTEGER NOT NULL,
+                previous_revision_id INTEGER REFERENCES request_revisions(id),
+                effective_requirements TEXT NOT NULL,
+                owner_amendment TEXT NOT NULL DEFAULT '',
+                author_id INTEGER,
+                origin TEXT NOT NULL DEFAULT 'initial',
+                content_fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(task_id, revision_number)
             )
             """
         )

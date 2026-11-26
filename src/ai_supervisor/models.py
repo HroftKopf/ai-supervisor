@@ -363,6 +363,7 @@ class TaskSpec(BaseModel):
     goal: str = Field(min_length=10, max_length=8000)
     task_type: TaskType = TaskType.MODIFY
     source_request: str = Field(default="", max_length=8000)
+    request_revision: int = Field(default=1, ge=1)
     scope: str = Field(default="", max_length=2000)
     parent_task_id: int | None = Field(default=None, ge=1)
     acceptance_criteria: list[str] = Field(min_length=1, max_length=20)

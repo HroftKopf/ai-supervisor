@@ -107,6 +107,7 @@ class RequestService:
         source_request: str,
     ) -> tuple[Any, bool]:
         """Atomically create the task, accepted event and request binding."""
+        from ai_supervisor.memory.revisions import RevisionService
         from ai_supervisor.memory.tasks import TaskService
 
         tasks = TaskService(self.db)
@@ -134,6 +135,12 @@ class RequestService:
                 intent_source="telegram",
             )
             if created:
+                await RevisionService.create_initial_conn(
+                    conn,
+                    task_id=task.id,
+                    request_id=request_id,
+                    source_request=source_request,
+                )
                 await conn.execute(
                     """
                     INSERT INTO task_events(task_id, event_type, message, payload_json,
