@@ -15,6 +15,7 @@ from ai_supervisor.models import (
     TaskSpec,
     TaskStatus,
 )
+from ai_supervisor.presentation.formatting import bullets, metadata, normalize_card, section
 
 MAX_CARD_CHARS = 3800
 
@@ -72,7 +73,7 @@ def _safe_url(value: str | None) -> str | None:
 
 
 def _finalize(lines: Iterable[str]) -> str:
-    text = "\n".join(line for line in lines if line is not None).strip()
+    text = normalize_card("\n".join(line for line in lines if line is not None))
     if len(text) <= MAX_CARD_CHARS:
         return text
     cut = text[: MAX_CARD_CHARS - 20]
@@ -177,23 +178,27 @@ def completion_card(
         summary = task.report.split("\n\n", 1)[0]
     lines.append(esc(summary[:900] or "Задача завершена."))
     lines.append("")
+    facts: list[tuple[str, str]] = []
     if evidence and evidence.changed_files:
-        lines.append(f"Файлов: {len(evidence.changed_files)}")
+        facts.append(("Файлов", str(len(evidence.changed_files))))
     if stages:
         done = sum(stage.status in {StageStatus.COMPLETED, StageStatus.SKIPPED} for stage in stages)
-        lines.append(f"Этапов: {done}/{len(stages)}")
+        facts.append(("Этапов", f"{done}/{len(stages)}"))
     if model_requests is not None:
-        lines.append(f"Запросов к моделям: {model_requests}")
+        facts.append(("Запросов к моделям", str(model_requests)))
     if evidence:
         if evidence.checks:
             passed = sum(check.passed for check in evidence.checks)
-            lines.append(f"Проверки: {passed}/{len(evidence.checks)} OK")
+            facts.append(("Проверки", f"{passed}/{len(evidence.checks)} OK"))
         else:
-            lines.append("Проверки: не запускались")
+            facts.append(("Проверки", "не запускались"))
         if task.head_commit:
-            lines.append(f"Коммит: {_code(task.head_commit[:12])}")
+            facts.append(("Коммит", task.head_commit[:12]))
     if repo_url:
-        lines.append(f"Репозиторий: {esc(repo_url)}")
+        facts.append(("Репозиторий", repo_url))
+    if facts:
+        lines.append(metadata(facts))
+        lines.append("")
     if mode != "compact" and task.error:
         lines += ["", _code(task.error[:1000])]
     return _finalize(lines)
@@ -228,10 +233,10 @@ def approval_card(
     volume: str | None = None,
     details: str | None = None,
 ) -> str:
-    lines = [_b(title), "", f"Что: {esc(why)}", f"Ресурс: {esc(target)}"]
+    facts = [("Что", why), ("Ресурс", target)]
     if volume:
-        lines.append(f"Объём: {esc(volume)}")
-    lines.append(f"Последствия: {esc(consequences)}")
+        facts.append(("Объём", volume))
+    lines = [_b(title), "", metadata(facts), "", f"Последствия: {esc(consequences)}"]
     if details:
         lines += ["", esc(details[:1000])]
     return _finalize(lines)
@@ -257,10 +262,14 @@ def details_view(
             f"Цель: {esc(spec.goal)[:1000]}",
         ]
         if spec.acceptance_criteria:
-            lines.append("Критерии:")
-            lines.extend(f"• {esc(item)[:300]}" for item in spec.acceptance_criteria[:10])
+            lines += [
+                "",
+                section(
+                    "Критерии", bullets([item[:300] for item in spec.acceptance_criteria[:10]])
+                ),
+            ]
     if stages:
-        lines += ["", "Этапы:"]
+        lines += ["", section("Этапы", "")]
         for stage in stages:
             result = stage.result or {}
             details: list[str] = []
@@ -273,19 +282,30 @@ def details_view(
             if stage.error:
                 details.append(f"ошибка: {esc(stage.error[:200])}")
             lines.append(
-                f"• {esc(stage.stage_key)} [{esc(stage.status.value)}] — {'; '.join(details) or esc(stage.goal)[:160]}"
+                f"• {esc(stage.stage_key)} [{esc(stage.status.value)}] — "
+                f"{'; '.join(details) or esc(stage.goal)[:160]}"
             )
     if evidence:
-        lines += ["", f"Файлов: {len(evidence.changed_files)}"]
-        lines.extend(f"• {esc(name)}" for name in evidence.changed_files[:20])
+        lines += [
+            "",
+            section("Файлы", metadata([("Количество", str(len(evidence.changed_files)))])),
+        ]
+        lines += [bullets(evidence.changed_files[:20])]
         if evidence.checks:
-            lines.append("Проверки:")
-            lines.extend(
-                f"• {esc(check.name)}: {'OK' if check.passed else 'FAIL'}"
-                for check in evidence.checks
-            )
+            lines += [
+                "",
+                section(
+                    "Проверки",
+                    bullets(
+                        [
+                            f"{check.name}: {'OK' if check.passed else 'FAIL'}"
+                            for check in evidence.checks
+                        ]
+                    ),
+                ),
+            ]
         else:
-            lines.append("Проверки не запускались.")
+            lines += ["", section("Проверки", "Проверки не запускались.")]
     if task.error:
         lines += ["", f"Ошибка: {_code(task.error[:1000])}"]
     if mode == "debug":
@@ -294,14 +314,14 @@ def details_view(
 
 
 def project_card(project: ProjectRecord, *, current: bool = False) -> str:
-    lines = [_b(project.name), f"Путь: {_code(project.path)}"]
+    lines = [_b(project.name), "", f"Путь: {_code(project.path)}"]
     if project.description:
-        lines.append(esc(project.description[:500]))
-    lines.append(f"Ветка: {esc(project.base_branch)}")
+        lines += ["", esc(project.description[:500])]
+    lines += ["", metadata([("Ветка", project.base_branch)])]
     if project.remote_url:
         lines.append(f"Remote: {esc(project.remote_url)}")
     if current:
-        lines.append("Текущий проект.")
+        lines += ["", "Текущий проект."]
     return _finalize(lines)
 
 
@@ -311,9 +331,9 @@ def usage_card(
     totals: str,
     models: list[str] | None = None,
 ) -> str:
-    lines = [_b("Расход API"), f"Период: {esc(period)}", "", esc(totals)]
+    lines = [_b("Расход API"), "", f"Период: {esc(period)}", "", esc(totals)]
     if models:
-        lines += ["", *[esc(item) for item in models[:10]]]
+        lines += ["", section("Модели", bullets(models[:10]))]
     return _finalize(lines)
 
 
@@ -322,7 +342,7 @@ def status_card(*, lines: list[str]) -> str:
 
 
 def settings_card(*, mode: str, lines: list[str]) -> str:
-    return _finalize([_b("Настройки"), f"Режим интерфейса: {esc(mode)}", "", *lines])
+    return _finalize([_b("Настройки"), "", f"Режим интерфейса: {esc(mode)}", "", *lines])
 
 
 def main_menu(*, project_name: str | None, active: int, mode: str) -> str:

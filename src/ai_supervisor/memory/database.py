@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def iso_now() -> str:
@@ -400,6 +400,7 @@ class Database:
                 "last_confirmed_at": "TEXT",
             },
             "usage_events": {
+                "raw_usage_json": "TEXT",
                 "prompt_version": "TEXT",
                 "role": "TEXT",
                 "routing_level": "INTEGER",

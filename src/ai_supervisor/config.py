@@ -68,6 +68,32 @@ class KimiSection(BaseModel):
     verify_model_on_startup: bool = True
 
 
+class LLMSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    default_provider: Literal["kimi", "openai", "openai_compatible"] = "kimi"
+    roles: dict[str, str] = Field(default_factory=dict)
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "gpt-4.1"
+    openai_reasoning: bool = False
+    openai_prompt_cache: bool = True
+    compatible_base_url: str = ""
+    compatible_model: str = ""
+    compatible_reasoning: bool = False
+    compatible_prompt_cache: bool = False
+
+    @field_validator("roles")
+    @classmethod
+    def _roles(cls, value: dict[str, str]) -> dict[str, str]:
+        allowed_roles = {"chat", "classifier", "planner", "reviewer", "summarizer", "experience"}
+        allowed_providers = {"kimi", "openai", "openai_compatible"}
+        for role, provider in value.items():
+            if role not in allowed_roles:
+                raise ValueError(f"unknown LLM role: {role}")
+            if provider not in allowed_providers:
+                raise ValueError(f"unknown LLM provider: {provider}")
+        return value
+
+
 class TelegramSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     private_chat_only: bool = True
@@ -276,6 +302,8 @@ class UsageSection(BaseModel):
 class Secrets(BaseModel):
     model_config = ConfigDict(extra="ignore")
     kimi_api_key: SecretStr = SecretStr("")
+    openai_api_key: SecretStr = SecretStr("")
+    openai_compatible_api_key: SecretStr = SecretStr("")
     deepseek_api_key: SecretStr = SecretStr("")
     telegram_bot_token: SecretStr = SecretStr("")
     github_token: SecretStr = SecretStr("")
@@ -283,8 +311,6 @@ class Secrets(BaseModel):
 
     def missing(self) -> list[str]:
         names: list[str] = []
-        if not self.kimi_api_key.get_secret_value().strip():
-            names.append("KIMI_API_KEY")
         if not self.deepseek_api_key.get_secret_value().strip():
             names.append("DEEPSEEK_API_KEY")
         if not self.telegram_bot_token.get_secret_value().strip():
@@ -302,6 +328,7 @@ class Settings(BaseModel):
     env_path: Path
     app: AppSection
     kimi: KimiSection
+    llm: LLMSection
     telegram: TelegramSection
     security: SecuritySection
     github: GitHubSection
@@ -318,6 +345,18 @@ class Settings(BaseModel):
     @model_validator(mode="after")
     def _validate_combined(self) -> Settings:
         validate_provider_url(self.kimi.base_url, label="KIMI_BASE_URL")
+        providers = {self.llm.default_provider, *self.llm.roles.values()}
+        if "openai" in providers:
+            validate_provider_url(self.llm.openai_base_url, label="OPENAI_BASE_URL")
+            if not self.llm.openai_model.strip():
+                raise ConfigError("llm.openai_model must not be empty")
+        if "openai_compatible" in providers:
+            if not self.llm.compatible_base_url or not self.llm.compatible_model:
+                raise ConfigError(
+                    "llm.compatible_base_url and llm.compatible_model are required for "
+                    "openai_compatible roles"
+                )
+            validate_provider_url(self.llm.compatible_base_url, label="OPENAI_COMPATIBLE_BASE_URL")
         if self.deepseek_base_url:
             validate_provider_url(self.deepseek_base_url, label="DEEPSEEK_BASE_URL")
         self._validate_platform_model_pair()
@@ -402,6 +441,14 @@ class Settings(BaseModel):
         return self.secrets.kimi_api_key.get_secret_value().strip()
 
     @property
+    def openai_key(self) -> str:
+        return self.secrets.openai_api_key.get_secret_value().strip()
+
+    @property
+    def openai_compatible_key(self) -> str:
+        return self.secrets.openai_compatible_api_key.get_secret_value().strip()
+
+    @property
     def github_token(self) -> str:
         return self.secrets.github_token.get_secret_value().strip()
 
@@ -461,6 +508,11 @@ class Settings(BaseModel):
                 "model": self.kimi.model,
                 "reasoning_effort": self.kimi.reasoning_effort,
             },
+            "llm": {
+                "default_provider": self.llm.default_provider,
+                "roles": self.llm.roles,
+                "openai_model": self.llm.openai_model,
+            },
             "deepseek": {
                 "model": self.deepseek_model,
                 "profile": self.deepseek.profile,
@@ -487,6 +539,13 @@ class Settings(BaseModel):
 
     def require_credentials(self) -> None:
         missing = self.secrets.missing()
+        providers = {self.llm.default_provider, *self.llm.roles.values()}
+        if "kimi" in providers and not self.kimi_key:
+            missing.append("KIMI_API_KEY")
+        if "openai" in providers and not self.openai_key:
+            missing.append("OPENAI_API_KEY")
+        if "openai_compatible" in providers and not self.openai_compatible_key:
+            missing.append("OPENAI_COMPATIBLE_API_KEY")
         if missing:
             raise ConfigError(
                 "missing required credentials: "
@@ -575,6 +634,10 @@ def load_settings(
 
     secrets = Secrets(
         kimi_api_key=SecretStr(os.environ.get("KIMI_API_KEY", "").strip()),
+        openai_api_key=SecretStr(os.environ.get("OPENAI_API_KEY", "").strip()),
+        openai_compatible_api_key=SecretStr(
+            os.environ.get("OPENAI_COMPATIBLE_API_KEY", "").strip()
+        ),
         deepseek_api_key=SecretStr(os.environ.get("DEEPSEEK_API_KEY", "").strip()),
         telegram_bot_token=SecretStr(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()),
         telegram_owner_id=owner_id,
@@ -586,6 +649,7 @@ def load_settings(
     allowed_top_level = {
         "app",
         "kimi",
+        "llm",
         "telegram",
         "security",
         "limits",
@@ -611,6 +675,7 @@ def load_settings(
             env_path=env_file.resolve(),
             app=AppSection.model_validate(raw.get("app", {})),
             kimi=KimiSection.model_validate(kimi),
+            llm=LLMSection.model_validate(raw.get("llm", {})),
             telegram=TelegramSection.model_validate(raw.get("telegram", {})),
             security=SecuritySection.model_validate(raw.get("security", {})),
             github=GitHubSection.model_validate(raw.get("github", {})),

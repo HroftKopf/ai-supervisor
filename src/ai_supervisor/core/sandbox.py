@@ -240,7 +240,14 @@ class BwrapSandbox:
             env = {
                 key: value
                 for key, value in env.items()
-                if key not in {"DEEPSEEK_API_KEY", "KIMI_API_KEY", "TELEGRAM_BOT_TOKEN"}
+                if key
+                not in {
+                    "DEEPSEEK_API_KEY",
+                    "KIMI_API_KEY",
+                    "OPENAI_API_KEY",
+                    "OPENAI_COMPATIBLE_API_KEY",
+                    "TELEGRAM_BOT_TOKEN",
+                }
             }
         args: list[str] = [
             self._bwrap,

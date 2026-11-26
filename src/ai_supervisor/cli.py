@@ -36,7 +36,7 @@ async def run_bot(settings: Settings, *, skip_checks: bool = False) -> None:
     from ai_supervisor.memory.database import Database
     from ai_supervisor.memory.projects import ProjectService
     from ai_supervisor.memory.tasks import TaskService
-    from ai_supervisor.providers.kimi import KimiClient, KimiClientConfig
+    from ai_supervisor.providers.registry import ProviderRegistry
     from ai_supervisor.telegram.bot import TelegramBot, build_bot
     from ai_supervisor.telegram.notifications import BotNotifier
 
@@ -51,33 +51,23 @@ async def run_bot(settings: Settings, *, skip_checks: bool = False) -> None:
 
     db = Database(settings.db_path)
     await db.connect()
-    kimi = KimiClient(
-        KimiClientConfig(
-            api_key=settings.kimi_key,
-            base_url=settings.kimi.base_url,
-            model=settings.kimi.model,
-            reasoning_effort=settings.kimi.reasoning_effort,
-            max_completion_tokens=settings.kimi.max_completion_tokens,
-            request_timeout_seconds=settings.kimi.request_timeout_seconds,
-            max_retries=settings.kimi.max_retries,
-            max_concurrent_requests=settings.kimi.max_concurrent_requests,
-        ),
-        redactor,
-    )
+    providers = ProviderRegistry(settings, redactor)
     bot: Bot | None = None
     orchestrator: Orchestrator | None = None
     telegram: TelegramBot | None = None
     try:
         if not skip_checks and settings.kimi.verify_model_on_startup:
-            models = await kimi.validate_model()
-            logger.info("Kimi model verified (%s models available)", len(models))
+            health = await providers.health("chat")
+            logger.info("LLM provider check: %s", health)
         projects = ProjectService(db, settings)
         conversations = ConversationService(db, settings)
         tasks = TaskService(db)
         usage = UsageService(db, settings)
         approvals = ApprovalService(db)
         workspace = WorkspaceManager(settings, sandbox, redactor)
-        supervisor = SupervisorAgent(kimi, settings, redactor)
+        supervisor = SupervisorAgent(
+            providers.provider_for("chat"), settings, redactor, providers=providers
+        )
         context_builder = ProjectContextBuilder(settings, redactor)
         worker_manager = WorkerManager(
             settings=settings,
@@ -116,7 +106,7 @@ async def run_bot(settings: Settings, *, skip_checks: bool = False) -> None:
     finally:
         if orchestrator is not None:
             await orchestrator.shutdown()
-        await kimi.close()
+        await providers.close()
         if telegram is not None:
             await telegram.close()
         elif bot is not None:
@@ -273,32 +263,27 @@ class Doctor:
         else:
             self.warn("GitHub API", "GITHUB_TOKEN optional and not configured; /github is disabled")
 
-        if s.kimi_key:
-            from ai_supervisor.core.redaction import SecretRedactor
-            from ai_supervisor.providers.kimi import KimiClient, KimiClientConfig
+        from ai_supervisor.core.redaction import SecretRedactor
+        from ai_supervisor.providers.registry import ProviderRegistry
 
-            kimi = KimiClient(
-                KimiClientConfig(
-                    api_key=s.kimi_key,
-                    base_url=s.kimi.base_url,
-                    model=s.kimi.model,
-                    reasoning_effort=s.kimi.reasoning_effort,
-                    max_completion_tokens=s.kimi.max_completion_tokens,
-                    request_timeout_seconds=s.kimi.request_timeout_seconds,
-                    max_retries=0,
-                    max_concurrent_requests=1,
-                ),
-                SecretRedactor.from_settings(s),
-            )
-            try:
-                models = await kimi.validate_model()
-                self.ok("Kimi model", f"{s.kimi.model} (available; {len(models)} models)")
-            except Exception as exc:
-                self.fail("Kimi model", f"{type(exc).__name__}: {exc}")
-            finally:
-                await kimi.close()
-        else:
-            self.fail("Kimi", "KIMI_API_KEY is missing")
+        providers = ProviderRegistry(s, SecretRedactor.from_settings(s))
+        try:
+            health = await providers.health()
+            for role, data in providers.snapshot()["roles"].items():
+                provider = data["provider"]
+                if not data["available"]:
+                    self.fail(f"LLM {role}", f"provider {provider} is not configured")
+                    continue
+                status = health.get(provider, {})
+                if status.get("available"):
+                    self.ok(f"LLM {role}", f"{provider}/{data['model']} available")
+                else:
+                    self.fail(
+                        f"LLM {role}",
+                        f"{provider}/{data['model']}: {str(status.get('detail') or 'unavailable')[:300]}",
+                    )
+        finally:
+            await providers.close()
 
         self._print()
         return 1 if self.errors else 0

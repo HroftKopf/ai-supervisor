@@ -51,10 +51,17 @@ TELEGRAM_BOT_TOKEN=...
 TELEGRAM_OWNER_ID=123456789
 # Optional: GitHub repo info/create and HTTPS Git push
 GITHUB_TOKEN=
+# Optional provider-agnostic control models:
+# OPENAI_API_KEY=
+# OPENAI_COMPATIBLE_API_KEY=
 ```
 
 `DEEPSEEK_BASE_URL` оставьте пустым для официального endpoint SDK. Если задаёте свой,
 он должен быть совместим с **Messages API** (`/v1/messages`), который использует DSH 0.2.2rc2.
+
+Провайдеры управляющих моделей выбираются в `[llm.roles]`; по умолчанию все роли — Kimi.
+Для OpenAI задайте `OPENAI_API_KEY` и при необходимости `[llm] openai_model`.
+Ключи не передаются worker-процессам.
 
 `config.toml`:
 
@@ -79,7 +86,7 @@ GITHUB_TOKEN=
 ## 4.1. Обновление с Phase 1
 
 При первом запуске новой версии `Database` сделает backup
-`var/backups/pre-migration-v5-*.db` и обновит схему v1/v2/v3/v4→v5. Старые задачи сохраняются.
+`var/backups/pre-migration-v6-*.db` и обновит схему v1/v2/v3/v4/v5→v6. Старые задачи сохраняются.
 Перед обновлением можно дополнительно выполнить `scripts/backup.sh`.
 
 ## 4.2. Egress worker

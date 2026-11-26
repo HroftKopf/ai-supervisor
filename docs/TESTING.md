@@ -20,7 +20,7 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 | Проверка | Результат |
 |---|---|
 | `ruff check .` | все проверки пройдены |
-| `pytest -q` | **103 passed, 4 skipped** |
+| `pytest -q` | **112 passed, 4 skipped** |
 | `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py` | **2 passed** |
 | `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py` | **2 passed** |
 | bwrap probe | OK (user namespaces, read-only `/usr`) |
@@ -47,7 +47,7 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 - Egress proxy: allowlisted CONNECT, отказ неизвестному host.
 - COMPOSITE: граф/циклы, маршрутизация executor, approvals, reject, повтор, no-op import,
   auto-discovery Niri, mock GitHub + bare remote, сохранение completed этапов.
-- SQLite v5: `task_stages`, UI/usage/prompt metadata, structured memory columns; миграция с backup.
+- SQLite v6: `task_stages`, UI/usage/prompt metadata, structured memory columns; миграция с backup.
 - Git auth: HTTPS askpass, ls-remote/fetch/push через единый слой, SSH passthrough,
   third-party host без токена, отсутствие токена в env/argv/config, auth-error без ретраев,
   WAITING_INPUT и продолжение publish.
@@ -57,6 +57,10 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 - Prompt profiles/versions/common safety; request diagnostics; capability/strategy selection.
 - Reviewer root cause: planner_error не отправляет executor на rework; external → RETRY_WAIT.
 - Memory categories/upsert/stale/experience extractor; 39 evaluation scenarios.
+- Provider abstraction: Kimi regression, OpenAI Responses mock, tools, streaming, usage,
+  normalized errors, capability negotiation, independent roles, no fallback.
+- Typography: Markdown→Telegram HTML, paragraphs/code, vertical spacing and limits.
+- Worker env excludes KIMI/OpenAI/OPENAI_COMPATIBLE keys.
 
 ### Что не проверено живьём
 

@@ -53,6 +53,7 @@ class UsageService:
         prompt_version: str | None = None,
         routing_level: int | None = None,
         context_chars: int | None = None,
+        raw_usage: dict[str, Any] | None = None,
     ) -> None:
         if usage.requests == 0 and usage.total_tokens == 0:
             return
@@ -62,8 +63,8 @@ class UsageService:
             INSERT INTO usage_events(task_id, project_id, provider, model, input_tokens,
                 output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, requests,
                 duration_ms, error_category, cost, currency, prompt_version, role,
-                routing_level, context_chars, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                routing_level, context_chars, raw_usage_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -84,6 +85,9 @@ class UsageService:
                 role,
                 routing_level,
                 context_chars,
+                __import__("json").dumps(raw_usage, ensure_ascii=False)[:20000]
+                if raw_usage
+                else None,
                 iso_now(),
             ),
         )

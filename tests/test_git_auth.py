@@ -181,6 +181,10 @@ def test_default_git_environment_does_not_inherit_secrets(monkeypatch) -> None:
 
     monkeypatch.setenv("GITHUB_TOKEN", "test-token-abcdefghijklmnop")
     monkeypatch.setenv("KIMI_API_KEY", "sk-test-secret-value")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-test-value")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "sk-compatible-test-value")
     env = git_env()
     assert "GITHUB_TOKEN" not in env
     assert "KIMI_API_KEY" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert "OPENAI_COMPATIBLE_API_KEY" not in env

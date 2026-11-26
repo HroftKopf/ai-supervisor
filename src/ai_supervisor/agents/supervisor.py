@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, TypeVar
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from ai_supervisor.agents.prompts import PromptRegistry
 from ai_supervisor.config import Settings
@@ -19,10 +19,10 @@ from ai_supervisor.models import (
     TaskSpec,
     TokenUsage,
 )
+from ai_supervisor.providers.base import ProviderProtocolError, ProviderResponse
 from ai_supervisor.providers.kimi import (
     KimiClient,
     KimiProtocolError,
-    KimiResponse,
     parse_tool_call,
     structured_tool,
 )
@@ -267,6 +267,7 @@ class StructuredReply(BaseModel):
     value: Any
     usage: TokenUsage
     model: str
+    raw_usage: dict[str, Any] = Field(default_factory=dict)
 
 
 def _read_prompt(name: str) -> str:
@@ -285,12 +286,20 @@ class SupervisorAgent:
         redactor: SecretRedactor,
         *,
         prompt_root: Path | None = None,
+        providers: Any | None = None,
     ) -> None:
         self.kimi = kimi
         self.settings = settings
         self.redactor = redactor
+        self.providers = providers
+        self.last_raw_usage: dict[str, Any] = {}
         self.prompts = PromptRegistry(prompt_root or PROMPTS_DIR)
         self.base_prompt = self.prompts.get("supervisor").text
+
+    def _provider(self, role: str) -> Any:
+        if self.providers is not None:
+            return self.providers.provider_for(role)
+        return self.kimi
 
     def prompt_metadata(self) -> dict[str, str]:
         return self.prompts.metadata()
@@ -319,6 +328,7 @@ class SupervisorAgent:
                 "reviewer": [REVIEW_TOOL["function"]["name"]],
                 "chat": [],
             },
+            "providers": self.providers.snapshot() if self.providers is not None else {},
         }
 
     async def classify(
@@ -353,6 +363,7 @@ class SupervisorAgent:
             reasoning_effort=reasoning_effort,
             prompt_cache_key=f"conv-{conversation_id}-classify",
             purpose="classify",
+            provider_role="classifier",
         )
         return result.value, result.usage
 
@@ -394,6 +405,7 @@ class SupervisorAgent:
             reasoning_effort=reasoning_effort,
             prompt_cache_key=f"conv-{conversation_id}-plan",
             purpose="plan",
+            provider_role="planner",
         )
         return result.value, result.usage
 
@@ -428,6 +440,7 @@ class SupervisorAgent:
             reasoning_effort=reasoning_effort,
             prompt_cache_key=f"task-{evidence.task_id}-review",
             purpose="review",
+            provider_role="reviewer",
         )
         return result.value, result.usage
 
@@ -442,7 +455,7 @@ class SupervisorAgent:
         conversation_id: int,
         reasoning_effort: str | None = None,
         max_completion_tokens: int = 4096,
-    ) -> KimiResponse:
+    ) -> ProviderResponse:
         system_parts = [self.base_prompt]
         if project_block:
             system_parts.append(f"# Текущий проект\n{project_block}")
@@ -467,7 +480,7 @@ class SupervisorAgent:
                         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
                     )
                 last_user["content"] = blocks
-        response = await self.kimi.complete(
+        response = await self._provider("chat").complete(
             api_messages,
             tool_choice="auto",
             max_completion_tokens=max_completion_tokens,
@@ -475,10 +488,11 @@ class SupervisorAgent:
             purpose="chat",
             reasoning_effort=reasoning_effort,
         )
+        self.last_raw_usage = getattr(response, "raw_usage", {})
         return response
 
     async def summarize(self, prompt: str) -> tuple[str, TokenUsage]:
-        response = await self.kimi.complete(
+        response = await self._provider("summarizer").complete(
             [
                 {
                     "role": "system",
@@ -504,12 +518,13 @@ class SupervisorAgent:
         prompt_cache_key: str,
         purpose: str,
         reasoning_effort: str | None = None,
+        provider_role: str = "planner",
     ) -> StructuredReply:
         current_messages = list(messages)
         last_error: str | None = None
         usage_total = TokenUsage()
         for attempt in range(2):
-            response = await self.kimi.complete(
+            response = await self._provider(provider_role).complete(
                 current_messages,
                 tools=[tool],
                 tool_choice="required",
@@ -519,13 +534,19 @@ class SupervisorAgent:
                 reasoning_effort=reasoning_effort,
             )
             usage_total = usage_total.merge(response.usage)
+            self.last_raw_usage = getattr(response, "raw_usage", {})
             if response.finish_reason == "length" and attempt == 0:
                 max_completion_tokens = min(max_completion_tokens * 2, 131072)
             try:
                 raw = parse_tool_call(response, expected_name)
                 value = schema.model_validate(raw)
-                return StructuredReply(value=value, usage=usage_total, model=response.model)
-            except (KimiProtocolError, ValidationError) as exc:
+                return StructuredReply(
+                    value=value,
+                    usage=usage_total,
+                    model=response.model,
+                    raw_usage=getattr(response, "raw_usage", {}),
+                )
+            except (KimiProtocolError, ProviderProtocolError, ValidationError) as exc:
                 last_error = str(exc)
                 logger.warning(
                     "%s structured output rejected (attempt %s): %s", purpose, attempt + 1, exc
@@ -554,13 +575,13 @@ class SupervisorAgent:
                         }
                     )
         raise SupervisorError(
-            f"Kimi не вернул корректный вызов инструмента {expected_name!r} ({purpose}): {last_error}"
+            f"Провайдер не вернул корректный вызов инструмента {expected_name!r} ({purpose}): {last_error}"
         )
 
     @staticmethod
     def _append_tool_error_results(
         messages: list[dict[str, Any]],
-        response: KimiResponse,
+        response: ProviderResponse,
         *,
         expected_name: str,
         error: str,

@@ -4,7 +4,7 @@
 **Kimi K3.1 Pro** — технический руководитель и ревьюер, **DeepSeek Harness** — исполнитель,
 **Python-оркестратор** — управляющая инфраструктура.
 
-> Статус: **Phase 2.7**. Добавлены централизованный Presentation Layer, компактные
+> Статус: **Phase 2.8**. Добавлены централизованный Presentation Layer, компактные
 > редактируемые карточки прогресса, режимы compact/detailed/debug, меню /start, разделение
 > и версионирование промптов, адаптивная маршрутизация Level 0–3 и профили reasoning.
 > Сохранены COMPOSITE, GitAuthManager, approvals, sandbox, egress, auto-resume и миграции.
@@ -26,7 +26,7 @@
   без поддерживаемого этапа fail-closed.
 - COMPOSITE-этапы: `import_config`, `git_commit`, `validate`, `github_ensure_repo`, `publish`,
   `kimi_analyze`, `deepseek_change`; уникальные id, зависимости, исполнитель, полномочия,
-  критерии, входы/выходы и статус хранятся в SQLite (`task_stages`, schema v3).
+  критерии, входы/выходы и статус хранятся в SQLite (`task_stages`, schema v6).
 - Изолированный git worktree на задачу, отдельная ветка, коммит оркестратора, накопительный diff
   от base commit (включая коммиты предыдущих попыток).
 - DeepSeek Harness через официальный Python SDK (`deepseek-harness-sdk==0.2.2rc2`),
@@ -83,6 +83,12 @@
   детерминированных полей, classifier с контекстными ссылками.
 - Reviewer root cause: planner/executor/environment/permission/evidence/external service.
 - Structured experience memory schema v5, deterministic extraction, stale/verified/categories.
+- Provider-agnostic управляющие модели: KimiProvider, OpenAIProvider (Responses API),
+  OpenAICompatibleProvider; независимые роли chat/classifier/planner/reviewer/summarizer/experience.
+- Capability negotiation: tools, structured output, streaming, reasoning, context/output limits,
+  prompt cache; никакого автоматического fallback между платными API.
+- `/models`, `/provider info|test|select`; ключи только в env, worker их не получает.
+- Единая типографика Telegram: карточки, Markdown Kimi → HTML, сохранение кода/абзацев.
 - FTS5-поиск, резюме, stop/rollback/pause/retry, systemd, doctor, redaction.
 
 Phase 1 намеренно **не** реализует SSH, браузер, Docker/Podman, MCP и распределённый VPS.
@@ -342,7 +348,7 @@ memory_mb = 4096
 
 Выполнено:
 
-- `pytest`: **103 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
+- `pytest`: **112 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
   Проверены запуск runtime, проброс `DEEPSEEK_BASE_URL`, запись результата, usage (input 42,
@@ -420,7 +426,7 @@ ai-supervisor run
 - Реальная публикация пользовательских файлов не входит в автоматические тесты; используется
   mock GitHub API и временный bare remote.
 
-Полный список: [docs/PHASE2_7.md](docs/PHASE2_7.md).
+Полный список: [docs/PHASE2_8.md](docs/PHASE2_8.md).
 
 ---
 

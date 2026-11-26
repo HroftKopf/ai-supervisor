@@ -44,6 +44,8 @@ class SecretRedactor:
         return cls(
             (
                 settings.kimi_key,
+                settings.openai_key,
+                settings.openai_compatible_key,
                 settings.deepseek_key,
                 settings.telegram_token,
             )

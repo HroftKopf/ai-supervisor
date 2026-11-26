@@ -49,7 +49,9 @@ HELP_TEXT = """AI Supervisor — команды
 /push [id] — опубликовать завершённый Git-репозиторий (с подтверждением)
 /rework [id] — отправить ожидающую задачу на доработку
 /usage [today|week|month|task <id>] — расход токенов
-/memory [query] — память; /memory add <текст>, /memory delete <id>
+/memory [query] — память; /memory add <текст>, /memory edit <id> <текст>, /memory stale <id> on|off, /memory delete <id>
+/models — управляющие модели по ролям
+/provider [info|test [role]|select <role> <provider>] — провайдеры без секретов
 /settings — настройки без секретов
 /doctor — быстрая диагностика
 /github info <owner/repo> — информация о репозитории
@@ -110,6 +112,8 @@ class Handlers:
         r.message.register(self.cmd_rework, Command("rework"))
         r.message.register(self.cmd_usage, Command("usage"))
         r.message.register(self.cmd_memory, Command("memory"))
+        r.message.register(self.cmd_models, Command("models"))
+        r.message.register(self.cmd_provider, Command("provider"))
         r.message.register(self.cmd_settings, Command("settings"))
         r.message.register(self.cmd_doctor, Command("doctor"))
         r.message.register(self.cmd_github, Command("github"))
@@ -548,6 +552,7 @@ class Handlers:
         await self.notifier.send_text(
             message.chat.id,
             await self.orchestrator.usage_text(message.chat.id, period, task_id),
+            parse_mode="HTML",
         )
 
     async def cmd_memory(self, message: Message) -> None:
@@ -606,7 +611,9 @@ class Handlers:
             )
             return
         await self.notifier.send_text(
-            message.chat.id, await self.orchestrator.memory_text(message.chat.id, arg)
+            message.chat.id,
+            await self.orchestrator.memory_text(message.chat.id, arg),
+            parse_mode="HTML",
         )
 
     async def cmd_doctor(self, message: Message) -> None:
@@ -634,6 +641,83 @@ class Handlers:
         await self.notifier.send_text(
             message.chat.id,
             "Использование: /github info <owner/repo> | /github create <name> [private|public]",
+        )
+
+    async def cmd_models(self, message: Message) -> None:
+        if self.orchestrator.providers is None:
+            await self.notifier.send_text(message.chat.id, "Провайдеры не инициализированы.")
+            return
+        snapshot = self.orchestrator.providers.snapshot()
+        lines = ["Управляющие модели", ""]
+        for role, data in snapshot["roles"].items():
+            model = data.get("model") or "недоступна"
+            available = "✓" if data.get("available") else "✕"
+            lines.append(f"{available} {role}: {data['provider']} / {model}")
+        lines += [
+            "",
+            "Смена: /provider select <role> <provider>; активные задачи должны быть завершены.",
+        ]
+        await self.notifier.send_text(message.chat.id, "\n".join(lines))
+
+    async def cmd_provider(self, message: Message) -> None:
+        if self.orchestrator.providers is None:
+            await self.notifier.send_text(message.chat.id, "Провайдеры не инициализированы.")
+            return
+        parts = (message.text or "").split()
+        arg = parts[1] if len(parts) > 1 else "info"
+        registry = self.orchestrator.providers
+        if arg == "info":
+            snapshot = registry.snapshot()
+            lines = ["Провайдеры", ""]
+            for name, data in snapshot["providers"].items():
+                cap = data["capabilities"]
+                lines.append(
+                    f"{name}: {data['model']}; tools={cap['tools']}, structured={cap['structured_output']}, "
+                    f"streaming={cap['streaming']}, reasoning={cap['reasoning']}, cache={cap['prompt_cache']}"
+                )
+            lines += ["", "Ключи не отображаются."]
+            await self.notifier.send_text(message.chat.id, "\n".join(lines))
+            return
+        if arg == "test":
+            role = parts[2] if len(parts) > 2 else "chat"
+            results = await registry.health(role)
+            lines = ["Проверка провайдера", ""]
+            for name, data in results.items():
+                lines.append(f"{name}: {'доступен' if data['available'] else 'недоступен'}")
+                if data.get("detail"):
+                    lines.append(str(data["detail"])[:1000])
+            await self.notifier.send_text(message.chat.id, "\n".join(lines))
+            return
+        if arg == "select":
+            if len(parts) != 4:
+                await self.notifier.send_text(
+                    message.chat.id, "Использование: /provider select <role> <provider>"
+                )
+                return
+            role, provider = parts[2], parts[3]
+            active = await self.orchestrator.tasks.active(None)
+            if active:
+                await self.notifier.send_text(
+                    message.chat.id,
+                    "Есть активные задачи. Дождитесь их завершения или отмените их; "
+                    "смена провайдера не применяется к уже запущенным задачам.",
+                )
+                return
+            try:
+                registry.select(role, provider)
+            except Exception as exc:
+                await self.notifier.send_text(message.chat.id, f"Не удалось: {exc}")
+                return
+            await self.notifier.send_text(
+                message.chat.id,
+                f"Роль {role} теперь использует {provider}. Смена действует на новые запросы "
+                "до перезапуска; для постоянной настройки измените [llm.roles].",
+            )
+            return
+        await self.notifier.send_text(
+            message.chat.id,
+            "Использование: /provider info | /provider test [role] | "
+            "/provider select <role> <provider>",
         )
 
     async def cmd_settings(self, message: Message) -> None:

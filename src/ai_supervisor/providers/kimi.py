@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from ai_supervisor.core.redaction import SecretRedactor
 from ai_supervisor.models import TokenUsage
+from ai_supervisor.providers.base import ProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ TRANSIENT_MARKERS = (
 )
 
 
-class KimiError(RuntimeError):
+class KimiError(ProviderError):
     """Base class for sanitized, user-presentable Kimi failures."""
 
 
@@ -95,6 +96,7 @@ class KimiResponse(BaseModel):
     usage: TokenUsage = Field(default_factory=TokenUsage)
     model: str = ""
     request_id: str | None = None
+    raw_usage: dict[str, Any] = Field(default_factory=dict)
 
     def assistant_message(self) -> dict[str, Any]:
         message: dict[str, Any] = {"role": "assistant", "content": self.content}

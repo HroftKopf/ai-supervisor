@@ -39,5 +39,7 @@ async def test_planner_error_does_not_send_executor_to_rework(orchestrator) -> N
     await _run(orch)
     task = await tasks.get(1)
     assert task.status is TaskStatus.BLOCKED
-    assert workers.calls == 1
+    assert workers.calls == 2  # one bounded automatic replan, then stop
     assert "планировщик" in (task.error or "").lower()
+    events = await tasks.events(task.id)
+    assert sum(event["event_type"] == "planner_replan" for event in events) == 1

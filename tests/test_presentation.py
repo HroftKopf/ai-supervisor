@@ -233,3 +233,41 @@ async def test_progress_throttling_merges_updates(orchestrator, project) -> None
     assert await orch.progress.update(task.id, force=True, chat_id=424242) is True
     assert await orch.progress.update(task.id, chat_id=424242) is False
     await orch.progress.close()
+
+
+def test_markdown_to_telegram_preserves_paragraphs_and_code() -> None:
+    from ai_supervisor.presentation.formatting import markdown_to_telegram_html
+
+    text = "## Итог\n\nПервый **важный** абзац.\n\n```python\nif a < b:\n    print('ok')\n```\n\n- один\n- два"
+    html = markdown_to_telegram_html(text)
+    assert "<b>Итог</b>" in html
+    assert "Первый <b>важный</b> абзац." in html
+    assert "<pre><code>if a &lt; b:" in html
+    assert "\n\n" in html
+    assert "a < b" not in html
+    assert html == (
+        "<b>Итог</b>\n\nПервый <b>важный</b> абзац.\n\n"
+        "<pre><code>if a &lt; b:\n    print(&#x27;ok&#x27;)\n</code></pre>\n\n"
+        "• один\n• два"
+    )
+
+
+def test_cards_have_vertical_spacing_and_limits(project) -> None:
+    from datetime import UTC, datetime
+
+    from ai_supervisor.models import TaskRecord, TaskStatus
+    from ai_supervisor.presentation.formatting import normalize_card
+
+    task = TaskRecord(
+        id=1,
+        project_id=project.id,
+        conversation_id=1,
+        title="Заголовок",
+        status=TaskStatus.RUNNING,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    text = progress_card(task, project, [])
+    assert "\n\n" in text
+    assert "\n\n\n" not in normalize_card(text)
+    assert len(text) <= 3800

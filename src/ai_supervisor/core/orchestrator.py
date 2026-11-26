@@ -73,11 +73,17 @@ from ai_supervisor.models import (
     WorkerResult,
     ensure_transition,
 )
+from ai_supervisor.presentation.formatting import markdown_to_telegram_html
 from ai_supervisor.presentation.progress import ProgressManager
 from ai_supervisor.presentation.renderer import (
     completion_card,
     details_view,
     error_card,
+)
+from ai_supervisor.providers.base import (
+    ProviderError,
+    ProviderQuotaError,
+    ProviderRateLimitError,
 )
 from ai_supervisor.providers.kimi import (
     KimiError,
@@ -190,6 +196,7 @@ class Orchestrator:
         self.usage = usage
         self.approvals = approvals
         self.supervisor = supervisor
+        self.providers = getattr(supervisor, "providers", None)
         self.workspace = workspace
         self.workers = workers
         self.scheduler = scheduler
@@ -413,10 +420,10 @@ class Orchestrator:
                 role="classification",
                 context_chars=len(project_block) + len(conversation_block),
             )
-        except KimiQuotaError as exc:
+        except (KimiQuotaError, ProviderQuotaError) as exc:
             await self._notify_quota(message.chat_id, exc)
             return
-        except (KimiError, LimitExceeded) as exc:
+        except (KimiError, ProviderError, LimitExceeded) as exc:
             await self.notifier.send_text(message.chat_id, self._friendly_error(exc))
             return
 
@@ -494,15 +501,15 @@ class Orchestrator:
                 ),
                 routing_level=int(self.routing.for_request(latest_text)),
             )
-        except KimiQuotaError as exc:
+        except (KimiQuotaError, ProviderQuotaError) as exc:
             await self._notify_quota(chat_id, exc)
             return
-        except (KimiError, LimitExceeded) as exc:
+        except (KimiError, ProviderError, LimitExceeded) as exc:
             await self.notifier.send_text(chat_id, self._friendly_error(exc))
             return
         content = self.redactor.redact(response.content.strip())
         if not content:
-            content = "Kimi не вернул текстовый ответ."
+            content = "Провайдер не вернул текстовый ответ."
         await self.conversations.add_message(
             conversation.id,
             "assistant",
@@ -513,7 +520,7 @@ class Orchestrator:
                 "usage": response.usage.model_dump(),
             },
         )
-        await self._send_long(chat_id, content)
+        await self._send_markdown(chat_id, content)
         warning = await self.usage.warning()
         if warning:
             await self.notifier.send_text(chat_id, "⚠️ " + warning)
@@ -719,12 +726,13 @@ class Orchestrator:
             await self._handle_cancel(task_id)
         except LimitExceeded as exc:
             await self._pause_task(task_id, str(exc))
-        except KimiQuotaError as exc:
+        except (KimiQuotaError, ProviderQuotaError) as exc:
             await self._pause_task(task_id, str(exc))
-        except KimiRateLimitError as exc:
+        except (KimiRateLimitError, ProviderRateLimitError) as exc:
             await self._retry_wait(task_id, str(exc))
         except (
             KimiError,
+            ProviderError,
             SupervisorError,
             WorkspaceError,
             WorkerError,
@@ -739,7 +747,13 @@ class Orchestrator:
             logger.exception("task #%s failed unexpectedly", task_id)
             await self._fail_task(task_id, f"{type(exc).__name__}: {exc}")
 
-    async def _plan_task(self, task: TaskRecord, project: ProjectRecord) -> TaskRecord:
+    async def _plan_task(
+        self,
+        task: TaskRecord,
+        project: ProjectRecord,
+        *,
+        request_override: str | None = None,
+    ) -> TaskRecord:
         if task.status is TaskStatus.CREATED:
             task = await self.tasks.transition(task.id, TaskStatus.PLANNING)
         elif task.status not in {
@@ -761,7 +775,9 @@ class Orchestrator:
         conversation = await self.conversations.get(task.conversation_id)
         _summary, context_messages = await self.conversations.build_context(task.conversation_id)
         user_messages = [message for message in context_messages if message.role == "user"]
-        latest_user = user_messages[-1].content if user_messages else task.title
+        latest_user = request_override or (
+            user_messages[-1].content if user_messages else task.title
+        )
         memory_block = await self.conversations.memory_context(
             project_id=project.id, conversation_id=conversation.id
         )
@@ -1092,11 +1108,37 @@ class Orchestrator:
                 )
                 return
             if review.root_cause is RootCause.PLANNER_ERROR:
-                await self._block_task(
+                events = await self.tasks.events(task.id, limit=100)
+                replanned = any(event["event_type"] == "planner_replan" for event in events)
+                if replanned:
+                    await self._block_task(
+                        task.id,
+                        "Повторная ошибка планировщика: автоматический пересмотр уже выполнялся; "
+                        "исполнитель не отправлен на доработку.\n" + review.summary,
+                        review=review,
+                    )
+                    return
+                original = (task.spec.source_request if task.spec else "") or task.title
+                await self.tasks.add_event(
                     task.id,
-                    "Ошибка планировщика: требуется пересмотр плана, исполнитель не отправлен "
-                    "на доработку.\n" + review.summary,
-                    review=review,
+                    "planner_replan",
+                    "Ограниченный автоматический пересмотр ТЗ после planner_error",
+                    {"reason": review.summary[:2000], "original_request": original[:8000]},
+                    agent="orchestrator",
+                )
+                await self._try_transition(task.id, TaskStatus.WAITING_INPUT)
+                task = await self.tasks.get(task.id)
+                await self._try_transition(task.id, TaskStatus.PLANNING)
+                task = await self.tasks.get(task.id)
+                await self._plan_task(task, project, request_override=original)
+                task = await self.tasks.get(task.id)
+                await self._try_transition(task.id, TaskStatus.QUEUED)
+                task = await self.tasks.get(task.id)
+                await self._execute_task(
+                    task.id,
+                    project=project,
+                    project_context=project_context,
+                    manual_instruction=None,
                 )
                 return
             if (
@@ -3140,9 +3182,18 @@ class Orchestrator:
         routing_level: int | None = None,
         context_chars: int | None = None,
     ) -> None:
+        provider_name = "kimi"
+        model_name = self.settings.kimi.model
+        if self.providers is not None and role:
+            try:
+                provider = self.providers.provider_for(role)
+                provider_name = provider.name
+                model_name = provider.model
+            except Exception:
+                pass
         await self.usage.record(
-            provider="kimi",
-            model=self.settings.kimi.model,
+            provider=provider_name,
+            model=model_name,
             usage=usage,
             task_id=task_id,
             project_id=project_id,
@@ -3155,12 +3206,13 @@ class Orchestrator:
             ),
             routing_level=routing_level,
             context_chars=context_chars,
+            raw_usage=getattr(self.supervisor, "last_raw_usage", None),
         )
 
     async def _notify_quota(self, chat_id: int, exc: Exception) -> None:
         await self.notifier.send_text(
             chat_id,
-            "Лимит/квота Kimi исчерпаны. Новые запросы приостановлены; проверьте лимиты аккаунта.\n"
+            "Лимит/квота провайдера исчерпаны. Новые запросы приостановлены; проверьте лимиты аккаунта.\n"
             + self.redactor.redact(str(exc))[:1000],
         )
 
@@ -3168,9 +3220,20 @@ class Orchestrator:
         text = self.redactor.redact(str(exc))[:1500]
         if isinstance(exc, LimitExceeded):
             return "Лимит: " + text
+        if isinstance(exc, ProviderError):
+            return "Ошибка провайдера: " + text
         if isinstance(exc, KimiError):
             return "Ошибка Kimi: " + text
         return "Ошибка: " + text
+
+    async def _send_markdown(self, chat_id: int, text: str) -> None:
+        formatted = markdown_to_telegram_html(text)
+        limit = self.settings.telegram.max_message_chars
+        if len(formatted) <= min(limit, 3800):
+            await self.notifier.send_text(chat_id, formatted, parse_mode="HTML")
+            return
+        # Long provider answers: preserve Markdown as plain text rather than risk unbalanced HTML.
+        await self._send_long(chat_id, text)
 
     async def _send_long(self, chat_id: int, text: str) -> None:
         limit = self.settings.telegram.max_message_chars
@@ -3293,7 +3356,17 @@ class Orchestrator:
             f"Исполнители: {self.scheduler.active_count}/{self.scheduler.max_workers} "
             f"(свободно {self.scheduler.available_slots})"
         )
-        lines.append(f"Модель Kimi: {self.settings.kimi.model}")
+        if self.providers is not None:
+            roles = self.providers.snapshot()["roles"]
+            lines.append(
+                "Управляющие модели: "
+                + ", ".join(
+                    f"{role}={data['provider']}/{data['model'] or '—'}"
+                    for role, data in roles.items()
+                )
+            )
+        else:
+            lines.append(f"Модель Kimi: {self.settings.kimi.model}")
         lines.append(f"Модель DeepSeek: {self.settings.deepseek_model}")
         return "\n".join(lines)
 
@@ -3319,14 +3392,17 @@ class Orchestrator:
         self, chat_id: int, period: str = "today", task_id: int | None = None
     ) -> str:
         project = await self._current_project(chat_id)
-        lines = ["Расходы (фактические значения API)"]
+        lines = ["<b>Расход API</b>", ""]
         if task_id is not None:
             task = await self.tasks.get(task_id)
             totals = await self.usage.task_totals(task.id)
-            lines.append(f"Задача #{task.id:03d}: {self.usage.format_totals(totals)}")
+            lines += [f"<b>Задача #{task.id:03d}</b>", "", self.usage.format_totals(totals), ""]
             models = await self.usage.by_model(task_id=task.id)
-            for (provider, model), value in models.items():
-                lines.append(f"• {provider}/{model}: {self.usage.format_totals(value)}")
+            if models:
+                lines.append("<b>Модели</b>")
+                lines.append("")
+                for (provider, model), value in models.items():
+                    lines.append(f"• {provider}/{model}: {self.usage.format_totals(value)}")
             return "\n".join(lines)
         zone = ZoneInfo(self.settings.app.timezone)
         now = datetime.now(zone)
@@ -3345,21 +3421,24 @@ class Orchestrator:
             label = "сегодня"
         end = start + timedelta(days=7 if period == "week" else 30 if period == "month" else 1)
         totals = await self.usage.range_totals(start, end)
-        lines.append(f"{label.capitalize()}: {self.usage.format_totals(totals)}")
+        lines += [f"<b>{label.capitalize()}</b>", "", self.usage.format_totals(totals)]
         models = await self.usage.by_model(start=start, end=end)
-        for (provider, model), value in models.items():
-            lines.append(f"• {provider}/{model}: {self.usage.format_totals(value)}")
+        if models:
+            lines += ["", "<b>Модели</b>", ""]
+            for (provider, model), value in models.items():
+                lines.append(f"• {provider}/{model}: {self.usage.format_totals(value)}")
         if project:
             provider_totals = await self.usage.by_provider(project_id=project.id)
-            lines.append(f"Проект {project.name} (все время):")
+            lines += ["", f"<b>Проект {project.name}</b>", ""]
             for provider, value in provider_totals.items():
                 lines.append(f"• {provider}: {self.usage.format_totals(value)}")
         if not self.settings.usage.configured:
-            lines.append("Цены не заданы в config.toml, стоимость не рассчитывается.")
-        lines.append(
+            lines += ["", "Цены не заданы в config.toml, стоимость не рассчитывается."]
+        lines += [
+            "",
             f"Лимит/сутки: токены {self.settings.limits.daily_token_limit or 'без лимита'}, "
-            f"запросы {self.settings.limits.daily_request_limit or 'без лимита'}."
-        )
+            f"запросы {self.settings.limits.daily_request_limit or 'без лимита'}.",
+        ]
         return "\n".join(lines)
 
     async def memory_text(self, chat_id: int, query: str) -> str:
@@ -3368,22 +3447,28 @@ class Orchestrator:
             memories = await self.conversations.search_memories(query.strip())
             if not memories:
                 return "Совпадений в памяти нет."
+            import html
+
             return "\n".join(
-                f"#{item.id} [{item.scope}/{item.category}{' · устарело' if item.stale else ''}] "
-                f"{item.content[:500]}"
+                f"#{item.id} [{html.escape(item.scope)}/{html.escape(item.category)}"
+                f"{' · устарело' if item.stale else ''}] "
+                f"{html.escape(item.content[:500], quote=True)}"
                 for item in memories
             )
         items = await self.conversations.get_memories(project_id=project.id if project else None)
         if not items:
             return "Память пуста. Добавить: /memory add <текст>"
-        lines = ["Память (последние записи):"]
+        lines = ["<b>Память</b>", ""]
         for item in items[:20]:
-            confirmed = "" if item.verified else " (неподтверждено)"
+            confirmed = "" if item.verified else " · неподтверждено"
             stale = " · устарело" if item.stale else ""
-            lines.append(
-                f"#{item.id} [{item.scope}/{item.category}{confirmed}{stale}] {item.content[:300]}"
-            )
-        return "\n".join(lines)
+            lines += [
+                f"<b>#{item.id} · {item.scope}/{item.category}</b>{confirmed}{stale}",
+                "",
+                __import__("html").escape(item.content[:500], quote=True),
+                "",
+            ]
+        return "\n".join(lines).rstrip()
 
     async def doctor_text(self, chat_id: int) -> str:
         import importlib.metadata
@@ -3430,9 +3515,18 @@ class Orchestrator:
         )
         lines.append(f"Unfinished tasks: {len(unfinished)}")
         lines.append(f"Worker slots: {self.scheduler.available_slots}/{self.scheduler.max_workers}")
-        lines.append(
-            f"Kimi: {self.settings.kimi.model} (key configured: {bool(self.settings.kimi_key)})"
-        )
+        if self.providers is not None:
+            lines.append(
+                "LLM roles: "
+                + ", ".join(
+                    f"{role}={data['provider']}/{data['model'] or '—'}"
+                    for role, data in self.providers.snapshot()["roles"].items()
+                )
+            )
+        else:
+            lines.append(
+                f"Kimi: {self.settings.kimi.model} (key configured: {bool(self.settings.kimi_key)})"
+            )
         lines.append(
             f"DeepSeek: {self.settings.deepseek_model} (key configured: {bool(self.settings.deepseek_key)})"
         )
@@ -3448,16 +3542,28 @@ class Orchestrator:
             lines.append("GitHub auth: not configured")
         lines.append(f"Project: {project.name if project else 'none'}")
         lines.append(
-            "CLI `ai-supervisor doctor` additionally checks Kimi /models, Telegram getMe and bwrap."
+            "CLI `ai-supervisor doctor` additionally checks configured providers, Telegram getMe and bwrap."
         )
         return "\n".join(lines)
 
     async def settings_text(self, chat_id: int) -> str:
         summary = self.settings.public_summary()
-        return (
-            "Настройки (секреты скрыты):\n"
-            + json.dumps(summary, ensure_ascii=False, indent=2)[:3500]
-        )
+        lines = ["<b>Настройки</b>", "", "Секреты скрыты.", ""]
+        lines += [
+            "<b>Модели</b>",
+            "",
+            *[
+                f"{role}: {data['provider']} / {data['model'] or 'недоступна'}"
+                for role, data in (
+                    self.providers.snapshot()["roles"].items() if self.providers is not None else []
+                )
+            ],
+            "",
+            "<b>Параметры</b>",
+            "",
+            json.dumps(summary, ensure_ascii=False, indent=2)[:2500],
+        ]
+        return "\n".join(lines)
 
     async def send_diff(self, task_id: int, chat_id: int) -> None:
         task = await self.tasks.get(task_id)
