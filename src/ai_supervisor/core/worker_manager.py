@@ -9,8 +9,10 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from ai_supervisor.config import Settings
+from ai_supervisor.core.egress import EgressProxy
 from ai_supervisor.core.redaction import SecretRedactor
 from ai_supervisor.core.sandbox import BwrapSandbox
 from ai_supervisor.core.workspace import WorkspaceManager
@@ -84,6 +86,25 @@ class WorkerManager:
         paths = self.workspace.sandbox_paths(
             worktree, dsh_home, state_dir, self.workspace.extra_read_paths(project)
         )
+        egress_socket: Path | None = None
+        egress_proxy: EgressProxy | None = None
+        if self.settings.egress.enabled:
+            base_url = self.settings.deepseek_base_url or "https://api.deepseek.com"
+            parsed = urlparse(base_url)
+            allowed = list(self.settings.egress.allowed_hosts)
+            ports = list(self.settings.egress.allowed_ports)
+            if parsed.hostname:
+                allowed.append(parsed.hostname)
+            if parsed.port:
+                ports.append(parsed.port)
+            egress_socket = state_dir / "egress.sock"
+            egress_proxy = EgressProxy(
+                egress_socket,
+                allowed_hosts=allowed,
+                allowed_ports=ports,
+                max_connections=self.settings.egress.max_connections,
+            )
+
         argv = self.sandbox.worker_argv(
             paths,
             session_id=session_id,
@@ -96,49 +117,56 @@ class WorkerManager:
             deepseek_api_key=self.settings.deepseek_key,
             deepseek_base_url=self.settings.deepseek_base_url,
             resume=resume,
+            egress_socket="/state/egress.sock" if egress_socket else None,
         )
         stdout_path = state_dir / "worker.stdout.log"
         stderr_path = state_dir / "worker.stderr.log"
         started = time.monotonic()
-        with open(stdout_path, "wb") as stdout_file, open(stderr_path, "wb") as stderr_file:
-            os.chmod(stdout_path, 0o600)
-            os.chmod(stderr_path, 0o600)
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                start_new_session=True,
-            )
-            self._processes[task.id] = process
-            await self.tasks.update_worker(worker_id, status="running", pid=process.pid)
-            if task.id in self._cancelled:
-                self._terminate(task.id, process, signal.SIGTERM)
-                await process.wait()
-                raise WorkerError("задача отменена во время запуска исполнителя")
-            timed_out = False
-            try:
-                await asyncio.wait_for(
-                    process.communicate(prompt.encode("utf-8")), timeout=timeout_seconds
+        try:
+            if egress_proxy is not None:
+                await egress_proxy.start()
+            with open(stdout_path, "wb") as stdout_file, open(stderr_path, "wb") as stderr_file:
+                os.chmod(stdout_path, 0o600)
+                os.chmod(stderr_path, 0o600)
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    start_new_session=True,
                 )
-            except TimeoutError:
-                timed_out = True
-                self._terminate(task.id, process, signal.SIGTERM)
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=15)
-                except TimeoutError:
-                    self._terminate(task.id, process, signal.SIGKILL)
+                self._processes[task.id] = process
+                await self.tasks.update_worker(worker_id, status="running", pid=process.pid)
+                if task.id in self._cancelled:
+                    self._terminate(task.id, process, signal.SIGTERM)
                     await process.wait()
-            except asyncio.CancelledError:
-                self._terminate(task.id, process, signal.SIGTERM)
+                    raise WorkerError("задача отменена во время запуска исполнителя")
+                timed_out = False
                 try:
-                    await asyncio.wait_for(process.wait(), timeout=10)
+                    await asyncio.wait_for(
+                        process.communicate(prompt.encode("utf-8")), timeout=timeout_seconds
+                    )
                 except TimeoutError:
-                    self._terminate(task.id, process, signal.SIGKILL)
-                    await process.wait()
-                raise
-            finally:
-                self._processes.pop(task.id, None)
+                    timed_out = True
+                    self._terminate(task.id, process, signal.SIGTERM)
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=15)
+                    except TimeoutError:
+                        self._terminate(task.id, process, signal.SIGKILL)
+                        await process.wait()
+                except asyncio.CancelledError:
+                    self._terminate(task.id, process, signal.SIGTERM)
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=10)
+                    except TimeoutError:
+                        self._terminate(task.id, process, signal.SIGKILL)
+                        await process.wait()
+                    raise
+                finally:
+                    self._processes.pop(task.id, None)
+        finally:
+            if egress_proxy is not None:
+                await egress_proxy.stop()
         duration = time.monotonic() - started
         _redact_log_file(stdout_path, self.redactor, max_bytes=2_000_000)
         _redact_log_file(stderr_path, self.redactor, max_bytes=2_000_000)

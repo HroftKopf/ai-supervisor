@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def iso_now() -> str:
@@ -141,6 +141,47 @@ CREATE TABLE IF NOT EXISTS task_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, id);
+
+CREATE TABLE IF NOT EXISTS task_stages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    stage_key TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    operation TEXT NOT NULL,
+    executor TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    depends_on_json TEXT NOT NULL DEFAULT '[]',
+    acceptance_criteria_json TEXT NOT NULL DEFAULT '[]',
+    inputs_json TEXT NOT NULL DEFAULT '[]',
+    outputs_json TEXT NOT NULL DEFAULT '[]',
+    required_permissions_json TEXT NOT NULL DEFAULT '[]',
+    source TEXT,
+    destination TEXT,
+    overwrite INTEGER NOT NULL DEFAULT 0,
+    commit_message TEXT,
+    repo_name TEXT,
+    repo_owner TEXT,
+    private INTEGER NOT NULL DEFAULT 1,
+    remote TEXT NOT NULL DEFAULT 'origin',
+    branch TEXT,
+    merge INTEGER NOT NULL DEFAULT 1,
+    instruction TEXT,
+    allowed_paths_json TEXT NOT NULL DEFAULT '[]',
+    require_change INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    approval_id INTEGER,
+    approval_granted INTEGER NOT NULL DEFAULT 0,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    UNIQUE(task_id, stage_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_stages_task ON task_stages(task_id, position);
 
 CREATE TABLE IF NOT EXISTS agent_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

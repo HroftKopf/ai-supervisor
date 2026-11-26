@@ -347,7 +347,14 @@ class WorkspaceManager:
             verification_note=verification_note,
         )
 
-    async def commit_changes(self, *, task: TaskRecord, worktree: Path, changed: bool) -> str:
+    async def commit_changes(
+        self,
+        *,
+        task: TaskRecord,
+        worktree: Path,
+        changed: bool,
+        message: str | None = None,
+    ) -> str:
         if not changed:
             return (await git_output(worktree, "rev-parse", "HEAD")).strip()
         staged = await git(worktree, "diff", "--cached", "--quiet", "HEAD", check=False)
@@ -355,7 +362,9 @@ class WorkspaceManager:
             # The cumulative task diff may be non-empty after an earlier rework
             # commit while this attempt introduced no new changes.
             return (await git_output(worktree, "rev-parse", "HEAD")).strip()
-        message = f"{self.settings.git.commit_prefix}: task {task.id:04d} — {task.title}"[:200]
+        commit_message = (
+            message or f"{self.settings.git.commit_prefix}: task {task.id:04d} — {task.title}"
+        )[:200]
         result = await git(
             worktree,
             "-c",
@@ -369,7 +378,7 @@ class WorkspaceManager:
             "commit",
             "--no-verify",
             "-m",
-            message,
+            commit_message,
             timeout_seconds=120,
             check=False,
         )
@@ -395,7 +404,7 @@ class WorkspaceManager:
         )
         return result.returncode == 0
 
-    async def apply(self, task: TaskRecord, project: ProjectRecord) -> str:
+    async def apply(self, task: TaskRecord, project: ProjectRecord, *, cleanup: bool = True) -> str:
         repo = Path(project.path).resolve()
         self._assert_inside_allowed(repo)
         if not task.branch or not task.head_commit:
@@ -437,9 +446,10 @@ class WorkspaceManager:
             raise WorkspaceError(
                 "merge завершился не на ожидаемом коммите; проверьте ветку вручную"
             )
-        warnings = await self.cleanup(task, project, remove_branch=True, strict=False)
-        for warning in warnings:
-            logging.getLogger(__name__).warning("post-merge cleanup: %s", warning)
+        if cleanup:
+            warnings = await self.cleanup(task, project, remove_branch=True, strict=False)
+            for warning in warnings:
+                logging.getLogger(__name__).warning("post-merge cleanup: %s", warning)
         return new_head
 
     async def cleanup(

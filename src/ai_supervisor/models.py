@@ -29,6 +29,37 @@ class RiskLevel(StrEnum):
     CRITICAL = "critical"
 
 
+class StageOperation(StrEnum):
+    IMPORT_CONFIG = "import_config"
+    GIT_COMMIT = "git_commit"
+    VALIDATE = "validate"
+    GITHUB_ENSURE_REPO = "github_ensure_repo"
+    PUBLISH = "publish"
+    KIMI_ANALYZE = "kimi_analyze"
+    DEEPSEEK_CHANGE = "deepseek_change"
+
+
+class StageExecutor(StrEnum):
+    PYTHON = "python"
+    GIT = "git"
+    GITHUB = "github"
+    VALIDATOR = "validator"
+    KIMI = "kimi"
+    DEEPSEEK = "deepseek"
+
+
+class StageStatus(StrEnum):
+    PENDING = "pending"
+    READY = "ready"
+    RUNNING = "running"
+    WAITING_APPROVAL = "waiting_approval"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+
+
 class TaskStatus(StrEnum):
     CREATED = "created"
     PLANNING = "planning"
@@ -101,11 +132,13 @@ TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
         {
             TaskStatus.VALIDATING,
             TaskStatus.REVIEWING,
+            TaskStatus.WAITING_APPROVAL,
             TaskStatus.PAUSED,
             TaskStatus.CANCELLED,
             TaskStatus.INTERRUPTED,
             TaskStatus.FAILED,
             TaskStatus.BLOCKED,
+            TaskStatus.COMPLETED,
         }
     ),
     TaskStatus.VALIDATING: frozenset(
@@ -117,6 +150,7 @@ TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.RETRY_WAIT,
             TaskStatus.BLOCKED,
             TaskStatus.PARTIALLY_COMPLETED,
+            TaskStatus.COMPLETED,
             TaskStatus.PAUSED,
             TaskStatus.CANCELLED,
             TaskStatus.FAILED,
@@ -229,6 +263,91 @@ class IntentResult(BaseModel):
     task_title_hint: str | None = Field(default=None, max_length=160)
 
 
+STAGE_ID_RE = r"^[a-z][a-z0-9_-]{0,63}$"
+STAGE_EXECUTORS: dict[StageOperation, StageExecutor] = {
+    StageOperation.IMPORT_CONFIG: StageExecutor.PYTHON,
+    StageOperation.GIT_COMMIT: StageExecutor.GIT,
+    StageOperation.VALIDATE: StageExecutor.VALIDATOR,
+    StageOperation.GITHUB_ENSURE_REPO: StageExecutor.GITHUB,
+    StageOperation.PUBLISH: StageExecutor.GIT,
+    StageOperation.KIMI_ANALYZE: StageExecutor.KIMI,
+    StageOperation.DEEPSEEK_CHANGE: StageExecutor.DEEPSEEK,
+}
+
+
+class StageSpec(BaseModel):
+    """A single executable node in a COMPOSITE task graph."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=STAGE_ID_RE)
+    operation: StageOperation
+    goal: str = Field(min_length=3, max_length=2000)
+    depends_on: list[str] = Field(default_factory=list, max_length=30)
+    executor: StageExecutor
+    required_permissions: list[RiskLevel] = Field(default_factory=list, max_length=10)
+    acceptance_criteria: list[str] = Field(min_length=1, max_length=15)
+    inputs: list[str] = Field(default_factory=list, max_length=30)
+    outputs: list[str] = Field(default_factory=list, max_length=30)
+    source: str | None = Field(default=None, max_length=2000)
+    destination: str | None = Field(default=None, max_length=2000)
+    overwrite: bool = False
+    commit_message: str | None = Field(default=None, max_length=300)
+    repo_name: str | None = Field(default=None, max_length=100)
+    repo_owner: str | None = Field(default=None, max_length=39)
+    private: bool = True
+    remote: str = Field(default="origin", max_length=64)
+    branch: str | None = Field(default=None, max_length=200)
+    merge: bool = True
+    instruction: str | None = Field(default=None, max_length=8000)
+    allowed_paths: list[str] = Field(default_factory=lambda: ["."], max_length=50)
+    require_change: bool = False
+
+    @field_validator("depends_on")
+    @classmethod
+    def _known_dependencies(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("stage dependencies must be unique")
+        return value
+
+    @field_validator("allowed_paths")
+    @classmethod
+    def _stage_paths(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for item in value:
+            item = item.strip()
+            if not item:
+                continue
+            path = PathLike(item)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError(f"stage paths must stay inside the project: {item}")
+            cleaned.append(item)
+        return cleaned or ["."]
+
+    @model_validator(mode="after")
+    def _operation_consistency(self) -> StageSpec:
+        expected = STAGE_EXECUTORS[self.operation]
+        if self.executor is not expected:
+            raise ValueError(
+                f"stage {self.id}: operation {self.operation.value} must use executor "
+                f"{expected.value}, not {self.executor.value}"
+            )
+        if RiskLevel.CRITICAL in self.required_permissions:
+            raise ValueError(f"stage {self.id}: CRITICAL permissions are forbidden")
+        if self.operation is StageOperation.IMPORT_CONFIG and not self.destination:
+            raise ValueError(f"stage {self.id}: import_config requires destination")
+        if self.operation is StageOperation.GITHUB_ENSURE_REPO and not self.repo_name:
+            raise ValueError(f"stage {self.id}: github_ensure_repo requires repo_name")
+        if self.operation in {StageOperation.KIMI_ANALYZE, StageOperation.DEEPSEEK_CHANGE}:
+            if not (self.instruction or self.goal):
+                raise ValueError(f"stage {self.id}: model operation requires an instruction")
+        if self.operation is StageOperation.PUBLISH and self.merge and self.branch is not None:
+            raise ValueError(
+                f"stage {self.id}: branch is derived from the project base branch when merge=true"
+            )
+        return self
+
+
 class TaskSpec(BaseModel):
     """Validated contract passed from Kimi to the executor.
 
@@ -253,6 +372,7 @@ class TaskSpec(BaseModel):
     required_tools: list[str] = Field(default_factory=list, max_length=30)
     required_permissions: list[RiskLevel] = Field(default_factory=list, max_length=20)
     dependencies: list[str] = Field(default_factory=list, max_length=30)
+    stages: list[StageSpec] = Field(default_factory=list, max_length=30)
     constraints: list[str] = Field(default_factory=list, max_length=20)
     risks: list[str] = Field(default_factory=list, max_length=20)
     requires_file_changes: bool | None = None
@@ -301,7 +421,42 @@ class TaskSpec(BaseModel):
             }
         if self.task_type is TaskType.READ_ONLY and self.requires_file_changes:
             raise ValueError("READ_ONLY task cannot require file changes")
+        if self.task_type is TaskType.COMPOSITE:
+            if not self.stages:
+                raise ValueError("COMPOSITE task requires at least one executable stage")
+            self._validate_stage_graph()
+        elif self.stages:
+            raise ValueError("only a COMPOSITE task may declare stages")
         return self
+
+    def _validate_stage_graph(self) -> None:
+        ids = [stage.id for stage in self.stages]
+        if len(ids) != len(set(ids)):
+            raise ValueError("COMPOSITE stage ids must be unique")
+        known = set(ids)
+        for stage in self.stages:
+            unknown = [dep for dep in stage.depends_on if dep not in known]
+            if unknown:
+                raise ValueError(f"stage {stage.id}: unknown dependencies: {unknown}")
+            if stage.id in stage.depends_on:
+                raise ValueError(f"stage {stage.id}: cannot depend on itself")
+        visiting: set[str] = set()
+        visited: set[str] = set()
+        graph = {stage.id: stage.depends_on for stage in self.stages}
+
+        def visit(node: str) -> None:
+            if node in visited:
+                return
+            if node in visiting:
+                raise ValueError(f"COMPOSITE dependency cycle includes {node}")
+            visiting.add(node)
+            for parent in graph[node]:
+                visit(parent)
+            visiting.remove(node)
+            visited.add(node)
+
+        for stage_id in ids:
+            visit(stage_id)
 
 
 class IssueSeverity(StrEnum):
@@ -527,6 +682,82 @@ class TaskRecord(BaseModel):
             return ReviewResult.model_validate(json.loads(self.review_json))
         except Exception:
             return None
+
+
+class StageRecord(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    task_id: int
+    stage_key: str
+    position: int
+    operation: StageOperation
+    executor: StageExecutor
+    goal: str
+    depends_on: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    inputs: list[str] = Field(default_factory=list)
+    outputs: list[str] = Field(default_factory=list)
+    required_permissions: list[RiskLevel] = Field(default_factory=list)
+    source: str | None = None
+    destination: str | None = None
+    overwrite: bool = False
+    commit_message: str | None = None
+    repo_name: str | None = None
+    repo_owner: str | None = None
+    private: bool = True
+    remote: str = "origin"
+    branch: str | None = None
+    merge: bool = True
+    instruction: str | None = None
+    allowed_paths: list[str] = Field(default_factory=list)
+    require_change: bool = False
+    status: StageStatus = StageStatus.PENDING
+    attempts: int = 0
+    approval_id: int | None = None
+    approval_granted: bool = False
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_db_row(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        import json
+
+        data = dict(value)
+        for source, target in (
+            ("depends_on_json", "depends_on"),
+            ("acceptance_criteria_json", "acceptance_criteria"),
+            ("inputs_json", "inputs"),
+            ("outputs_json", "outputs"),
+            ("required_permissions_json", "required_permissions"),
+            ("allowed_paths_json", "allowed_paths"),
+            ("result_json", "result"),
+        ):
+            raw = data.get(source)
+            if isinstance(raw, str):
+                try:
+                    data[target] = json.loads(raw)
+                except json.JSONDecodeError:
+                    data[target] = [] if target != "result" else {}
+        for source, target in (
+            ("overwrite", "overwrite"),
+            ("private", "private"),
+            ("merge", "merge"),
+            ("require_change", "require_change"),
+            ("approval_granted", "approval_granted"),
+        ):
+            if isinstance(data.get(source), int):
+                data[target] = bool(data[source])
+            elif data.get(source) is None:
+                data[target] = False
+        return data
 
 
 class ApprovalStatus(StrEnum):

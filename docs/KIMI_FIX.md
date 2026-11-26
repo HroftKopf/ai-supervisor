@@ -72,8 +72,8 @@ live plan: Перевести README проекта на русский язык
 live review: valid ReviewResult (accept/rework)
 ```
 
-Итог: `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py` — 1 passed.
-Обычные/регрессионные тесты: 65 passed, 3 skipped. `ruff check` — без ошибок.
+Итог: `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py` — 2 passed.
+Обычные/регрессионные тесты: 76 passed, 4 skipped. `ruff check` — без ошибок.
 
 ## Перезапуск сервиса
 

@@ -176,6 +176,15 @@ class Doctor:
         else:
             self.fail("bubblewrap", "install the bubblewrap package")
 
+        if s.egress.enabled:
+            self.ok(
+                "egress",
+                "worker netns + allowlist proxy; hosts="
+                + (", ".join(s.egress.allowed_hosts) or "(derived from DEEPSEEK_BASE_URL)"),
+            )
+        else:
+            self.warn("egress", "worker network isolation is disabled by config")
+
         for root in s.allowed_roots():
             if root.is_dir():
                 self.ok("allowed root", str(root))

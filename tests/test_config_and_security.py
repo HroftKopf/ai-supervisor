@@ -151,3 +151,33 @@ def test_unknown_top_level_config_section_is_rejected(monkeypatch, tmp_path: Pat
     # A minimal config plus an unknown section must fail before defaults apply.
     with pytest.raises(ConfigError):
         load_settings(config_path=config, env_path=tmp_path / ".env", check_env_permissions=False)
+
+
+def test_worker_uses_unshared_network_and_egress_socket(settings, tmp_path) -> None:
+    from ai_supervisor.core.sandbox import BwrapSandbox, SandboxPaths
+
+    sandbox = BwrapSandbox(settings)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    dsh_home = tmp_path / "dsh"
+    dsh_home.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    argv = sandbox.worker_argv(
+        SandboxPaths(worktree=worktree, dsh_home=dsh_home, state_dir=state),
+        session_id="s",
+        model="deepseek-v4-flash",
+        provider="deepseek-official",
+        profile="sdk-minimal",
+        max_tokens=1024,
+        reasoning_effort="",
+        system_prompt="x",
+        deepseek_api_key="secret",
+        deepseek_base_url="https://api.deepseek.com",
+        resume=False,
+        egress_socket="/state/egress.sock",
+    )
+    assert "--unshare-net" in argv
+    assert "--unshare-user" in argv
+    assert "CAP_NET_ADMIN" in argv
+    assert "/state/egress.sock" in argv

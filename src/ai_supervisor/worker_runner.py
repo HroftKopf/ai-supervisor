@@ -4,7 +4,12 @@ import argparse
 import json
 import os
 import resource
+import select
+import socket
+import socketserver
+import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -33,7 +38,64 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--cpu-seconds", type=int, default=3000)
     parser.add_argument("--max-open-files", type=int, default=1024)
     parser.add_argument("--max-processes", type=int, default=1024)
+    parser.add_argument("--egress-socket", default="")
     return parser.parse_args(argv)
+
+
+class _RelayHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            upstream.connect(self.server.egress_socket)  # type: ignore[attr-defined]
+            sockets = [self.request, upstream]
+            while True:
+                readable, _, _ = select.select(sockets, [], [], 30)
+                if not readable:
+                    continue
+                for source in readable:
+                    data = source.recv(64 * 1024)
+                    if not data:
+                        return
+                    target = upstream if source is self.request else self.request
+                    target.sendall(data)
+        except (ConnectionError, OSError):
+            return
+        finally:
+            upstream.close()
+
+
+class _RelayServer(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address: tuple[str, int], egress_socket: str) -> None:
+        self.egress_socket = egress_socket
+        super().__init__(address, _RelayHandler)
+
+
+def _start_egress_relay(socket_path: str) -> tuple[_RelayServer, int]:
+    # The network namespace starts with loopback down. CAP_NET_ADMIN is scoped
+    # to this namespace by bwrap; it has no route to the host.
+    result = subprocess.run(
+        ["/usr/bin/ip", "link", "set", "lo", "up"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"cannot bring loopback up: {result.stderr.strip()[:500]}")
+    server = _RelayServer(("127.0.0.1", 0), socket_path)
+    thread = threading.Thread(target=server.serve_forever, name="egress-relay", daemon=True)
+    thread.start()
+    return server, int(server.server_address[1])
+
+
+def _install_proxy_env(port: int) -> None:
+    proxy = f"http://127.0.0.1:{port}"
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        os.environ[key] = proxy
+    for key in ("NO_PROXY", "no_proxy"):
+        os.environ[key] = ""
 
 
 def _apply_limits(args: argparse.Namespace) -> None:
@@ -163,7 +225,11 @@ def main(argv: list[str] | None = None) -> int:
         "duration_seconds": 0.0,
     }
     harness = None
+    relay: _RelayServer | None = None
     try:
+        if args.egress_socket:
+            relay, proxy_port = _start_egress_relay(args.egress_socket)
+            _install_proxy_env(proxy_port)
         prompt = _read_prompt()
         from deepseek_harness import DeepSeekHarness
 
@@ -218,6 +284,9 @@ def main(argv: list[str] | None = None) -> int:
                 harness.close()
             except Exception:
                 pass
+        if relay is not None:
+            relay.shutdown()
+            relay.server_close()
 
 
 if __name__ == "__main__":

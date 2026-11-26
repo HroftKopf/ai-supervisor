@@ -15,7 +15,15 @@ from ai_supervisor.agents.supervisor import SupervisorAgent, SupervisorError
 from ai_supervisor.config import Settings
 from ai_supervisor.core.config_import import ConfigImportError, ConfigImportService
 from ai_supervisor.core.context import ContextError, ProjectContextBuilder
-from ai_supervisor.core.git_ops import GitOpsError, push_branch, remote_url, verify_remote_branch
+from ai_supervisor.core.git_ops import (
+    GitOpsError,
+    ensure_remote,
+    push_branch,
+    remote_branch_sha,
+    remote_url,
+    verify_remote_branch,
+)
+from ai_supervisor.core.git_utils import git, git_output
 from ai_supervisor.core.github import GitHubClient, GitHubError
 from ai_supervisor.core.interfaces import Button, IncomingMessage, Notifier
 from ai_supervisor.core.permissions import (
@@ -28,10 +36,12 @@ from ai_supervisor.core.permissions import (
 from ai_supervisor.core.redaction import SecretRedactor
 from ai_supervisor.core.reviewer import ReviewGate, build_report
 from ai_supervisor.core.usage import LimitExceeded, UsageService
+from ai_supervisor.core.validation import TaskValidator
 from ai_supervisor.core.worker_manager import WorkerError, WorkerManager, WorkerScheduler
 from ai_supervisor.core.workspace import WorkspaceError, WorkspaceManager
 from ai_supervisor.memory.conversations import ConversationService
 from ai_supervisor.memory.projects import ProjectError, ProjectService, validate_remote_url
+from ai_supervisor.memory.stages import StageError, TaskStageService
 from ai_supervisor.memory.tasks import TaskError, TaskService
 from ai_supervisor.models import (
     Evidence,
@@ -40,11 +50,15 @@ from ai_supervisor.models import (
     ReviewResult,
     ReviewVerdict,
     RiskLevel,
+    StageOperation,
+    StageRecord,
+    StageStatus,
     TaskRecord,
     TaskSpec,
     TaskStatus,
     TaskType,
     TransitionError,
+    WorkerResult,
     ensure_transition,
 )
 from ai_supervisor.providers.kimi import (
@@ -104,6 +118,10 @@ class OrchestratorError(RuntimeError):
     pass
 
 
+class CompositeError(RuntimeError):
+    pass
+
+
 def _locked_action(
     method: Callable[..., Coroutine[Any, Any, None]],
 ) -> Callable[..., Coroutine[Any, Any, None]]:
@@ -140,6 +158,7 @@ class Orchestrator:
         self.projects = projects
         self.conversations = conversations
         self.tasks = tasks
+        self.stages = TaskStageService(tasks.db)
         self.usage = usage
         self.approvals = approvals
         self.supervisor = supervisor
@@ -178,6 +197,21 @@ class Orchestrator:
             logger.warning(
                 "marked %s task(s) interrupted after restart: %s", len(interrupted), interrupted
             )
+            if self.settings.app.auto_resume_composite:
+                for task_id in interrupted:
+                    task = await self.tasks.get_optional(task_id)
+                    if task is None or task.cancel_requested:
+                        continue
+                    spec = task.spec
+                    if spec is not None and spec.task_type is TaskType.COMPOSITE:
+                        await self.tasks.transition(task.id, TaskStatus.QUEUED)
+                        await self.tasks.add_event(
+                            task.id,
+                            "composite-resumed",
+                            "Составная задача автоматически продолжена после перезапуска",
+                            agent="orchestrator",
+                        )
+                        self._spawn_job(task.id, plan_if_needed=False, manual_instruction=None)
 
     async def _cleanup_old_task_logs(self) -> None:
         import shutil
@@ -651,15 +685,25 @@ class Orchestrator:
         if spec.task_type in {
             TaskType.SYSTEM_OPERATION,
             TaskType.EXTERNAL_OPERATION,
-            TaskType.COMPOSITE,
         }:
             reason = (
-                f"Тип {spec.task_type.value} требует отдельного привилегированного исполнителя "
-                "или декомпозиции; Phase 2 пока не исполняет его автоматически. "
-                "Для Git-публикации используйте завершённую задачу и /push."
+                f"Тип {spec.task_type.value} требует отдельного привилегированного исполнителя; "
+                "используйте COMPOSITE с поддерживаемыми этапами или отдельный этап."
             )
             await self._block_task(task.id, reason)
             return await self.tasks.get(task.id)
+        if spec.task_type is TaskType.COMPOSITE:
+            if not spec.stages:
+                await self._block_task(task.id, "COMPOSITE не содержит этапов.")
+                return await self.tasks.get(task.id)
+            await self.stages.ensure(task.id, spec.stages)
+            await self.tasks.add_event(
+                task.id,
+                "composite-plan",
+                f"Сохранён план из {len(spec.stages)} этапов",
+                {"stages": [stage.model_dump() for stage in spec.stages]},
+            )
+            return task
         needs_approval = RiskLevel.HIGH in spec.required_permissions or spec.task_type in {
             TaskType.SYSTEM_OPERATION,
             TaskType.EXTERNAL_OPERATION,
@@ -718,6 +762,11 @@ class Orchestrator:
             return
         task = await self.tasks.transition(task_id, TaskStatus.RUNNING)
         await self.tasks.add_event(task_id, "running", "Работа началась")
+        if self._spec_for(task).task_type is TaskType.COMPOSITE:
+            await self._execute_composite(
+                task, project, project_context, manual_instruction=manual_instruction
+            )
+            return
         prepared = await self.workspace.prepare(task, project)
         dsh_home = self.settings.dsh_homes_dir / f"task-{task.id:04d}"
         dsh_home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -942,6 +991,788 @@ class Orchestrator:
             task = await self.tasks.get(task.id)
             resume = True
             manual_instruction = None
+
+    # ------------------------------------------------------------------
+    # COMPOSITE execution
+    # ------------------------------------------------------------------
+
+    async def _execute_composite(
+        self,
+        task: TaskRecord,
+        project: ProjectRecord,
+        project_context: str,
+        *,
+        manual_instruction: str | None,
+    ) -> None:
+        spec = self._spec_for(task)
+        if spec.task_type is not TaskType.COMPOSITE:
+            raise CompositeError("task is not composite")
+        if not spec.stages:
+            raise CompositeError("COMPOSITE task has no executable stages")
+        await self.stages.ensure(task.id, spec.stages)
+        if not task.worktree_path:
+            prepared = await self.workspace.prepare(task, project)
+            dsh_home = self.settings.dsh_homes_dir / f"task-{task.id:04d}"
+            dsh_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            task = await self.tasks.update_fields(
+                task.id,
+                worker_name="Composite",
+                worktree_path=prepared["worktree_path"],
+                branch=prepared["branch"],
+                base_ref=prepared["base_ref"],
+                base_commit=prepared["base_commit"],
+                dsh_home=str(dsh_home),
+            )
+        worktree = Path(task.worktree_path or "")
+        if not worktree.is_dir():
+            raise CompositeError("worktree не существует")
+        await self.stages.reset_running(task.id)
+        await self.stages.reset_waiting(task.id)
+        await self.stages.reset_failed(task.id)
+
+        if not task.head_commit:
+            task = await self.tasks.update_fields(
+                task.id, head_commit=(await git_output(worktree, "rev-parse", "HEAD")).strip()
+            )
+        await self.notifier.send_text(
+            self._chat_for_task(task),
+            f"Задача #{task.id:03d}: выполняю составной план из {len(spec.stages)} этапов.",
+            [[Button("Остановить", f"stop:{task.id}")]],
+        )
+
+        while True:
+            task = await self.tasks.get(task.id)
+            project = await self.projects.get(task.project_id) or project
+            if task.cancel_requested:
+                await self.stages.cancel_open(task.id)
+                await self._try_transition(task.id, TaskStatus.CANCELLED)
+                return
+            budget_error = await self._composite_budget_error(task, project, spec)
+            if budget_error:
+                await self._block_task(task.id, budget_error)
+                return
+            stages = await self.stages.list(task.id)
+            if any(stage.status is StageStatus.WAITING_APPROVAL for stage in stages):
+                # If the task is running, an approval was lost/expired; request it again.
+                await self.stages.reset_waiting(task.id)
+                stages = await self.stages.list(task.id)
+            if all(
+                stage.status in {StageStatus.COMPLETED, StageStatus.SKIPPED} for stage in stages
+            ):
+                await self._finalize_composite(task, project, spec, stages)
+                return
+            failed = [
+                stage
+                for stage in stages
+                if stage.status in {StageStatus.FAILED, StageStatus.BLOCKED}
+            ]
+            if failed:
+                await self._block_task(
+                    task.id,
+                    f"Этап {failed[0].stage_key} не выполнен: {failed[0].error or 'неизвестная причина'}",
+                )
+                return
+            completed = {
+                stage.stage_key
+                for stage in stages
+                if stage.status in {StageStatus.COMPLETED, StageStatus.SKIPPED}
+            }
+            ready = [
+                stage
+                for stage in stages
+                if stage.status in {StageStatus.PENDING, StageStatus.READY}
+                and all(dep in completed for dep in stage.depends_on)
+            ]
+            if not ready:
+                await self._block_task(
+                    task.id, "Нет готовых этапов: граф зависимостей не даёт прогресса."
+                )
+                return
+            stage = ready[0]
+            if stage.status is StageStatus.PENDING:
+                stage = await self.stages.set_status(stage.id, StageStatus.READY)
+            if self._stage_needs_approval(stage) and not stage.approval_granted:
+                await self._request_stage_approval(task, project, stage, worktree)
+                return
+            await self.stages.set_status(stage.id, StageStatus.RUNNING, increment_attempts=True)
+            await self.tasks.add_event(
+                task.id,
+                f"stage-{stage.stage_key}",
+                f"Этап {stage.stage_key} начат: {stage.goal}",
+                {"operation": stage.operation.value, "executor": stage.executor.value},
+                agent=stage.executor.value,
+                stage_id=stage.id,
+            )
+            await self.notifier.send_text(
+                self._chat_for_task(task),
+                f"Задача #{task.id:03d}: этап {stage.stage_key} ({stage.operation.value}) начат.",
+            )
+            try:
+                task = await self.tasks.get(task.id)
+                result = await self._dispatch_stage(
+                    task, project, stage, worktree, project_context, manual_instruction
+                )
+            except (
+                CompositeError,
+                StageError,
+                WorkspaceError,
+                GitOpsError,
+                GitHubError,
+                ConfigImportError,
+                WorkerError,
+            ) as exc:
+                stage = await self.stages.set_status(
+                    stage.id, StageStatus.FAILED, error=self.redactor.redact(str(exc))[:4000]
+                )
+                await self._block_task(
+                    task.id,
+                    f"Этап {stage.stage_key} не выполнен: {str(exc)[:2000]}",
+                )
+                return
+            stage = await self.stages.set_status(
+                stage.id,
+                StageStatus.COMPLETED,
+                result=result,
+                error=None,
+                approval_granted=False,
+            )
+            await self.tasks.add_event(
+                task.id,
+                f"stage-{stage.stage_key}",
+                f"Этап {stage.stage_key} завершён",
+                {"result": result},
+                agent=stage.executor.value,
+                stage_id=stage.id,
+            )
+            await self.notifier.send_text(
+                self._chat_for_task(task),
+                f"Задача #{task.id:03d}: этап {stage.stage_key} завершён.",
+            )
+
+    async def _composite_budget_error(
+        self, task: TaskRecord, project: ProjectRecord, spec: TaskSpec
+    ) -> str | None:
+        now = datetime.now(UTC)
+        limit_minutes = spec.max_minutes or self.settings.limits.max_task_minutes
+        deadline = (task.started_at or now).astimezone(UTC) + timedelta(minutes=limit_minutes)
+        if now >= deadline:
+            return "Превышен максимальный лимит времени составной задачи."
+        budget = spec.token_budget or project.token_budget
+        if budget > 0:
+            totals = await self.usage.task_totals(task.id)
+            if totals.total_tokens >= budget:
+                return f"Исчерпан token_budget задачи ({totals.total_tokens}/{budget})."
+        return None
+
+    @staticmethod
+    def _stage_needs_approval(stage: StageRecord) -> bool:
+        if RiskLevel.HIGH in stage.required_permissions:
+            return True
+        return stage.operation in {
+            StageOperation.IMPORT_CONFIG,
+            StageOperation.GITHUB_ENSURE_REPO,
+            StageOperation.PUBLISH,
+        }
+
+    @staticmethod
+    def _stage_approval_action(stage: StageRecord) -> Action:
+        return {
+            StageOperation.IMPORT_CONFIG: Action.CONFIG_IMPORT,
+            StageOperation.GITHUB_ENSURE_REPO: Action.GITHUB_REPOSITORY_CREATE,
+            StageOperation.PUBLISH: Action.GIT_PUSH,
+        }.get(stage.operation, Action.STAGE_APPROVAL)
+
+    async def _request_stage_approval(
+        self, task: TaskRecord, project: ProjectRecord, stage: StageRecord, worktree: Path
+    ) -> None:
+        action = self._stage_approval_action(stage)
+        payload: dict[str, Any] = {
+            "task_id": task.id,
+            "stage_id": stage.id,
+            "stage_key": stage.stage_key,
+            "project_id": project.id,
+            "operation": stage.operation.value,
+            "action": action.value,
+        }
+        details = [f"Задача #{task.id:03d}, этап {stage.stage_key}: {stage.goal}"]
+        try:
+            if stage.operation is StageOperation.IMPORT_CONFIG:
+                plan = await self.config_import.plan(
+                    project,
+                    await self._stage_import_source(project, stage),
+                    stage.destination or "",
+                    overwrite=stage.overwrite,
+                    target_root=worktree,
+                    allow_existing_identical=True,
+                )
+                payload.update(
+                    {
+                        "source": str(plan.source),
+                        "destination": str(plan.destination.relative_to(worktree)),
+                        "overwrite": plan.overwrite,
+                        "source_hash": plan.source_hash,
+                        "already_applied": plan.already_applied,
+                    }
+                )
+                details.append(
+                    f"Импорт: {plan.source} → {plan.destination.relative_to(worktree)} "
+                    f"({plan.file_count} файлов, {plan.total_bytes} байт)"
+                )
+            elif stage.operation is StageOperation.GITHUB_ENSURE_REPO:
+                if self.github is None:
+                    raise CompositeError("GITHUB_TOKEN не настроен")
+                owner = stage.repo_owner
+                if not owner:
+                    user = await self.github.authenticated_user()
+                    owner = str(user.get("login") or "")
+                    if not owner:
+                        raise CompositeError("GitHub не вернул имя пользователя")
+                    await self.stages.update(stage.id, repo_owner=owner)
+                    stage = await self.stages.get(stage.id)
+                payload.update(
+                    {
+                        "repo_owner": owner,
+                        "repo_name": stage.repo_name,
+                        "private": stage.private,
+                    }
+                )
+                details.append(f"GitHub: {owner}/{stage.repo_name}, private={stage.private}")
+            elif stage.operation is StageOperation.PUBLISH:
+                if not task.head_commit:
+                    raise CompositeError("нет коммита для публикации")
+                branch = stage.branch or project.base_branch
+                if not stage.merge and branch is None and task.branch:
+                    branch = task.branch
+                if not project.remote_url:
+                    raise CompositeError(
+                        "remote проекта не задан; сначала добавьте github_ensure_repo"
+                    )
+                actual_remote = await remote_url(Path(project.path), stage.remote)
+                validate_remote_url(actual_remote)
+                payload.update(
+                    {
+                        "remote": stage.remote,
+                        "branch": branch,
+                        "commit": task.head_commit,
+                        "remote_url": actual_remote,
+                        "merge": stage.merge,
+                    }
+                )
+                details.append(
+                    f"Публикация: {stage.remote}/{branch}, commit {task.head_commit[:12]}, "
+                    f"remote={actual_remote}, merge={stage.merge}"
+                )
+            else:
+                details.append(
+                    f"Операция: {stage.operation.value}, executor={stage.executor.value}"
+                )
+        except (CompositeError, ConfigImportError, GitOpsError, GitHubError, ProjectError) as exc:
+            await self._block_task(task.id, f"Подготовка этапа {stage.stage_key} невозможна: {exc}")
+            return
+        approval_id = await self.approvals.request(
+            action=action,
+            payload=payload,
+            created_by=self.settings.owner_id,
+            task_id=task.id,
+            ttl_seconds=900,
+        )
+        stage = await self.stages.set_status(
+            stage.id, StageStatus.WAITING_APPROVAL, approval_id=approval_id, approval_granted=False
+        )
+        await self._try_transition(task.id, TaskStatus.WAITING_APPROVAL)
+        await self.tasks.add_event(
+            task.id,
+            "stage-approval-requested",
+            f"Этап {stage.stage_key}: требуется подтверждение",
+            payload,
+            agent="orchestrator",
+            stage_id=stage.id,
+        )
+        await self.notifier.send_text(
+            self._chat_for_task(task),
+            f"Задача #{task.id:03d}: требуется подтверждение этапа {stage.stage_key}.\n"
+            + "\n".join(details)
+            + "\nПодтверждение привязано к указанному действию, репозиторию/ветке и коммиту.",
+            [
+                [
+                    Button("Разрешить один раз", f"apv:{approval_id}"),
+                    Button("Отклонить", f"rej:{approval_id}"),
+                ],
+                [
+                    Button("Показать diff", f"dif:{task.id}"),
+                    Button("Остановить", f"stop:{task.id}"),
+                ],
+            ],
+        )
+
+    async def _stage_binding_error(
+        self, task: TaskRecord, project: ProjectRecord, stage: StageRecord, payload: dict[str, Any]
+    ) -> str | None:
+        if stage.operation is StageOperation.IMPORT_CONFIG:
+            try:
+                plan = await self.config_import.plan(
+                    project,
+                    await self._stage_import_source(project, stage),
+                    stage.destination or "",
+                    overwrite=stage.overwrite,
+                    target_root=Path(task.worktree_path or ""),
+                    allow_existing_identical=True,
+                )
+            except ConfigImportError as exc:
+                return f"источник/назначение импорта изменились: {exc}"
+            if plan.source_hash != payload.get("source_hash"):
+                return "источник импорта изменился после запроса"
+            if str(plan.destination.relative_to(Path(task.worktree_path or ""))) != payload.get(
+                "destination"
+            ):
+                return "назначение импорта изменилось после запроса"
+        elif stage.operation is StageOperation.PUBLISH:
+            current_commit = task.head_commit or ""
+            if current_commit != payload.get("commit"):
+                return "коммит изменился после запроса на публикацию"
+            expected_branch = stage.branch or project.base_branch
+            if not stage.merge and not stage.branch and task.branch:
+                expected_branch = task.branch
+            if expected_branch != payload.get("branch"):
+                return "ветка публикации изменилась"
+            try:
+                actual = await remote_url(
+                    Path(project.path), str(payload.get("remote") or stage.remote)
+                )
+            except GitOpsError as exc:
+                return f"remote больше не настроен: {exc}"
+            if actual != payload.get("remote_url"):
+                return "remote URL изменился после запроса на публикацию"
+        elif stage.operation is StageOperation.GITHUB_ENSURE_REPO:
+            if stage.repo_name != payload.get("repo_name"):
+                return "имя GitHub-репозитория изменилось"
+            if stage.private != payload.get("private"):
+                return "видимость GitHub-репозитория изменилась"
+            if stage.repo_owner and stage.repo_owner != payload.get("repo_owner"):
+                return "владелец GitHub-репозитория изменился"
+        return None
+
+    async def _handle_stage_approval(
+        self,
+        task_id: int,
+        stage_id: int,
+        approval_id: int,
+        payload: dict[str, Any],
+        user_id: int,
+        chat_id: int,
+    ) -> None:
+        task = await self.tasks.get(task_id)
+        project = await self.projects.get(task.project_id)
+        stage = await self.stages.get(stage_id)
+        if project is None or stage.task_id != task.id:
+            await self.notifier.send_text(chat_id, "Этап/проект не найден.")
+            return
+        if stage.status is not StageStatus.WAITING_APPROVAL or stage.approval_id != approval_id:
+            await self.notifier.send_text(chat_id, "Это подтверждение больше не актуально.")
+            return
+        reason = await self._stage_binding_error(task, project, stage, payload)
+        if reason:
+            await self.stages.set_status(stage.id, StageStatus.BLOCKED, error=reason)
+            await self._block_task(
+                task.id, f"Подтверждение этапа {stage.stage_key} устарело: {reason}"
+            )
+            return
+        stage = await self.stages.set_status(
+            stage.id, StageStatus.READY, approval_granted=True, error=None
+        )
+        if not await self._try_transition(task.id, TaskStatus.QUEUED):
+            await self.notifier.send_text(chat_id, "Не удалось вернуть задачу в очередь.")
+            return
+        await self.tasks.reset_started_at(task.id)
+        await self.tasks.update_fields(task.id, cancel_requested=False)
+        await self.tasks.add_event(
+            task.id,
+            "stage-approved",
+            f"Этап {stage.stage_key} подтверждён",
+            payload,
+            agent="orchestrator",
+            stage_id=stage.id,
+        )
+        await self.notifier.send_text(
+            chat_id, f"Задача #{task.id:03d}: этап {stage.stage_key} подтверждён, продолжаю."
+        )
+        self._spawn_job(task.id, plan_if_needed=False, manual_instruction=None)
+
+    async def _handle_stage_rejection(
+        self, task_id: int, stage_id: int, reason: str, chat_id: int
+    ) -> None:
+        stage = await self.stages.get_optional(stage_id)
+        task = await self.tasks.get_optional(task_id)
+        if stage is None or task is None or stage.task_id != task.id:
+            return
+        if stage.status is StageStatus.WAITING_APPROVAL:
+            await self.stages.set_status(stage.id, StageStatus.BLOCKED, error=reason)
+        await self._block_task(task.id, f"Этап {stage.stage_key} отклонён владельцем: {reason}")
+        await self.notifier.send_text(
+            chat_id,
+            f"Задача #{task.id:03d}: этап {stage.stage_key} отклонён; завершённые этапы сохранены.",
+        )
+
+    async def _dispatch_stage(
+        self,
+        task: TaskRecord,
+        project: ProjectRecord,
+        stage: StageRecord,
+        worktree: Path,
+        project_context: str,
+        manual_instruction: str | None,
+    ) -> dict[str, Any]:
+        if stage.operation is StageOperation.IMPORT_CONFIG:
+            return await self._stage_import(task, project, stage, worktree)
+        if stage.operation is StageOperation.GIT_COMMIT:
+            return await self._stage_commit(task, stage, worktree)
+        if stage.operation is StageOperation.VALIDATE:
+            return await self._stage_validate(task, project, stage, worktree)
+        if stage.operation is StageOperation.GITHUB_ENSURE_REPO:
+            return await self._stage_github(task, project, stage)
+        if stage.operation is StageOperation.PUBLISH:
+            return await self._stage_publish(task, project, stage)
+        if stage.operation is StageOperation.KIMI_ANALYZE:
+            return await self._stage_kimi(task, project, stage, project_context, manual_instruction)
+        if stage.operation is StageOperation.DEEPSEEK_CHANGE:
+            return await self._stage_deepseek(
+                task, project, stage, project_context, manual_instruction
+            )
+        raise CompositeError(f"неизвестная операция этапа: {stage.operation.value}")
+
+    async def _stage_import_source(self, project: ProjectRecord, stage: StageRecord) -> str:
+        if stage.source:
+            return stage.source
+        return str(await self.config_import.discover(project, stage.goal))
+
+    async def _stage_import(
+        self, task: TaskRecord, project: ProjectRecord, stage: StageRecord, worktree: Path
+    ) -> dict[str, Any]:
+        plan = await self.config_import.plan(
+            project,
+            await self._stage_import_source(project, stage),
+            stage.destination or "",
+            overwrite=stage.overwrite,
+            target_root=worktree,
+            allow_existing_identical=True,
+        )
+        result = await self.config_import.execute(plan)
+        return {
+            "destination": str(plan.destination.relative_to(worktree)),
+            "files": result.files,
+            "bytes": result.total_bytes,
+            "already_applied": plan.already_applied,
+            "backup": result.backup,
+        }
+
+    async def _stage_commit(
+        self, task: TaskRecord, stage: StageRecord, worktree: Path
+    ) -> dict[str, Any]:
+        staged = await git(worktree, "add", "-A", timeout_seconds=60, check=False)
+        if staged.returncode != 0:
+            raise CompositeError(f"git add failed: {staged.stderr.strip()[:1000]}")
+        quiet = await git(worktree, "diff", "--cached", "--quiet", "HEAD", check=False)
+        changed = quiet.returncode != 0
+        if changed:
+            commit = await self.workspace.commit_changes(
+                task=task,
+                worktree=worktree,
+                changed=True,
+                message=stage.commit_message or None,
+            )
+        else:
+            commit = (await git_output(worktree, "rev-parse", "HEAD")).strip()
+        await self.tasks.update_fields(task.id, head_commit=commit)
+        return {"commit": commit, "changed": changed}
+
+    async def _stage_validate(
+        self, task: TaskRecord, project: ProjectRecord, stage: StageRecord, worktree: Path
+    ) -> dict[str, Any]:
+        spec = self._spec_for(task)
+        dsh_home = Path(task.dsh_home or self.settings.dsh_homes_dir / f"task-{task.id:04d}")
+        state_dir = self.settings.task_logs_dir / f"task-{task.id:04d}" / f"stage-{stage.stage_key}"
+        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        check_timeout = max(30.0, (spec.max_minutes or self.settings.limits.max_task_minutes) * 60)
+        evidence = await self.workspace.collect_evidence(
+            task=task,
+            project=project,
+            worktree=worktree,
+            dsh_home=dsh_home,
+            state_dir=state_dir,
+            worker=WorkerResult(
+                session_id=f"composite-{stage.stage_key}",
+                final_response="deterministic composite validation",
+                finish_reason="completed",
+                return_code=0,
+            ),
+            check_timeout_seconds=check_timeout,
+            diff_path=state_dir / "diff.patch",
+        )
+        failed = [check.name for check in evidence.checks if not check.passed]
+        if failed:
+            raise CompositeError("провалены проверки: " + ", ".join(failed))
+        if stage.require_change and not evidence.has_changes:
+            raise CompositeError("этап validate требует фактического изменения, diff пуст")
+        for name in evidence.changed_files:
+            allowed = any(
+                name == path or name.startswith(path.rstrip("/") + "/")
+                for path in stage.allowed_paths
+            )
+            if not allowed:
+                raise CompositeError(f"файл вне allowed_paths этапа: {name}")
+        await self.tasks.update_fields(
+            task.id,
+            evidence_json=evidence.model_dump_json(),
+            diff_path=str(state_dir / "diff.patch"),
+            head_commit=evidence.head_commit,
+        )
+        return {
+            "checks": [check.model_dump() for check in evidence.checks],
+            "changed_files": evidence.changed_files,
+            "head_commit": evidence.head_commit,
+        }
+
+    async def _stage_github(
+        self, task: TaskRecord, project: ProjectRecord, stage: StageRecord
+    ) -> dict[str, Any]:
+        if self.github is None:
+            raise CompositeError("GITHUB_TOKEN не настроен")
+        user = await self.github.authenticated_user()
+        login = str(user.get("login") or "")
+        if not login:
+            raise CompositeError("GitHub не вернул имя пользователя")
+        owner = stage.repo_owner or login
+        if not stage.repo_name:
+            raise CompositeError("repo_name не задан")
+        info = await self.github.repository_info(owner, stage.repo_name)
+        created = info is None
+        if info is None:
+            # The authenticated user's own repos use /user/repos; only a
+            # different owner is an organization endpoint.
+            org = None if owner == login else owner
+            info = await self.github.create_repository(
+                stage.repo_name, private=stage.private, owner=org
+            )
+        clone_url = str(info.get("clone_url") or "")
+        if not clone_url:
+            html = str(info.get("html_url") or "")
+            if html:
+                clone_url = html.rstrip("/") + ".git"
+        if not clone_url:
+            raise CompositeError("GitHub не вернул clone_url")
+        validate_remote_url(clone_url)
+        changed = await ensure_remote(Path(project.path), stage.remote, clone_url)
+        project = await self.projects.update_instructions(project.id, remote_url=clone_url)
+        return {
+            "repository": str(info.get("full_name") or f"{owner}/{stage.repo_name}"),
+            "clone_url": clone_url,
+            "created": created,
+            "remote": stage.remote,
+            "remote_changed": changed,
+        }
+
+    async def _stage_publish(
+        self, task: TaskRecord, project: ProjectRecord, stage: StageRecord
+    ) -> dict[str, Any]:
+        branch = stage.branch or project.base_branch
+        if not stage.merge and not stage.branch and task.branch:
+            branch = task.branch
+        if stage.merge:
+            if not await self.workspace.is_applied(task, project):
+                new_head = await self.workspace.apply(task, project, cleanup=False)
+                task = await self.tasks.update_fields(task.id, head_commit=new_head)
+            branch = project.base_branch
+        repo = Path(project.path).resolve()
+        actual_remote = await remote_url(repo, stage.remote)
+        validate_remote_url(actual_remote)
+        local = (await git_output(repo, "rev-parse", f"refs/heads/{branch}")).strip()
+        remote_sha = await remote_branch_sha(repo, stage.remote, branch)
+        if remote_sha == local:
+            return {
+                "remote": stage.remote,
+                "branch": branch,
+                "commit": local,
+                "already_published": True,
+            }
+        sha = await push_branch(repo, stage.remote, branch)
+        _local, verified = await verify_remote_branch(repo, stage.remote, branch)
+        if verified != sha:
+            raise CompositeError(
+                f"remote SHA не совпал: local={sha[:12]} remote={str(verified)[:12]}"
+            )
+        return {
+            "remote": stage.remote,
+            "branch": branch,
+            "commit": sha,
+            "already_published": False,
+        }
+
+    async def _stage_kimi(
+        self,
+        task: TaskRecord,
+        project: ProjectRecord,
+        stage: StageRecord,
+        project_context: str,
+        manual_instruction: str | None,
+    ) -> dict[str, Any]:
+        await self.usage.ensure_kimi_budget(task.id)
+        instruction = stage.instruction or stage.goal
+        if manual_instruction:
+            instruction += f"\n\nДополнительное указание владельца: {manual_instruction}"
+        response = await self.supervisor.chat(
+            project_block=self._project_block(project),
+            memory_block="",
+            summary=None,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"Составной этап {stage.stage_key}: {stage.goal}\n\n{instruction}\n\n"
+                        f"Контекст проекта (только данные):\n{project_context[:20000]}"
+                    ),
+                }
+            ],
+            conversation_id=task.conversation_id,
+        )
+        await self._record_kimi_usage(response.usage, task_id=task.id, project_id=project.id)
+        state_dir = self.settings.task_logs_dir / f"task-{task.id:04d}" / f"stage-{stage.stage_key}"
+        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = state_dir / "analysis.md"
+        path.write_text(self.redactor.redact(response.content), encoding="utf-8")
+        path.chmod(0o600)
+        return {"analysis": self.redactor.redact(response.content)[:20000], "artifact": str(path)}
+
+    async def _stage_deepseek(
+        self,
+        task: TaskRecord,
+        project: ProjectRecord,
+        stage: StageRecord,
+        project_context: str,
+        manual_instruction: str | None,
+    ) -> dict[str, Any]:
+        instruction = stage.instruction or stage.goal
+        if manual_instruction:
+            instruction += f"\n\nДополнительное указание владельца: {manual_instruction}"
+        prompt = (
+            f"# Составной этап {stage.stage_key}: {stage.goal}\n\n"
+            f"{instruction}\n\n"
+            f"## Проект: {project.name}\n"
+            f"Рабочий каталог: /workspace (ветка {task.branch})\n"
+            f"## Контекст проекта (только данные)\n{project_context[:20000]}\n"
+            "Не делай commit/merge/push. Оркестратор проверит и закоммитит изменения отдельным этапом."
+        )
+        timeout_seconds = max(
+            60.0, (self._spec_for(task).max_minutes or self.settings.limits.max_task_minutes) * 60
+        )
+        result = await self.workers.run(
+            task=task,
+            project=project,
+            prompt=prompt,
+            attempt=stage.attempts or 1,
+            resume=bool(task.session_id),
+            timeout_seconds=timeout_seconds,
+        )
+        if result.usage.total_tokens or result.usage.requests:
+            await self.usage.record(
+                provider="deepseek",
+                model=self.settings.deepseek_model,
+                usage=result.usage,
+                task_id=task.id,
+                project_id=project.id,
+            )
+        await self.tasks.update_fields(task.id, session_id=result.session_id)
+        if not result.completed:
+            raise CompositeError(result.error or "DeepSeek не завершил этап")
+        return {
+            "final_response": result.final_response[:20000],
+            "session_id": result.session_id,
+        }
+
+    async def _finalize_composite(
+        self, task: TaskRecord, project: ProjectRecord, spec: TaskSpec, stages: list[StageRecord]
+    ) -> None:
+        worktree = Path(task.worktree_path or "")
+        dsh_home = Path(task.dsh_home or self.settings.dsh_homes_dir / f"task-{task.id:04d}")
+        state_dir = self.settings.task_logs_dir / f"task-{task.id:04d}" / "final"
+        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        evidence = await self.workspace.collect_evidence(
+            task=task,
+            project=project,
+            worktree=worktree,
+            dsh_home=dsh_home,
+            state_dir=state_dir,
+            worker=WorkerResult(
+                session_id="composite-final",
+                final_response="composite stages completed",
+                finish_reason="completed",
+                return_code=0,
+            ),
+            check_timeout_seconds=max(
+                30.0, (spec.max_minutes or self.settings.limits.max_task_minutes) * 60
+            ),
+            diff_path=state_dir / "diff.patch",
+        )
+        if evidence.has_changes:
+            head = await self.workspace.commit_changes(
+                task=task,
+                worktree=worktree,
+                changed=True,
+                message=f"{self.settings.git.commit_prefix}: composite task {task.id:04d}",
+            )
+            evidence = evidence.model_copy(update={"head_commit": head})
+            task = await self.tasks.update_fields(task.id, head_commit=head)
+        validation_spec = spec.model_copy(update={"requires_file_changes": False})
+        validation = TaskValidator.validate(
+            spec=validation_spec, evidence=evidence, worktree=worktree
+        )
+        if validation.status != "pass":
+            detail = "; ".join(issue.evidence or issue.criterion for issue in validation.issues)
+            await self._block_task(task.id, f"Финальная проверка не пройдена: {detail}")
+            return
+        review = ReviewResult(
+            verdict=ReviewVerdict.APPROVED,
+            summary="Все этапы COMPOSITE завершены; детерминированная проверка пройдена.",
+        )
+        task = await self.tasks.update_fields(
+            task.id,
+            evidence_json=evidence.model_dump_json(),
+            review_json=review.model_dump_json(),
+            head_commit=evidence.head_commit,
+        )
+        if not await self._try_transition(task.id, TaskStatus.COMPLETED):
+            await self._block_task(task.id, "Не удалось завершить составную задачу.")
+            return
+        task = await self.tasks.get(task.id)
+        usage_totals = await self.usage.by_provider(task_id=task.id)
+        report = build_report(
+            task=task,
+            project_name=project.name,
+            spec=validation_spec,
+            evidence=evidence,
+            review=review,
+            usage_service=self.usage,
+            usage_totals=usage_totals,
+            final_status=TaskStatus.COMPLETED,
+        )
+        report += "\n\n## Этапы\n" + "\n".join(
+            f"- {stage.stage_key}: {stage.status.value} — {stage.goal[:160]}" for stage in stages
+        )
+        await self.tasks.update_fields(task.id, report=report)
+        await self.tasks.add_event(
+            task.id,
+            "composite-completed",
+            "Составная задача завершена",
+            {"stages": [stage.stage_key for stage in stages]},
+            agent="orchestrator",
+        )
+        await self._maybe_usage_warning(task.id)
+        await self._send_long(self._chat_for_task(task), report)
+        await self.conversations.add_message(
+            task.conversation_id,
+            "assistant",
+            report,
+            meta={"task_id": task.id, "kind": "composite-report", "status": "completed"},
+        )
 
     def _max_attempts(self, task: TaskRecord) -> int:
         spec = self._spec_for(task)
@@ -1173,6 +2004,7 @@ class Orchestrator:
             TaskStatus.BLOCKED,
             TaskStatus.RETRY_WAIT,
             TaskStatus.WAITING_INPUT,
+            TaskStatus.WAITING_APPROVAL,
         }:
             await self.notifier.send_text(
                 chat_id,
@@ -1257,6 +2089,7 @@ class Orchestrator:
             or job is None
         ):
             await self.workers.cancel(task.id)
+            await self.stages.cancel_open(task.id)
             await self._try_transition(task.id, TaskStatus.CANCELLED)
             await self.notifier.send_text(
                 chat_id,
@@ -1456,6 +2289,16 @@ class Orchestrator:
             await self.notifier.send_text(chat_id, f"Подтверждение отклонено: {exc}")
             return
         action = Action(approval["action"])
+        if payload.get("stage_id"):
+            await self._handle_stage_approval(
+                int(payload["task_id"]),
+                int(payload["stage_id"]),
+                approval_id,
+                payload,
+                user_id,
+                chat_id,
+            )
+            return
         if action is Action.ROLLBACK:
             task_id = int(payload["task_id"])
             task = await self.tasks.get(task_id)
@@ -1594,7 +2437,21 @@ class Orchestrator:
     async def reject_action(self, approval_id: int, user_id: int, chat_id: int) -> None:
         self._assert_owner(user_id)
         self._assert_owner_chat(chat_id)
+        pending = await self.approvals.get(approval_id)
         changed = await self.approvals.reject_pending(approval_id, user_id=user_id)
+        if changed and pending and pending.get("payload_json"):
+            try:
+                payload = json.loads(pending["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if isinstance(payload, dict) and payload.get("stage_id"):
+                await self._handle_stage_rejection(
+                    int(payload["task_id"]),
+                    int(payload["stage_id"]),
+                    "rejected by owner",
+                    chat_id,
+                )
+                return
         await self.notifier.send_text(
             chat_id,
             "Подтверждение отклонено."
@@ -1709,6 +2566,11 @@ class Orchestrator:
             await self.tasks.transition(task.id, target)
         except (TransitionError, TaskError):
             logger.warning("could not record cancellation for task #%s", task.id)
+        if task.task_type is TaskType.COMPOSITE:
+            if target is TaskStatus.PAUSED:
+                await self.stages.reset_running(task.id)
+            else:
+                await self.stages.cancel_open(task.id)
         await self.tasks.add_event(
             task.id,
             "cancelled" if target is TaskStatus.CANCELLED else "interrupted",
@@ -2101,6 +2963,10 @@ class Orchestrator:
         lines.append(f"DSH SDK: {sdk}")
         lines.append(f"bubblewrap: {shutil.which('bwrap') or 'MISSING'}")
         lines.append(f"Git: {shutil.which('git') or 'MISSING'}")
+        lines.append(
+            f"Egress: {'enabled' if self.settings.egress.enabled else 'disabled'}; "
+            f"hosts={','.join(self.settings.egress.allowed_hosts) or '(derived)'}"
+        )
         lines.append(
             f"DB: {self.settings.db_path}; FTS5={getattr(self.usage.db, 'fts_available', '?')}"
         )

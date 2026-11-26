@@ -69,7 +69,8 @@ async def test_real_dsh_worker_in_bwrap(monkeypatch, settings, repo, database, p
     assert sockets
     port = sockets[0].getsockname()[1]
     try:
-        monkeypatch.setenv("DEEPSEEK_BASE_URL", f"http://127.0.0.1:{port}/v1")
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", f"http://127.0.0.1.nip.io:{port}/v1")
+        settings.egress.allowed_ports = [port, 80, 443]
         settings.secrets.deepseek_api_key = SecretStr("integration-placeholder")
         sandbox = BwrapSandbox(settings)
         await sandbox.check_available()
@@ -105,7 +106,7 @@ async def test_real_dsh_worker_in_bwrap(monkeypatch, settings, repo, database, p
             resume=False,
             timeout_seconds=180,
         )
-        assert result.completed
+        assert result.completed, result.error
         assert result.finish_reason == "completed"
         assert result.final_response
         assert result.usage.input_tokens >= 42
@@ -212,7 +213,8 @@ async def test_real_dsh_tool_edits_worktree(monkeypatch, settings, repo, databas
     assert sockets
     port = sockets[0].getsockname()[1]
     try:
-        monkeypatch.setenv("DEEPSEEK_BASE_URL", f"http://127.0.0.1:{port}/v1")
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", f"http://127.0.0.1.nip.io:{port}/v1")
+        settings.egress.allowed_ports = [port, 80, 443]
         settings.secrets.deepseek_api_key = SecretStr("integration-placeholder")
         sandbox = BwrapSandbox(settings)
         await sandbox.check_available()
@@ -248,7 +250,7 @@ async def test_real_dsh_tool_edits_worktree(monkeypatch, settings, repo, databas
             resume=False,
             timeout_seconds=180,
         )
-        assert result.completed
+        assert result.completed, result.error
         worktree = Path(prepared["worktree_path"])
         assert "from dsh tool" in (worktree / "README.md").read_text()
         assert requests >= 2

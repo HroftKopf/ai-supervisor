@@ -48,6 +48,7 @@ class Action(StrEnum):
     GIT_REMOTE_CHANGE = "git_remote_change"
     GITHUB_REPOSITORY_CREATE = "github_repository_create"
     CONFIG_IMPORT = "config_import"
+    STAGE_APPROVAL = "stage_approval"
     BYPASS_PERMISSIONS = "bypass_permissions"
     EXPAND_OWN_PERMISSIONS = "expand_own_permissions"
     READ_OTHER_SECRETS = "read_other_secrets"
@@ -77,6 +78,7 @@ RISK_LEVELS: dict[Action, RiskLevel] = {
     Action.GIT_REMOTE_CHANGE: RiskLevel.HIGH,
     Action.GITHUB_REPOSITORY_CREATE: RiskLevel.HIGH,
     Action.CONFIG_IMPORT: RiskLevel.HIGH,
+    Action.STAGE_APPROVAL: RiskLevel.HIGH,
     Action.DELETE_IMPORTANT_DATA: RiskLevel.HIGH,
     Action.SEND_SECRET_EXTERNALLY: RiskLevel.HIGH,
     Action.DESTRUCTIVE_COMMAND: RiskLevel.HIGH,
@@ -114,6 +116,7 @@ LEVELS: dict[Action, PermissionLevel] = {
     Action.GIT_REMOTE_CHANGE: PermissionLevel.APPROVAL_REQUIRED,
     Action.GITHUB_REPOSITORY_CREATE: PermissionLevel.APPROVAL_REQUIRED,
     Action.CONFIG_IMPORT: PermissionLevel.APPROVAL_REQUIRED,
+    Action.STAGE_APPROVAL: PermissionLevel.APPROVAL_REQUIRED,
     Action.BYPASS_PERMISSIONS: PermissionLevel.DENIED,
     Action.EXPAND_OWN_PERMISSIONS: PermissionLevel.DENIED,
     Action.READ_OTHER_SECRETS: PermissionLevel.DENIED,
@@ -278,6 +281,10 @@ class ApprovalService:
             if not isinstance(payload, dict):
                 raise ApprovalError("повреждён payload подтверждения")
             return {"id": approval_id, "action": data["action"], "payload": payload}
+
+    async def get(self, approval_id: int) -> dict[str, Any] | None:
+        row = await self.db.fetchone("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+        return row_to_dict(row)
 
     async def reject_pending(self, approval_id: int, *, user_id: int) -> bool:
         cursor = await self.db.execute(

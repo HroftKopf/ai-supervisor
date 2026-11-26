@@ -32,6 +32,7 @@ class AppSection(BaseModel):
     timezone: str = "Europe/Moscow"
     log_level: str = "INFO"
     task_log_retention_days: int = Field(default=14, ge=1, le=3650)
+    auto_resume_composite: bool = True
 
     @field_validator("log_level")
     @classmethod
@@ -138,6 +139,25 @@ class SandboxSection(BaseModel):
     cpu_seconds_per_worker: int = Field(default=3000, ge=10, le=86400)
     max_open_files: int = Field(default=1024, ge=64, le=65536)
     max_processes: int = Field(default=1024, ge=32, le=65536)
+
+
+class EgressSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = True
+    allowed_hosts: list[str] = Field(default_factory=list, max_length=50)
+    max_connections: int = Field(default=32, ge=1, le=256)
+    allowed_ports: list[int] = Field(default_factory=lambda: [80, 443], max_length=10)
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def _hosts(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for item in value:
+            item = item.strip().lower()
+            if not item or any(ch.isspace() for ch in item):
+                raise ValueError("egress host must be a hostname without spaces")
+            cleaned.append(item)
+        return cleaned
 
 
 class GitSection(BaseModel):
@@ -260,6 +280,7 @@ class Settings(BaseModel):
     telegram: TelegramSection
     security: SecuritySection
     github: GitHubSection
+    egress: EgressSection
     limits: LimitsSection
     deepseek: DeepSeekSection
     sandbox: SandboxSection
@@ -429,6 +450,11 @@ class Settings(BaseModel):
             },
             "limits": self.limits.model_dump(),
             "sandbox": self.sandbox.model_dump(),
+            "egress": {
+                "enabled": self.egress.enabled,
+                "allowed_hosts": self.egress.allowed_hosts,
+                "allowed_ports": self.egress.allowed_ports,
+            },
             "data_dir": str(self.data_dir),
             "prices_configured": self.usage.configured,
         }
@@ -541,6 +567,7 @@ def load_settings(
         "sandbox",
         "git",
         "github",
+        "egress",
         "memory",
         "usage",
     }
@@ -560,6 +587,7 @@ def load_settings(
             telegram=TelegramSection.model_validate(raw.get("telegram", {})),
             security=SecuritySection.model_validate(raw.get("security", {})),
             github=GitHubSection.model_validate(raw.get("github", {})),
+            egress=EgressSection.model_validate(raw.get("egress", {})),
             limits=LimitsSection.model_validate(raw.get("limits", {})),
             deepseek=DeepSeekSection.model_validate(deepseek),
             sandbox=SandboxSection.model_validate(raw.get("sandbox", {})),

@@ -20,9 +20,9 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 | Проверка | Результат |
 |---|---|
 | `ruff check .` | все проверки пройдены |
-| `pytest -q` | **65 passed, 3 skipped** |
+| `pytest -q` | **76 passed, 4 skipped** |
 | `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py` | **2 passed** |
-| `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py` | **1 passed** |
+| `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py` | **2 passed** |
 | bwrap probe | OK (user namespaces, read-only `/usr`) |
 | DSH runtime `sdk-minimal` init | OK |
 | Реальный DSH turn через mock Messages API | `completed`, usage input=42 output=7 cached=3 requests=1 |
@@ -43,15 +43,21 @@ AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 - Оркестратор: chat не создаёт задачу; задача проходит plan → worker → diff → review →
   waiting_approval → accept → merge; пустой diff не принимается; лимит доработок; stop;
   запрет второй задачи при ожидании принятия.
-- bwrap probe и отказ от неизвестного sandbox backend.
+- bwrap probe и отказ от неизвестного sandbox backend; worker netns + egress socket.
+- Egress proxy: allowlisted CONNECT, отказ неизвестному host.
+- COMPOSITE: граф/циклы, маршрутизация executor, approvals, reject, повтор, no-op import,
+  auto-discovery Niri, mock GitHub + bare remote, сохранение completed этапов.
+- SQLite v3 `task_stages`, миграция v1→v3 с backup.
 
 ### Что не проверено живьём
 
 - реальный Telegram `getMe`/long polling/кнопки;
-- реальный платный DeepSeek endpoint (вместо него — локальный Messages-совместимый mock).
+- реальный платный DeepSeek endpoint (вместо него — локальный Messages-совместимый mock);
+- реальная публикация пользовательских файлов на GitHub (использован mock API и временный
+  bare remote).
 
-Kimi API проверен живьём через `AI_SUPERVISOR_RUN_LIVE_KIMI=1` (chat/classify/plan v2/review),
-включая `tool_choice=required` и структурное ревью.
+Kimi API проверен живьём через `AI_SUPERVISOR_RUN_LIVE_KIMI=1` (chat/classify/plan v2/review
+и composite Niri plan), включая `tool_choice=required` и структурное ревью.
 Telegram-проверку нужно выполнить после настройки и запуска бота:
 
 ```bash
@@ -76,7 +82,7 @@ AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest -q tests/test_kimi_live.py -s
 ```bash
 python scripts/mock_deepseek_api.py --port 8765 &
 export DEEPSEEK_API_KEY=test
-export DEEPSEEK_BASE_URL=http://127.0.0.1:8765/v1
+export DEEPSEEK_BASE_URL=http://127.0.0.1.nip.io:8765/v1
 AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
 ```
 

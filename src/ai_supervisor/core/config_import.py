@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import uuid
@@ -40,6 +41,7 @@ class ImportPlan:
     source_hash: str
     files: tuple[ImportedFile, ...]
     total_bytes: int
+    already_applied: bool = False
 
     @property
     def file_count(self) -> int:
@@ -68,10 +70,21 @@ class ConfigImportService:
         destination_raw: str,
         *,
         overwrite: bool = False,
+        target_root: Path | None = None,
+        allow_existing_identical: bool = False,
     ) -> ImportPlan:
         return await asyncio.to_thread(
-            self._plan_sync, project, source_raw, destination_raw, overwrite
+            self._plan_sync,
+            project,
+            source_raw,
+            destination_raw,
+            overwrite,
+            target_root,
+            allow_existing_identical,
         )
+
+    async def discover(self, project: ProjectRecord, query: str) -> Path:
+        return await asyncio.to_thread(self._discover_sync, project, query)
 
     async def execute(self, plan: ImportPlan) -> ImportResult:
         return await asyncio.to_thread(self._execute_sync, plan)
@@ -86,22 +99,31 @@ class ConfigImportService:
         source_raw: str,
         destination_raw: str,
         overwrite: bool,
+        target_root: Path | None,
+        allow_existing_identical: bool,
     ) -> ImportPlan:
-        project_root = Path(project.path).resolve(strict=True)
+        project_root = (target_root or Path(project.path)).resolve(strict=True)
         source = self._resolve_source(project, source_raw)
         destination = self._resolve_destination(project_root, destination_raw)
-        if destination.exists() and not overwrite:
-            raise ConfigImportError(
-                f"destination already exists: {destination}; use --overwrite after reviewing it"
-            )
-        if destination.exists():
-            if source.is_dir() != destination.is_dir():
-                raise ConfigImportError("source and destination types differ")
         files = self._scan_source(source)
         total = sum(item.size for item in files)
         if total > MAX_BYTES:
             raise ConfigImportError(f"import is too large: {total} bytes > {MAX_BYTES}")
         digest = self._hash_files(source, files)
+        already_applied = False
+        if destination.exists():
+            if source.is_dir() != destination.is_dir():
+                raise ConfigImportError("source and destination types differ")
+            if (
+                not overwrite
+                and allow_existing_identical
+                and self._matches(source, destination, files)
+            ):
+                already_applied = True
+            elif not overwrite:
+                raise ConfigImportError(
+                    f"destination already exists: {destination}; use --overwrite after reviewing it"
+                )
         return ImportPlan(
             project_id=project.id,
             source=source,
@@ -110,7 +132,98 @@ class ConfigImportService:
             source_hash=digest,
             files=tuple(files),
             total_bytes=total,
+            already_applied=already_applied,
         )
+
+    def _discover_sync(self, project: ProjectRecord, raw_query: str) -> Path:
+        stopwords = {
+            "import",
+            "imports",
+            "config",
+            "configuration",
+            "file",
+            "files",
+            "copy",
+            "github",
+            "project",
+            "the",
+            "and",
+            "to",
+            "my",
+            "импорт",
+            "импортировать",
+            "конфигурация",
+            "конфигурацию",
+            "файл",
+            "файлы",
+            "скопировать",
+            "залей",
+            "мою",
+            "мой",
+            "проект",
+            "на",
+            "в",
+            "и",
+        }
+        terms = [
+            term
+            for term in re.findall(r"[a-zа-я0-9._-]{3,}", raw_query.lower())
+            if term not in stopwords
+        ]
+        if not terms:
+            raise ConfigImportError("не указан источник конфигурации и нет запроса для поиска")
+        roots = self._allowed_roots(project)
+        if not roots:
+            raise ConfigImportError(
+                "project has no extra_read_paths; configure /project extra-read first"
+            )
+        candidates: list[Path] = []
+        for root in roots:
+            if root.is_file():
+                if any(term in root.name.lower() for term in terms):
+                    candidates.append(root)
+                continue
+            if any(term in root.name.lower() for term in terms) and not (root / ".git").exists():
+                candidates.append(root)
+                continue
+            for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+                depth = len(Path(dirpath).relative_to(root).parts)
+                if depth >= 5:
+                    dirnames[:] = []
+                    continue
+                for name in list(dirnames):
+                    if name.startswith("."):
+                        continue
+                    path = Path(dirpath) / name
+                    if (
+                        any(term in name.lower() for term in terms)
+                        and path.is_dir()
+                        and not path.is_symlink()
+                        and not (path / ".git").exists()
+                    ):
+                        candidates.append(path)
+                for name in filenames:
+                    if name.startswith("."):
+                        continue
+                    path = Path(dirpath) / name
+                    if any(term in name.lower() for term in terms) and path.is_file():
+                        candidates.append(path)
+                dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+        unique = sorted({path.resolve() for path in candidates})
+        if not unique:
+            raise ConfigImportError(
+                f"конфигурация по запросу {raw_query!r} не найдена в extra_read_paths"
+            )
+        # Prefer a directory over its matched children.
+        unique = [
+            path
+            for path in unique
+            if not any(parent != path and path.is_relative_to(parent) for parent in unique)
+        ]
+        if len(unique) != 1:
+            preview = ", ".join(str(path) for path in unique[:8])
+            raise ConfigImportError(f"найдено несколько кандидатов: {preview}")
+        return unique[0]
 
     def _resolve_source(self, project: ProjectRecord, source_raw: str) -> Path:
         raw = (source_raw or "").strip()
@@ -234,6 +347,23 @@ class ConfigImportService:
             digest.update(b"\0")
         return digest.hexdigest()
 
+    @staticmethod
+    def _matches(source: Path, destination: Path, files: list[ImportedFile]) -> bool:
+        try:
+            if source.is_file() != destination.is_file():
+                return False
+            if source.is_file():
+                return source.read_bytes() == destination.read_bytes()
+            for item in files:
+                target = destination / item.relative_path
+                if not target.is_file() or target.is_symlink():
+                    return False
+                if (source / item.relative_path).read_bytes() != target.read_bytes():
+                    return False
+            return True
+        except OSError:
+            return False
+
     def _execute_sync(self, plan: ImportPlan) -> ImportResult:
         source = plan.source
         destination = plan.destination
@@ -242,6 +372,15 @@ class ConfigImportService:
         current_files = self._scan_source(source)
         if self._hash_files(source, current_files) != plan.source_hash:
             raise ConfigImportError("source changed after approval; request a new import")
+        if plan.already_applied:
+            if not self._matches(source, destination, current_files):
+                raise ConfigImportError("destination changed after approval; request a new import")
+            return ImportResult(
+                destination=str(destination),
+                files=plan.file_count,
+                total_bytes=plan.total_bytes,
+                backup=None,
+            )
         if destination.exists() and not plan.overwrite:
             raise ConfigImportError("destination appeared after approval; refusing to overwrite")
         if destination.exists() and source.is_dir() != destination.is_dir():

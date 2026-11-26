@@ -1,5 +1,8 @@
 # Phase 2 — модернизация ядра
 
+> Phase 2.5 добавляет исполняемые COMPOSITE-этапы и egress; актуальные результаты см.
+> [PHASE2_5.md](PHASE2_5.md). Ниже — историческая граница Phase 2 core.
+
 Этот этап расширяет Phase 1, не переписывая bwrap, DSH worker runner, SQLite/FTS и owner-auth.
 Реализована безопасная основа для универсальных задач; полная декомпозиция/routing/GitHub API
 вынесены дальше и явно перечислены в конце.
@@ -26,9 +29,9 @@
 - EXECUTE: успешность определяется проверками/exit codes; отсутствие проверок помечается
   как «не проверено», а не «тесты прошли».
 - GIT_OPERATION: проверяется состояние Git; публикация — отдельным approval `/push`.
-- SYSTEM_OPERATION/EXTERNAL_OPERATION/COMPOSITE: пока **fail-closed** (BLOCKED), так как
-  привилегированный исполнитель/декомпозиция ещё не реализованы. Это предотвращает ложный
-  успех при отсутствии фактического изменения системы.
+- SYSTEM_OPERATION/EXTERNAL_OPERATION: пока **fail-closed** (BLOCKED), так как
+  привилегированный исполнитель ещё не реализован. COMPOSITE в Phase 2.5 исполняется
+  через этапы; см. [PHASE2_5.md](PHASE2_5.md).
 - Проверяются `allowed_paths`, expected artifacts, worker completion и настроенные проверки.
 
 ### Жизненный цикл
@@ -96,16 +99,16 @@ Kimi возвращает `approved` / `rework_required` / `approval_required` /
 
 ### Миграции
 
-`Database` версионирует схему, делает backup перед v1→v2, добавляет колонки транзакционно,
+`Database` версионирует схему, делает backup перед миграцией (v1/v2→v3), добавляет колонки транзакционно,
 отказывается открывать БД новее поддерживаемой версии. Тест `tests/test_migrations.py`.
 
 ## Что проверено
 
-- `pytest`: 65 passed, 3 skipped.
+- `pytest`: 76 passed, 4 skipped.
 - `ruff check`: без ошибок.
 - Реальный DSH runtime в bwrap: 2 integration tests passed (включая bash tool call).
 - Живой Kimi API: chat/classify/plan v2/review — passed.
-- Миграция копии рабочей БД v1→v2 с backup — passed, 2 historical tasks сохранены.
+- Миграция копии рабочей БД v1/v2→v3 с backup — passed, 2 historical tasks сохранены.
 - Merge idempotence и approved Git push в локальный bare remote — tests.
 - Config import: file/dir, backup при overwrite, secret scan, traversal/symlink rejection,
   source hash после approval — tests.
@@ -115,10 +118,8 @@ Kimi возвращает `approved` / `rework_required` / `approval_required` /
 
 ## Ограничения
 
-См. раздел README «Что ещё не реализовано в Phase 2»:
-COMPOSITE/DAG, routing, продвинутые GitHub PR/checks, system/external executor,
-JSON-correlated logs/event retention. Базовые `/github info|create`
-и Git push реализованы. Worker network остаётся общей (egress allowlist — следующий этап).
+Актуальные ограничения Phase 2.5: [PHASE2_5.md](PHASE2_5.md).
+Исторически Phase 2 core не исполнял COMPOSITE и не имел egress; сейчас это реализовано.
 
 ## Перезапуск после обновления
 
@@ -139,6 +140,6 @@ journalctl --user -u ai-supervisor.service -f
 scripts/backup.sh
 ```
 
-При старте будет создан backup `var/backups/pre-migration-v2-*.db`, затем схема обновится.
+При старте будет создан backup `var/backups/pre-migration-v3-*.db`, затем схема обновится.
 Проверьте после рестарта: `/doctor`, `/queue`, обычный вопрос Kimi, небольшую READ_ONLY задачу
 (должна завершиться без diff), затем MODIFY-задачу и `/push` при наличии remote.

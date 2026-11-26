@@ -112,3 +112,58 @@ async def test_live_kimi_chat_classify_plan_review() -> None:
         print("live review:", review.verdict.value, review.summary[:120].replace("\n", " "))
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_live_kimi_builds_composite_niri_plan() -> None:
+    settings = load_settings()
+    if not settings.kimi_key:
+        pytest.skip("KIMI_API_KEY is not configured")
+    redactor = SecretRedactor.from_settings(settings)
+    client = KimiClient(
+        KimiClientConfig(
+            api_key=settings.kimi_key,
+            base_url=settings.kimi.base_url,
+            model=settings.kimi.model,
+            reasoning_effort=settings.kimi.reasoning_effort,
+            max_completion_tokens=settings.kimi.max_completion_tokens,
+            request_timeout_seconds=settings.kimi.request_timeout_seconds,
+            max_retries=0,
+            max_concurrent_requests=1,
+        ),
+        redactor,
+    )
+    try:
+        supervisor = SupervisorAgent(client, settings, redactor)
+        spec, _ = await supervisor.plan(
+            project_block=(
+                "name: niri-config\n"
+                "path: /tmp/niri-project\n"
+                "description: конфигурация Niri\n"
+                "stack: config\n"
+                "base_branch: main\n"
+                "instructions: (нет)\n"
+                'extra_read_paths: ["/tmp/niri"]'
+            ),
+            conversation_block="Пользователь: залей мою конфигурацию Niri на GitHub",
+            memory_block="",
+            project_context="niri/config.kdl: layout {}\n",
+            latest_user_message="Залей мою конфигурацию Niri на GitHub.",
+            conversation_id=900002,
+        )
+        assert spec.task_type.value == "composite"
+        assert spec.stages
+        assert any(stage.operation.value == "import_config" for stage in spec.stages)
+        assert any(stage.operation.value == "publish" for stage in spec.stages)
+        for stage in spec.stages:
+            assert stage.executor.value in {
+                "python",
+                "git",
+                "github",
+                "validator",
+                "kimi",
+                "deepseek",
+            }
+        print("live composite:", [(s.id, s.operation.value) for s in spec.stages])
+    finally:
+        await client.close()

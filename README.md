@@ -4,12 +4,12 @@
 **Kimi K3.1 Pro** — технический руководитель и ревьюер, **DeepSeek Harness** — исполнитель,
 **Python-оркестратор** — управляющая инфраструктура.
 
-> Статус: **Phase 1 + Phase 2 core**. Добавлены типы задач, контракт v2, новые состояния,
-> детерминированная проверка по типу задачи, структурное ревью, progress detection, миграции,
-> политики/подтверждения, per-model usage и Git push. Живые сценарии Kimi API проверены;
-> Telegram Bot API и платный DeepSeek endpoint ещё не проверялись. Часть требований
-> (полная декомпозиция, routing, GitHub API, system/external executor) вынесена в следующий
-> этап и явно перечислена в [«Известных ограничениях»](#известные-ограничения-phase-2).
+> Статус: **Phase 2.5**. Добавлены исполняемые COMPOSITE-этапы с DAG, детерминированная
+> маршрутизация операций, сохраняемое состояние этапов, автоматическое продолжение после
+> approvals, идемпотентные импорт/GitHub/push и сетевая изоляция worker через allowlist-proxy.
+> Живые сценарии Kimi API и реальный DSH в bwrap проверены; Telegram Bot API и реальная
+> публикация пользовательских файлов на GitHub не проверялись. Ограничения явно перечислены
+> в [«Известных ограничениях»](#известные-ограничения-phase-2-5).
 > Система не заявляет о непроверенных функциях как о работающих.
 
 ---
@@ -21,7 +21,11 @@
 - Формирование ТЗ v2 инструментом `submit_task_spec`: тип задачи, область, разрешённые пути,
   инструменты, полномочия, артефакты, бюджеты, критерии; `reasoning_content` сохраняется.
 - Типы задач: `READ_ONLY`, `MODIFY`, `GIT_OPERATION`, `EXECUTE`, `SYSTEM_OPERATION`,
-  `EXTERNAL_OPERATION`, `COMPOSITE`. Небезопасные/нереализованные типы fail-closed.
+  `EXTERNAL_OPERATION`, `COMPOSITE`. `COMPOSITE` исполняется как граф этапов; SYSTEM/EXTERNAL
+  без поддерживаемого этапа fail-closed.
+- COMPOSITE-этапы: `import_config`, `git_commit`, `validate`, `github_ensure_repo`, `publish`,
+  `kimi_analyze`, `deepseek_change`; уникальные id, зависимости, исполнитель, полномочия,
+  критерии, входы/выходы и статус хранятся в SQLite (`task_stages`, schema v3).
 - Изолированный git worktree на задачу, отдельная ветка, коммит оркестратора, накопительный diff
   от base commit (включая коммиты предыдущих попыток).
 - DeepSeek Harness через официальный Python SDK (`deepseek-harness-sdk==0.2.2rc2`),
@@ -37,17 +41,25 @@
 - Progress detection: одинаковый diff/проверки/замечания останавливают цикл как `BLOCKED`,
   а не бесконечно дорабатывают.
 - Новые состояния: `VALIDATING`, `WAITING_INPUT`, `RETRY_WAIT`, `PARTIALLY_COMPLETED`, `BLOCKED`;
-  миграции SQLite v1→v2 с backup.
+  миграции SQLite v1/v2→v3 с backup.
 - Preflight-контракт: неизвестные tools, CRITICAL-полномочия и нереализованные privileged-типы
   блокируются до worker; HIGH требует подтверждения.
 - Git push с обязательным подтверждением, без force, с проверкой remote SHA; `/github info|create`
   через GitHub API при заданном `GITHUB_TOKEN`.
+- Этапные approvals привязаны к операции, source hash, repository/owner/private, ветке и
+  коммиту; после approve задача автоматически продолжается с сохранённого этапа.
+- Идемпотентность: повторный импорт одинакового файла, повторный commit без изменений,
+  существующий GitHub repo и уже опубликованный SHA не выполняются повторно.
+- Worker запускается в отдельном network namespace; доступ только через Unix-socket
+  egress-proxy с allowlist хостов/портов. Прямые соединения невозможны.
 - `/project import-config <source> <dest> [--overwrite]`: импорт только из extra read paths,
   secret-scan, hash источника, backup при overwrite и отдельный approval.
 - Per-model usage/pricing, кэш/reasoning, duration; команды `/usage today|week|month|task N`.
 - Новые Telegram-команды: `/task`, `/task_info`, `/queue`, `/cancel`, `/pause`, `/retry`, `/doctor`,
   `/push`, `/github`, `/report full`; проектные `/project list|select|permissions|remote|budget|
   extra-read|permission|import-config`.
+- Автоматическое продолжение COMPOSITE после перезапуска (`app.auto_resume_composite`),
+  сохранение завершённых этапов и повтор только неуспешного этапа.
 - FTS5-поиск, резюме, stop/rollback/pause/retry, systemd, doctor, redaction.
 
 Phase 1 намеренно **не** реализует SSH, браузер, Docker/Podman, MCP и распределённый VPS.
@@ -307,15 +319,16 @@ memory_mb = 4096
 
 Выполнено:
 
-- `pytest`: **65 passed, 3 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
+- `pytest`: **76 passed, 4 skipped** (интеграционные и live-тесты по умолчанию пропускаются).
 - `AI_SUPERVISOR_RUN_INTEGRATION=1 pytest tests/test_worker_integration.py`: **2 passed** —
   реальный `DeepSeekHarness` в bwrap против локального Messages-совместимого mock API.
   Проверены запуск runtime, проброс `DEEPSEEK_BASE_URL`, запись результата, usage (input 42,
-  output 7, cached 3, requests 1), завершение `completed` и реальный `bash` tool call,
-  изменивший файл в worktree.
-- `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest tests/test_kimi_live.py`: **1 passed** — реальные
+  output 7, cached 3, requests 1), завершение `completed`, реальный `bash` tool call,
+  изменивший файл в worktree, и работу через netns + allowlisted egress proxy.
+- `AI_SUPERVISOR_RUN_LIVE_KIMI=1 pytest tests/test_kimi_live.py`: **2 passed** — реальные
   запросы к настроенному Kimi API: обычное общение (`tool_choice=auto`), классификация,
-  формирование ТЗ v2 и структурное ревью (`tool_choice=required` + ровно один инструмент).
+  формирование ТЗ v2, структурное ревью и COMPOSITE-план Niri
+  (`import → commit → validate → github → publish`).
 - `ruff check .`: все проверки пройдены.
 - `bwrap` probe: user namespaces + read-only `/usr` + изолированный worktree.
 - Ручной end-to-end оркестрации с fake Kimi и реальным Git: plan → execute → diff → review →
@@ -343,11 +356,14 @@ ai-supervisor run
 
 ---
 
-## Известные ограничения Phase 2
+## Известные ограничения Phase 2.5
 
-- **Сеть worker не изолирована по allowlist.** bwrap изолирует файлы/PID/UID, но worker должен
-  достучаться до DeepSeek API, поэтому сеть общая. Это позволяет exfiltration данных проекта
-  при prompt injection. Phase 2: egress-proxy/allowlist.
+- **Egress-proxy работает через allowlist.** Worker не имеет маршрута в сеть; разрешены только
+  настроенные хосты/порты DeepSeek. Модель всё ещё может отправить содержимое проекта в
+  разрешённый API через сам промпт — это не сетевой bypass, а свойство работы с моделью.
+- **Custom DeepSeek endpoint на loopback** не работает в netns без отдельной настройки:
+  DSH обходит proxy для loopback-адресов. Для локального mock используйте non-loopback имя
+  или отключите egress в тестовом профиле.
 - **Одна активная задача на проект.** Разные проекты могут выполняться параллельно (до
   `max_workers`), но внутри проекта задачи сериализованы, чтобы не конфликтовать в базовой ветке.
 - **Нет автоматического разрешения конфликтов.** Если основная ветка сдвинулась, merge отклоняется,
@@ -363,17 +379,19 @@ ai-supervisor run
 - При несовместимости сохранённой DSH-сессии `/resume` может потребовать нового запуска; система
   не подменяет сессию молча.
 
-### Что ещё не реализовано в Phase 2
+### Что ещё не реализовано в Phase 2.5
 
-- Полная декомпозиция `COMPOSITE` на зависимые этапы, DAG и параллельные подзадачи.
-- Маршрутизация Level 0–3 между моделями/исполнителями (кроме детерминированных Telegram-команд).
-- Продвинутые GitHub PR/checks и настройки организаций; базовые repo info/create и Git push реализованы.
-- Полноценный привилегированный исполнитель для `SYSTEM_OPERATION`/`EXTERNAL_OPERATION`;
-  сейчас эти типы блокируются до отдельного этапа.
-- JSON-корреляция логов и ретенция строк `task_events`; файловые task-логи очищаются
-  автоматически по `app.task_log_retention_days`, но JSON-формат журнала ещё не включён.
+- Параллельное исполнение независимых этапов (сейчас этапы выполняются последовательно в
+  топологическом порядке; DAG проверяется).
+- Полная маршрутизация Level 0–3 между моделями вне операций этапов; простые операции уже
+  детерминированы.
+- Продвинутые GitHub PR/checks и настройки организаций; repo create/info, remote и push реализованы.
+- Привилегированный SYSTEM/EXTERNAL executor; эти типы по-прежнему fail-closed.
+- JSON-корреляция логов и ретенция строк `task_events`; task-логи очищаются по retention.
+- Реальная публикация пользовательских файлов не входит в автоматические тесты; используется
+  mock GitHub API и временный bare remote.
 
-Полный список: [docs/PHASE2.md](docs/PHASE2.md).
+Полный список: [docs/PHASE2_5.md](docs/PHASE2_5.md).
 
 ---
 
@@ -407,18 +425,17 @@ src/ai_supervisor/
 config/dsh/          privacy patch for DSH session-log upload
 systemd/             user service
 tests/               unit + optional real DSH integration
-docs/                API notes, install, security, testing, phase 1/2
+docs/                API notes, install, security, testing, phase 1/2/2.5
 ```
 
 ---
 
 ## Следующий этап
 
-1. **Phase 2.5:** egress allowlist/proxy для worker, полная декомпозиция COMPOSITE, routing,
-   GitHub API, привилегированный system/external executor, retention/structured logs.
-2. **Phase 3:** несколько исполнителей, граф зависимостей, интеграционная ветка и разрешение
-   конфликтов, параллельные worktree.
-3. **Phase 4:** SSH, Podman, браузер, MCP, системный мониторинг — отдельными модулями с политиками.
-4. **Phase 5:** production systemd/backup, затем Controller + Worker Node с mTLS.
+1. **Phase 3:** параллельный DAG этапов, маршрутизация Level 0–3, расширенный GitHub
+   PR/checks, привилегированный system/external executor, retention/structured logs.
+2. **Phase 4:** несколько исполнителей, интеграционная ветка и разрешение конфликтов,
+   параллельные worktree, SSH/Podman/браузер/MCP, системный мониторинг.
+3. **Phase 5:** production systemd/backup, затем Controller + Worker Node с mTLS.
 
 Не реализовывать распределённую инфраструктуру раньше стабильной локальной версии.

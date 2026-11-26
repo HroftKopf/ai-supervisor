@@ -33,6 +33,23 @@ async def remote_url(repo: Path, remote: str) -> str:
     return result.stdout.strip()
 
 
+async def ensure_remote(repo: Path, remote: str, url: str) -> bool:
+    """Create or update a remote, returning True when the configuration changed."""
+    validate_remote_name(remote)
+    if not url.strip():
+        raise GitOpsError("remote URL is empty")
+    current = await git(repo, "remote", "get-url", remote, check=False)
+    if current.returncode == 0 and current.stdout.strip() == url.strip():
+        return False
+    if current.returncode == 0:
+        result = await git(repo, "remote", "set-url", remote, url, check=False)
+    else:
+        result = await git(repo, "remote", "add", remote, url, check=False)
+    if result.returncode != 0:
+        raise GitOpsError(f"cannot configure git remote {remote!r}: {result.stderr.strip()[:1000]}")
+    return True
+
+
 async def remote_branch_sha(repo: Path, remote: str, branch: str) -> str | None:
     validate_remote_name(remote)
     validate_branch_name(branch)

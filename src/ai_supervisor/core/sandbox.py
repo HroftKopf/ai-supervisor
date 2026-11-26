@@ -125,6 +125,7 @@ class BwrapSandbox:
         deepseek_api_key: str,
         deepseek_base_url: str,
         resume: bool,
+        egress_socket: str | None = None,
     ) -> list[str]:
         inner: list[str] = [
             "/venv/bin/python",
@@ -161,6 +162,8 @@ class BwrapSandbox:
             inner.extend(["--reasoning-effort", reasoning_effort])
         if resume:
             inner.append("--resume")
+        if egress_socket:
+            inner.extend(["--egress-socket", egress_socket])
         env = {
             "PATH": "/venv/bin:/usr/bin:/bin",
             "HOME": "/dsh-home",
@@ -243,60 +246,74 @@ class BwrapSandbox:
             self._bwrap,
             "--die-with-parent",
             "--new-session",
-            "--unshare-pid",
-            "--unshare-ipc",
-            "--unshare-uts",
-            "--unshare-cgroup-try",
-            "--cap-drop",
-            "ALL",
-            "--hostname",
-            "ai-supervisor-worker",
-            "--clearenv",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--symlink",
-            "usr/bin",
-            "/bin",
-            "--symlink",
-            "usr/bin",
-            "/sbin",
-            "--symlink",
-            "usr/lib",
-            "/lib",
-            "--symlink",
-            "usr/lib64",
-            "/lib64",
-            "--ro-bind",
-            str(self._venv),
-            "/venv",
-            "--ro-bind",
-            str(self._app_src),
-            "/app/ai_supervisor",
-            "--ro-bind",
-            str(self._config_dir),
-            "/config",
-            "--bind",
-            str(paths.worktree),
-            "/workspace",
-            "--bind",
-            str(paths.dsh_home),
-            "/dsh-home",
-            "--bind",
-            str(_home_cache_dir(paths.dsh_home)),
-            "/" + str(_host_cache_dir()).lstrip("/"),
-            "--bind",
-            str(paths.state_dir),
-            "/state",
-            "--tmpfs",
-            "/tmp",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "--chdir",
-            "/workspace",
         ]
+        if self.settings.egress.enabled:
+            # User namespace root is required to bring loopback up in the new
+            # network namespace; it has no host capabilities or routes.
+            args.extend(["--unshare-user", "--uid", "0", "--gid", "0"])
+        args.extend(
+            [
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--unshare-cgroup-try",
+                "--cap-drop",
+                "ALL",
+            ]
+        )
+        if self.settings.egress.enabled:
+            args.extend(["--cap-add", "CAP_NET_ADMIN"])
+        args.extend(
+            [
+                "--hostname",
+                "ai-supervisor-worker",
+                "--clearenv",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/bin",
+                "/sbin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib64",
+                "/lib64",
+                "--ro-bind",
+                str(self._venv),
+                "/venv",
+                "--ro-bind",
+                str(self._app_src),
+                "/app/ai_supervisor",
+                "--ro-bind",
+                str(self._config_dir),
+                "/config",
+                "--bind",
+                str(paths.worktree),
+                "/workspace",
+                "--bind",
+                str(paths.dsh_home),
+                "/dsh-home",
+                "--bind",
+                str(_home_cache_dir(paths.dsh_home)),
+                "/" + str(_host_cache_dir()).lstrip("/"),
+                "--bind",
+                str(paths.state_dir),
+                "/state",
+                "--tmpfs",
+                "/tmp",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--chdir",
+                "/workspace",
+            ]
+        )
         for rel in ETC_FILES:
             self._append_etc_file(args, rel)
         for rel in ETC_DIRS:
@@ -315,7 +332,7 @@ class BwrapSandbox:
             sanitized = _sanitized_git_config(paths.git_common_dir, paths.state_dir)
             if sanitized is not None:
                 args.extend(["--ro-bind", str(sanitized), "/repo-git/config"])
-        if not self.settings.sandbox.network:
+        if self.settings.egress.enabled or not self.settings.sandbox.network:
             args.insert(args.index("--cap-drop"), "--unshare-net")
         for key, value in env.items():
             args.extend(["--setenv", key, value])

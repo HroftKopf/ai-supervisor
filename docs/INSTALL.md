@@ -79,8 +79,23 @@ GITHUB_TOKEN=
 ## 4.1. Обновление с Phase 1
 
 При первом запуске новой версии `Database` сделает backup
-`var/backups/pre-migration-v2-*.db` и обновит схему v1→v2. Старые задачи сохраняются.
+`var/backups/pre-migration-v3-*.db` и обновит схему v1/v2→v3. Старые задачи сохраняются.
 Перед обновлением можно дополнительно выполнить `scripts/backup.sh`.
+
+## 4.2. Egress worker
+
+Worker не имеет прямого выхода в сеть. `config.toml`:
+
+```toml
+[egress]
+enabled = true
+allowed_hosts = ["api.deepseek.com"]
+allowed_ports = [80, 443]
+```
+
+Если `DEEPSEEK_BASE_URL` задаёт другой host/port, они добавляются автоматически только для
+этого endpoint. Не добавляйте произвольные хосты без необходимости. Для локального mock
+используйте non-loopback имя (`127.0.0.1.nip.io`) или тестовый профиль с `egress.enabled=false`.
 
 ## 5. systemd user service
 

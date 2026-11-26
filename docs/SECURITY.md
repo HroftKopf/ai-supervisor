@@ -64,6 +64,16 @@ Git worktree сам по себе не является песочницей.
 - `--overwrite` создаёт backup в `var/backups/config-import` с mode 700.
 - Импорт пишет в рабочее дерево и не коммитит автоматически; требуется отдельная проверка.
 
+### COMPOSITE-этапы
+
+- План проверяется на уникальные id, известные зависимости, циклы и соответствие executor.
+- Опасные этапы (`import_config`, `github_ensure_repo`, `publish`, high) требуют отдельного
+  one-shot approval, привязанного к source hash / repository / branch / commit.
+- Worker не получает GitHub-токен и не выполняет внешние операции; это делает host-оркестратор
+  после approval.
+- Завершённые этапы сохраняются; повторяется только failed/running этап.
+- SYSTEM/EXTERNAL вне поддерживаемых этапов fail-closed.
+
 ### Git push
 
 - Только после отдельного одноразового approval владельца.
@@ -100,16 +110,18 @@ Git worktree сам по себе не является песочницей.
   а проверки берутся только из реестра проекта владельца.
 - Kimi не может изменить свои полномочия или approval-политику: это код.
 
-## Осознанные ограничения Phase 1
+## Сеть worker
 
-### Сеть
+Phase 2.5 запускает worker с `--unshare-net` в отдельном network namespace. Прямого маршрута
+наружу нет. `worker_runner` поднимает loopback TCP-relay, который ведёт в Unix-socket
+`EgressProxy` на host; proxy разрешает только `egress.allowed_hosts`/`allowed_ports` и
+host/port из `DEEPSEEK_BASE_URL`. Поддерживается CONNECT и plain HTTP; TLS не перехватывается.
 
-bwrap **не** изолирует сеть: worker должен обращаться к DeepSeek API, поэтому используется
-host network. Это значит, что prompt injection/вредоносный код в проекте потенциально может
-отправить данные проекта на внешний сервер. Файловая и процессная изоляция при этом действует.
+Остаточный риск: разрешённый model API всё ещё получает содержимое промпта; это не сетевой
+bypass. Custom endpoint на literal loopback не работает в netns (DSH bypasses loopback);
+используйте non-loopback имя или тестовый профиль с `egress.enabled=false`.
 
-Для production с недоверенными проектами нужен egress-allowlist/proxy (Phase 2). До этого
-запускайте на доверенных проектах и не помещайте в них секреты, не предназначенные для модели.
+## Осознанные ограничения
 
 ### Остальное
 

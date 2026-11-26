@@ -82,3 +82,15 @@ async def test_import_requires_configured_read_path(settings, project, tmp_path:
     source.write_text("ok = 1\n", encoding="utf-8")
     with pytest.raises(ConfigImportError, match="extra_read_paths"):
         await service.plan(project, str(source), "configs/x")
+
+
+@pytest.mark.asyncio
+async def test_discover_niri_under_extra_root(settings, project, tmp_path: Path) -> None:
+    root = tmp_path / "configs"
+    niri = root / "niri"
+    niri.mkdir(parents=True)
+    (niri / "config.kdl").write_text("layout {}\n", encoding="utf-8")
+    service = ConfigImportService(settings)
+    current = _project(project, [root])
+    found = await service.discover(current, "niri")
+    assert found == niri.resolve()

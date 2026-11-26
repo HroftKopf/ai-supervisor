@@ -43,6 +43,8 @@ class FakeSupervisor:
         self.intent = IntentKind.TASK
         self.review_verdict = ReviewVerdict.ACCEPT
         self.review_sequence: list[ReviewVerdict] = []
+        self.chat_calls = 0
+        self.review_calls = 0
         self.chat_response = "Привет! Это ответ Kimi."
         self.plan_spec = TaskSpec(
             title="Append line",
@@ -67,6 +69,7 @@ class FakeSupervisor:
         return self.plan_spec, TokenUsage(input_tokens=10, output_tokens=5, requests=1)
 
     async def review(self, **_: object) -> tuple[ReviewResult, TokenUsage]:
+        self.review_calls += 1
         verdict = self.review_sequence.pop(0) if self.review_sequence else self.review_verdict
         if verdict is ReviewVerdict.ACCEPT:
             result = ReviewResult(
@@ -92,6 +95,7 @@ class FakeSupervisor:
         return result, TokenUsage(input_tokens=7, output_tokens=3, requests=1)
 
     async def chat(self, **_: object):
+        self.chat_calls += 1
         from ai_supervisor.providers.kimi import KimiResponse
 
         return KimiResponse(
