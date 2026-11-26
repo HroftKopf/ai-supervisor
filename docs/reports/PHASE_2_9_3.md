@@ -72,7 +72,7 @@ persistence. Migration backup is
 
 ## Verification
 
-- **163 passed, 4 skipped**, synthetic credentials only.
+- **164 passed, 4 skipped**, synthetic credentials only.
 - Offline benchmark after the change (single samples, current host): memory search 0.88–1.04 ms,
   context build 0.43–0.54 ms, state transitions median 3.5–3.6 ms, 20 scheduler jobs 0.28–0.30 ms,
   recovery 0.53–0.57 ms, peak context 25,693 B. These are slower than the Phase 2.9 sample

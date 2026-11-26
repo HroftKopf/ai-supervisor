@@ -3428,7 +3428,9 @@ class Orchestrator:
         async def summarize(prompt: str) -> str:
             await self.usage.ensure_kimi_budget(0)
             text, usage = await self.supervisor.summarize(prompt)
-            await self._record_kimi_usage(usage, task_id=None, project_id=project_id)
+            await self._record_kimi_usage(
+                usage, task_id=None, project_id=project_id, role="summarizer"
+            )
             return text
 
         async def run() -> None:

@@ -148,3 +148,25 @@ async def test_memory_context_uses_query_relevance(database, settings, project) 
     )
     assert "alpha release" in context
     assert "beta release" not in context
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_excludes_other_project_before_limit(
+    database, settings, project
+) -> None:
+    from ai_supervisor.memory.conversations import ConversationService
+    from ai_supervisor.memory.projects import ProjectService
+
+    service = ConversationService(database, settings)
+    projects = ProjectService(database, settings)
+    other = await projects.create("other")
+    await service.add_memory(
+        "project", "alpha-secret-in-other", project_id=other.id, key="other", verified=True
+    )
+    await service.add_memory(
+        "project", "alpha-local-fact", project_id=project.id, key="local", verified=True
+    )
+    results = await service.search_memories("alpha", project_id=project.id)
+    contents = " ".join(item.content for item in results)
+    assert "alpha-local-fact" in contents
+    assert "alpha-secret-in-other" not in contents

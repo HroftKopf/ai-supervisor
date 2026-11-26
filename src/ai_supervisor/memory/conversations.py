@@ -553,30 +553,47 @@ class ConversationService:
             )
         return "\n".join(lines)
 
-    async def search_memories(self, query: str, limit: int = 20) -> list[MemoryRecord]:
+    async def search_memories(
+        self,
+        query: str,
+        limit: int = 20,
+        *,
+        project_id: int | None = None,
+        conversation_id: int | None = None,
+    ) -> list[MemoryRecord]:
         clean_query = " ".join(query.split())
         if not clean_query:
             return []
+        scope_sql = " AND m.stale = 0"
+        scope_params: list[Any] = []
+        if project_id is not None:
+            scope_sql += " AND (m.scope != 'project' OR m.project_id = ?)"
+            scope_params.append(project_id)
+        if conversation_id is not None:
+            scope_sql += " AND (m.scope != 'conversation' OR m.conversation_id = ?)"
+            scope_params.append(conversation_id)
         if self.db.fts_available:
             fts_query = " AND ".join(
                 '"' + part.replace('"', '""') + '"' for part in clean_query.split()
             )
             try:
                 rows = await self.db.fetchall(
-                    """
+                    f"""
                     SELECT m.* FROM memories_fts
                     JOIN memories m ON m.id = memories_fts.memory_id
-                    WHERE memories_fts MATCH ? AND m.stale = 0
+                    WHERE memories_fts MATCH ?{scope_sql}
                     ORDER BY rank LIMIT ?
                     """,
-                    (fts_query, limit),
+                    (fts_query, *scope_params, limit),
                 )
                 return [MemoryRecord.model_validate(row_to_dict(row)) for row in rows]
             except Exception:
                 pass
         rows = await self.db.fetchall(
-            "SELECT * FROM memories WHERE content LIKE ? AND stale = 0 ORDER BY id DESC LIMIT ?",
-            (f"%{clean_query}%", limit),
+            "SELECT * FROM memories m WHERE m.content LIKE ?"
+            + scope_sql
+            + " ORDER BY m.id DESC LIMIT ?",
+            (f"%{clean_query}%", *scope_params, limit),
         )
         return [MemoryRecord.model_validate(row_to_dict(row)) for row in rows]
 
