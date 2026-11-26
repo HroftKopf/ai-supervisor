@@ -17,6 +17,7 @@ from ai_supervisor.config import Settings
 from ai_supervisor.core.capabilities import capability_block
 from ai_supervisor.core.config_import import ConfigImportError, ConfigImportService
 from ai_supervisor.core.context import ContextError, ProjectContextBuilder
+from ai_supervisor.core.fault_injection import FaultInjector
 from ai_supervisor.core.git_auth import (
     GitAuthError,
     GitAuthManager,
@@ -230,6 +231,7 @@ class Orchestrator:
         self.config_import = ConfigImportService(settings)
         self.git_auth = GitAuthManager(settings)
         self._summaries: dict[int, asyncio.Task[Any]] = {}
+        self.faults = FaultInjector.from_env()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -1858,6 +1860,9 @@ class Orchestrator:
                 "already_published": True,
             }
         sha = await push_branch(repo, stage.remote, branch, auth=self.git_auth)
+        # This boundary represents a successful external operation followed by
+        # failure before the stage result is committed. Retry must verify remote.
+        self.faults.hit("after_git_push")
         _local, verified = await verify_remote_branch(
             repo, stage.remote, branch, auth=self.git_auth
         )

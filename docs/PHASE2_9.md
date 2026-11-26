@@ -1,6 +1,6 @@
 # Phase 2.9 — Stabilization, security and benchmarking
 
-Baseline: `dd3a3cf`; starting suite: 125 passed, 4 skipped; Phase 2.9 final: **134 passed, 4 skipped**.
+Baseline: `dd3a3cf`; starting suite: 125 passed, 4 skipped; Phase 2.9 final: **154 passed, 4 skipped**.
 
 ## 1. Architecture audit
 
@@ -67,7 +67,7 @@ coverage run --branch --source=src/ai_supervisor -m pytest -q
 coverage report -m
 ```
 
-Measured final total is **61%** (branch/statement, `coverage run --branch`). The target 85% was
+Measured final combined total is **63%**; statement coverage **67.5%**, branch coverage **50.4%** (`coverage run --branch`). The target 85% was
 not reached. The initial run before Phase 2.9 tests was 59%. Critical components remain uneven:
 
 - GitAuthManager 87%, models/state validation 90%, permissions/approvals 85%;

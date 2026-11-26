@@ -883,7 +883,9 @@ class Handlers:
                     )
                 elif arg == "usage":
                     await self.notifier.send_text(
-                        chat_id, await self.orchestrator.usage_text(chat_id)
+                        chat_id,
+                        await self.orchestrator.usage_text(chat_id),
+                        parse_mode="HTML",
                     )
                 elif arg == "status":
                     await self.notifier.send_text(
@@ -900,7 +902,9 @@ class Handlers:
                 await self.orchestrator.send_compact(task_id, chat_id)
             elif action == "use" and task_id is not None:
                 await self.notifier.send_text(
-                    chat_id, await self.orchestrator.usage_text(chat_id, task_id=task_id)
+                    chat_id,
+                    await self.orchestrator.usage_text(chat_id, task_id=task_id),
+                    parse_mode="HTML",
                 )
             elif action == "rep" and task_id is not None:
                 await self.orchestrator.send_report(task_id, chat_id)

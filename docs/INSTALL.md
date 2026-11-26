@@ -202,3 +202,22 @@ rm -f ~/.config/systemd/user/ai-supervisor.service
 ```
 
 Файлы проектов не удаляются. `var/` содержит историю и рабочие копии; удаляйте осознанно.
+
+
+## Dependency lock and updates
+
+`requirements.lock` contains the exact development environment versions generated from the
+working venv. It is not hash-pinned; `pip check` and the full test suite are the current
+verification gate.
+
+```bash
+python -m pip install -r requirements.lock
+python -m pip check
+pytest -q
+AI_SUPERVISOR_RUN_INTEGRATION=1 pytest -q tests/test_worker_integration.py
+```
+
+Update one dependency at a time, regenerate the lock from a clean venv, and never run live
+provider tests without an approved budget. The offline environment does not provide a
+vulnerability database client (`pip-audit` is not installed), so no vulnerability-free claim is
+made.

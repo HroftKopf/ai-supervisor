@@ -10,3 +10,4 @@
 8. [Sandbox и безопасность](08-sandbox-and-security.md)
 9. [Тесты](09-testing-and-validation.md)
 10. [Git и deployment](10-git-and-deployment.md)
+11. [Fault tolerance и hardening](11-fault-tolerance-and-hardening.md)

@@ -4,6 +4,7 @@ import logging
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any
+from urllib.parse import quote, quote_plus
 
 from ai_supervisor.config import Settings
 
@@ -58,6 +59,11 @@ class SecretRedactor:
         result = text
         for secret in self._secrets:
             result = result.replace(secret, "[REDACTED]")
+            # Common URL encodings must not bypass redaction. This is not a
+            # universal encoding detector; arbitrary transforms are not claimed.
+            for encoded in (quote(secret, safe=""), quote_plus(secret)):
+                if encoded != secret:
+                    result = result.replace(encoded, "[REDACTED]")
         for pattern in _PATTERNS:
             result = pattern.sub(_replace_match, result)
         return result
@@ -134,3 +140,27 @@ def _redacting_factory(redactor: SecretRedactor):
         return record
 
     return factory
+
+
+class StreamingRedactor:
+    """Safely redact chunked text.
+
+    A secret can be split across arbitrary chunk boundaries. Emitting a processed
+    prefix would be unsafe unless a full streaming DFA is implemented, so chunks
+    are buffered and redacted once at flush(). This preserves confidentiality at
+    the cost of no incremental display; callers that need live display must use a
+    bounded, non-secret transport.
+    """
+
+    def __init__(self, redactor: SecretRedactor) -> None:
+        self.redactor = redactor
+        self._buffer = ""
+
+    def feed(self, chunk: str) -> str:
+        self._buffer += chunk or ""
+        return ""
+
+    def flush(self) -> str:
+        value = self.redactor.redact(self._buffer)
+        self._buffer = ""
+        return value

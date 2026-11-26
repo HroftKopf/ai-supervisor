@@ -156,3 +156,12 @@ bypass. Custom endpoint на literal loopback не работает в netns (DS
 4. Не запускать повторно задачу с неизвестным результатом: сначала изучить worktree и patch.
 5. При подозрении на утечку — проверить сетевые соединения worker-процессов и удалить
    соответствующие worktree.
+
+
+## Dependency and lock policy
+
+`requirements.lock` pins exact versions observed in the development venv, without artifact
+hashes. It improves reproducibility but does not cryptographically prove package integrity and
+does not replace a vulnerability database. Verify with `pip check`, the full test suite and the
+DSH integration test before deployment. Update dependencies individually; do not bulk-upgrade
+without a security review.

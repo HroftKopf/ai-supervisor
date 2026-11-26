@@ -100,3 +100,29 @@ async def test_conversation_storage_and_api_context_redact_secrets(
     assert "kimi-secret-value" not in message.content
     api = service.messages_for_api([message])
     assert "kimi-secret-value" not in str(api)
+
+
+def test_streaming_redactor_handles_split_secret_and_encodings() -> None:
+    from urllib.parse import quote
+
+    from ai_supervisor.core.redaction import StreamingRedactor
+
+    secret = "stream-secret-value"
+    redactor = SecretRedactor([secret])
+    stream = StreamingRedactor(redactor)
+    emitted = ""
+    for chunk in ["hello ", "stream-se", "cret-va", "lue", " world"]:
+        emitted += stream.feed(chunk)
+    emitted += stream.flush()
+    assert secret not in emitted
+    assert "hello" in emitted and "world" in emitted
+    assert secret not in redactor.redact(quote(secret, safe=""))
+    assert secret not in redactor.redact("URL " + quote(secret, safe=""))
+
+
+def test_nested_json_is_redacted() -> None:
+    redactor = SecretRedactor(["nested-secret-value"])
+    value = {"outer": [{"token": "nested-secret-value"}, {"ok": "safe"}]}
+    cleaned = redactor.redact_mapping(value)  # type: ignore[arg-type]
+    assert "nested-secret-value" not in str(cleaned)
+    assert "safe" in str(cleaned)

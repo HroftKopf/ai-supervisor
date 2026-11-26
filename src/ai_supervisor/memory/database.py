@@ -342,19 +342,23 @@ class Database:
     async def connect(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         conn = await aiosqlite.connect(self.path, isolation_level=None)
-        conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA journal_mode=WAL")
-        await conn.execute("PRAGMA synchronous=NORMAL")
-        await conn.execute("PRAGMA foreign_keys=ON")
-        await conn.execute("PRAGMA busy_timeout=5000")
-        await conn.executescript(SCHEMA)
-        await self._migrate(conn)
         try:
-            await conn.executescript(FTS_SCHEMA)
-            self.fts_available = True
-        except aiosqlite.OperationalError:
-            self.fts_available = False
-        await conn.commit()
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA synchronous=NORMAL")
+            await conn.execute("PRAGMA foreign_keys=ON")
+            await conn.execute("PRAGMA busy_timeout=5000")
+            await conn.executescript(SCHEMA)
+            await self._migrate(conn)
+            try:
+                await conn.executescript(FTS_SCHEMA)
+                self.fts_available = True
+            except aiosqlite.OperationalError:
+                self.fts_available = False
+            await conn.commit()
+        except BaseException:
+            await conn.close()
+            raise
         self._connection = conn
 
     async def _migrate(self, conn: aiosqlite.Connection) -> None:
